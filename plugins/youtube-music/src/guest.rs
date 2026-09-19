@@ -10,7 +10,10 @@ use crate::parse::{
     classify_playability, format_outcome, pick_audio, visitor_data, FormatOutcome, Picked,
     Playability,
 };
-use crate::rungs::{append_pot, player_request, pot_mint_request, probe_request, LADDER};
+use crate::rungs::{
+    append_pot, player_request, pot_mint_request, probe_request, LADDER, PROBE_FALLBACK_START,
+    PROBE_TAIL_BYTES,
+};
 
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
@@ -200,8 +203,23 @@ fn on_http_step(msg: &Value, state: &mut State) -> Vec<u8> {
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or(Value::Null);
+    // A 2xx player response must be a JSON envelope carrying
+    // `playabilityStatus.status` — anything else (an HTML interstitial,
+    // an empty body, a response shape the parser predates) is upstream
+    // breakage, not a rung outcome. Reporting it `invalid-response`
+    // keeps parser drift from masquerading as content unavailability.
     if body.is_null() {
-        return advance(state, RungOutcome::Transport);
+        return fail("invalid-response", "player response body is not JSON");
+    }
+    if body
+        .pointer("/playabilityStatus/status")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return fail(
+            "invalid-response",
+            "player response lacks playabilityStatus",
+        );
     }
     if let Some(visitor) = visitor_data(&body) {
         state.visitor_id = Some(visitor);
@@ -285,16 +303,112 @@ fn issue_probe(state: &mut State, picked: Picked) -> Vec<u8> {
     req
 }
 
-/// The probe verdict: 206 serves the file's tail and returns the picked
-/// resource. A 416 is a pass only when the probe used the fallback
-/// range — `content_length` was unknown, so the file may legitimately
-/// end before the probe start. A 416 on a known-length tail probe means
-/// the mint refuses bytes inside the advertised length (a cap, or a
-/// `contentLength` lie): the rung is `Capped`, same as a 403 — the
-/// downloader's strict-206 loop would only re-mint the same lie.
-/// Anything else marks the mint capped and advances the ladder. A probe
-/// transport failure is `Transport`, not `Capped`: nothing about
-/// serving was learned.
+/// A parsed `Content-Range` value: `bytes <start>-<end>/<total>` on a
+/// 206, `bytes */<total>` on a 416. `total` is `None` when the server
+/// sends `*`.
+enum ContentRange {
+    Range {
+        start: u64,
+        end: u64,
+        total: Option<u64>,
+    },
+    Unsatisfiable {
+        total: Option<u64>,
+    },
+}
+
+/// Case-insensitive header lookup over the `http_response` headers
+/// array-of-pairs.
+fn header_value<'a>(msg: &'a Value, name: &str) -> Option<&'a str> {
+    msg.get("headers")?.as_array()?.iter().find_map(|h| {
+        let pair = h.as_array()?;
+        let key = pair.first()?.as_str()?;
+        key.eq_ignore_ascii_case(name)
+            .then(|| pair.get(1)?.as_str())?
+    })
+}
+
+fn parse_content_range(msg: &Value) -> Option<ContentRange> {
+    let value = header_value(msg, "content-range")?
+        .trim()
+        .strip_prefix("bytes ")?;
+    if let Some(total) = value.strip_prefix("*/") {
+        return Some(ContentRange::Unsatisfiable {
+            total: total.trim().parse().ok(),
+        });
+    }
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.trim().split_once('-')?;
+    Some(ContentRange::Range {
+        start: start.trim().parse().ok()?,
+        end: end.trim().parse().ok()?,
+        total: total.trim().parse().ok(),
+    })
+}
+
+/// The byte offset this probe asked for: the tail of a known-length
+/// file, or the fixed fallback window start.
+fn probe_start(probe: &PendingProbe) -> u64 {
+    probe
+        .picked
+        .content_length
+        .map(|len| len.saturating_sub(PROBE_TAIL_BYTES))
+        .unwrap_or(PROBE_FALLBACK_START)
+}
+
+/// The probe verdict: `None` means the mint demonstrably serves the
+/// file's tail — resolve `done`. A 206 only proves that when its
+/// `Content-Range` starts where the probe asked, reaches the file's
+/// last byte, and the body carried the whole advertised span — an
+/// empty body or an absent/foreign range verifies nothing. A 416 is a
+/// pass only for the fallback range (unknown `content_length`) *and*
+/// only with a `bytes */N` showing the file ends before the probe
+/// start — a cap can wear a bare 416. A 429 keeps its taxonomy:
+/// rate-limiting is not evidence of a truncated mint. A 5xx is
+/// `Transport`, not `Capped` — server weather teaches nothing about
+/// serving. Anything else marks the mint capped and advances the
+/// ladder; a transport failure is `Transport` for the same reason.
+fn probe_verdict(msg: &Value, status: u64, probe: &PendingProbe) -> Option<RungOutcome> {
+    match status {
+        206 => {
+            let Some(ContentRange::Range { start, end, total }) = parse_content_range(msg) else {
+                return Some(RungOutcome::Capped);
+            };
+            let reached_eof = match total {
+                Some(t) => end.checked_add(1) == Some(t),
+                None => probe
+                    .picked
+                    .content_length
+                    .is_some_and(|l| end.checked_add(1) == Some(l)),
+            };
+            let body_len = msg
+                .get("body")
+                .and_then(Value::as_str)
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+                .map_or(0, |b| b.len() as u64);
+            let span_carried = end
+                .checked_sub(start)
+                .is_some_and(|span| span + 1 == body_len);
+            if start == probe_start(probe) && reached_eof && span_carried {
+                None
+            } else {
+                Some(RungOutcome::Capped)
+            }
+        }
+        416 if probe.picked.content_length.is_none() => match parse_content_range(msg) {
+            Some(ContentRange::Unsatisfiable { total: Some(total) })
+                if total <= probe_start(probe) =>
+            {
+                None
+            }
+            _ => Some(RungOutcome::Capped),
+        },
+        429 => Some(RungOutcome::RateLimited),
+        500..=599 => Some(RungOutcome::Transport),
+        _ => Some(RungOutcome::Capped),
+    }
+}
+
 fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8> {
     if msg.get("id").and_then(Value::as_u64) != Some(u64::from(probe.request_id)) {
         return fail("invalid-response", "probe response id mismatch");
@@ -303,20 +417,20 @@ fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8>
         return advance(state, RungOutcome::Transport);
     }
     let status = msg.get("status").and_then(Value::as_u64).unwrap_or(0);
-    let served = status == 206 || (status == 416 && probe.picked.content_length.is_none());
-    if served {
-        let rung = LADDER.get(state.rung);
-        let picked = probe.picked;
-        done(&json!({
-            "url": picked.url,
-            "mime": picked.mime,
-            "bitrate_kbps": picked.bitrate_kbps,
-            "expires_at_ms": picked.expires_at_ms,
-            "content_length": picked.content_length,
-            "client": rung.map_or("unknown", |r| r.name),
-        }))
-    } else {
-        advance(state, RungOutcome::Capped)
+    match probe_verdict(msg, status, &probe) {
+        None => {
+            let rung = LADDER.get(state.rung);
+            let picked = probe.picked;
+            done(&json!({
+                "url": picked.url,
+                "mime": picked.mime,
+                "bitrate_kbps": picked.bitrate_kbps,
+                "expires_at_ms": picked.expires_at_ms,
+                "content_length": picked.content_length,
+                "client": rung.map_or("unknown", |r| r.name),
+            }))
+        }
+        Some(outcome) => advance(state, outcome),
     }
 }
 
@@ -415,6 +529,26 @@ mod tests {
             "error": { "kind": "permission-denied", "message": "no provider" },
         }))
         .unwrap_or_default()
+    }
+
+    /// A probe answer carrying a `Content-Range` header and a body of
+    /// `body_len` bytes — the evidence a 206 or fallback-416 verdict
+    /// inspects.
+    fn probe_response(id: u32, status: u16, range: &str, body_len: usize) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "type": "http_response",
+            "id": id,
+            "status": status,
+            "headers": [["Content-Range", range]],
+            "body": base64::engine::general_purpose::STANDARD.encode(vec![b'x'; body_len]),
+        }))
+        .unwrap_or_default()
+    }
+
+    /// The honest 206 for the OK fixture's pick (`contentLength`
+    /// 4,557,665 → tail `4492129-4557664`, span 64 KiB).
+    fn probe_206(id: u32) -> Vec<u8> {
+        probe_response(id, 206, "bytes 4492129-4557664/4557665", 65536)
     }
 
     fn parse(out: &[u8]) -> Value {
@@ -528,7 +662,7 @@ mod tests {
         // rung 2 (first ANDROID_VR pin) yields plain URLs -> mint+probe.
         let out = feed(&out, OK);
         let probe_id = probe_of(&out);
-        let out = step(&http_response(probe_id, 206, ""));
+        let out = step(&probe_206(probe_id));
         let msg = parse(&out);
         assert_eq!(msg["type"], "done");
         assert_eq!(msg["result"]["client"], "ANDROID_VR@1.61.48");
@@ -552,7 +686,7 @@ mod tests {
         }
         let out = feed(&out, OK);
         let probe_id = probe_of(&out);
-        let out = step(&http_response(probe_id, 206, ""));
+        let out = step(&probe_206(probe_id));
         let msg = parse(&out);
         assert_eq!(msg["type"], "done");
         assert_eq!(msg["result"]["client"], "ANDROID_VR@1.43.32");
@@ -605,10 +739,181 @@ mod tests {
             Some("bytes=1048576-1114111")
         );
         let probe_id = req_id_of(&out);
-        let out = step(&http_response(probe_id, 416, ""));
+        // `bytes */900000` is the range evidence: the file ends before
+        // the probe start (1,048,576), so the mint serves the whole file.
+        let out = step(&probe_response(probe_id, 416, "bytes */900000", 0));
         let msg = parse(&out);
         assert_eq!(msg["type"], "done");
         assert_eq!(msg["result"]["client"], "VISIONOS");
+    }
+
+    #[test]
+    fn probe_416_fallback_with_large_total_is_capped() {
+        let out = begin("vid12345678");
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body
+            .pointer_mut("/streamingData/adaptiveFormats")
+            .and_then(Value::as_array_mut)
+        else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        for f in fmts {
+            if let Some(o) = f.as_object_mut() {
+                o.remove("contentLength");
+            }
+        }
+        let out = feed(&out, &body.to_string());
+        let probe_id = req_id_of(&out);
+        // `bytes */2000000` claims the file reaches past the probe start
+        // yet refused the in-range window — a cap wearing a 416.
+        let out = step(&probe_response(probe_id, 416, "bytes */2000000", 0));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_416_fallback_without_range_is_capped() {
+        let out = begin("vid12345678");
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body
+            .pointer_mut("/streamingData/adaptiveFormats")
+            .and_then(Value::as_array_mut)
+        else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        for f in fmts {
+            if let Some(o) = f.as_object_mut() {
+                o.remove("contentLength");
+            }
+        }
+        let out = feed(&out, &body.to_string());
+        let probe_id = req_id_of(&out);
+        // A bare 416 carries no evidence the file is short — the cap
+        // horizon sits in the same window, so it cannot pass.
+        let out = step(&http_response(probe_id, 416, ""));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_without_content_range_is_capped() {
+        let out = begin("vid12345678");
+        let out = feed(&out, OK);
+        let probe_id = probe_of(&out);
+        // A 206 with no echoed range — even with a full body — verifies
+        // nothing about the tail.
+        let out = step(&http_response(probe_id, 206, "x".repeat(65536).as_str()));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_wrong_start_is_capped() {
+        let out = begin("vid12345678");
+        let out = feed(&out, OK);
+        let probe_id = probe_of(&out);
+        // The server answered a different window than the tail asked.
+        let out = step(&probe_response(
+            probe_id,
+            206,
+            "bytes 0-65535/4557665",
+            65536,
+        ));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_stopping_before_eof_is_capped() {
+        let out = begin("vid12345678");
+        let out = feed(&out, OK);
+        let probe_id = probe_of(&out);
+        // Served a window but not through the file's last byte — the
+        // bytes above `end` are unverified (a cap horizon could sit
+        // there).
+        let out = step(&probe_response(
+            probe_id,
+            206,
+            "bytes 4492129-4557663/4557665",
+            65535,
+        ));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_truncated_body_is_capped() {
+        let out = begin("vid12345678");
+        let out = feed(&out, OK);
+        let probe_id = probe_of(&out);
+        // Header claims the full tail; the body arrived short.
+        let out = step(&probe_response(
+            probe_id,
+            206,
+            "bytes 4492129-4557664/4557665",
+            1024,
+        ));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_429_reports_rate_limit() {
+        let mut out = begin("vid12345678");
+        for _ in 0..5 {
+            out = feed(&out, OK);
+            let probe_id = probe_of(&out);
+            out = step(&http_response(probe_id, 429, ""));
+        }
+        // Stream-side rate limits keep their taxonomy instead of
+        // masquerading as capped mints.
+        assert_eq!(
+            fail_kind(&out),
+            ("rate-limit".to_string(), "rate-limit".to_string())
+        );
+    }
+
+    #[test]
+    fn probe_5xx_is_transport() {
+        let mut out = begin("vid12345678");
+        for _ in 0..5 {
+            out = feed(&out, OK);
+            let probe_id = probe_of(&out);
+            out = step(&http_response(probe_id, 503, ""));
+        }
+        // Server weather on every probe -> transport, not capped.
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "transport".to_string())
+        );
+    }
+
+    #[test]
+    fn player_body_not_json_is_invalid_response() {
+        let out = begin("vid12345678");
+        // A 200 carrying an HTML interstitial is upstream breakage —
+        // `invalid-response`, not transport weather.
+        let out = step(&http_response(req_id_of(&out), 200, "<html>oops</html>"));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-response".to_string(),
+                "player response body is not JSON".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn player_missing_playability_status_is_invalid_response() {
+        let out = begin("vid12345678");
+        // A JSON envelope without `playabilityStatus.status` is not a
+        // player response — the parser must not read it as unplayable.
+        let out = step(&http_response(
+            req_id_of(&out),
+            200,
+            &json!({ "videoDetails": {} }).to_string(),
+        ));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-response".to_string(),
+                "player response lacks playabilityStatus".to_string()
+            )
+        );
     }
 
     #[test]
@@ -821,7 +1126,7 @@ mod tests {
         ));
         let probe_id = probe_of(&out);
         assert!(url_of(&out).contains("pot=tok-abc"));
-        let out = step(&http_response(probe_id, 206, ""));
+        let out = step(&probe_206(probe_id));
         let msg = parse(&out);
         assert_eq!(msg["type"], "done");
         assert!(msg["result"]["url"]

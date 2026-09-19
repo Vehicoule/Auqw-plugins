@@ -199,17 +199,21 @@ fn url_query_value(value: &str) -> String {
 /// a 403 marks the rung capped. When `contentLength` is unknown the
 /// probe falls back to a window past the most-observed ~1 MiB horizon
 /// — a weaker guarantee (a higher H can still pass and cap later).
-const PROBE_TAIL_BYTES: u64 = 65536;
-const PROBE_FALLBACK_RANGE: &str = "bytes=1048576-1114111";
+pub const PROBE_TAIL_BYTES: u64 = 65536;
+/// First byte of the fallback probe window (1 MiB in).
+pub const PROBE_FALLBACK_START: u64 = 1_048_576;
 
 /// The Range header value for a probe over `content_length` bytes.
 fn probe_range(content_length: Option<u64>) -> String {
     match content_length {
         Some(len) => {
             let start = len.saturating_sub(PROBE_TAIL_BYTES);
-            format!("bytes={start}-{}", len - 1)
+            format!("bytes={start}-{}", len.saturating_sub(1))
         }
-        None => PROBE_FALLBACK_RANGE.to_string(),
+        None => format!(
+            "bytes={PROBE_FALLBACK_START}-{}",
+            PROBE_FALLBACK_START + PROBE_TAIL_BYTES - 1
+        ),
     }
 }
 
