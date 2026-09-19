@@ -127,13 +127,17 @@ fn issue_request(state: &mut State) -> Vec<u8> {
 }
 
 /// The mint verdict: a 200 body carrying `poToken` arms stream-URL
-/// decoration; anything else (host_error, non-200, unparseable) degrades
-/// to the bare URL. Either way the paused pick goes to its tail probe.
+/// decoration; `host_error` or a non-200 degrades to the bare URL, and
+/// a mismatched response id is a protocol violation. Otherwise the
+/// paused pick goes to its tail probe.
 fn on_mint_step(msg: &Value, mint: PendingMint, state: &mut State) -> Vec<u8> {
-    let is_response = msg.get("type").and_then(Value::as_str) == Some("http_response")
-        && msg.get("id").and_then(Value::as_u64) == Some(u64::from(mint.request_id))
-        && msg.get("status").and_then(Value::as_u64) == Some(200);
-    if is_response {
+    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
+        return issue_probe(state, mint.picked);
+    }
+    if msg.get("id").and_then(Value::as_u64) != Some(u64::from(mint.request_id)) {
+        return fail("invalid-message", "mint response id mismatch");
+    }
+    if msg.get("status").and_then(Value::as_u64) == Some(200) {
         state.pot_token = msg
             .get("body")
             .and_then(Value::as_str)
@@ -577,6 +581,28 @@ mod tests {
             (
                 "invalid-message".to_string(),
                 "probe response id mismatch".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn mint_id_mismatch_fails() {
+        let out = begin("vid12345678");
+        // rung 0 yields plain URLs -> the lazy mint request follows.
+        let out = step(&http_response(req_id_of(&out), 200, OK));
+        assert!(mint_id_of(&out).is_some());
+        // A response with an id that is not the mint's is a host
+        // protocol violation.
+        let out = step(&http_response(
+            99,
+            200,
+            &json!({"poToken": "tok"}).to_string(),
+        ));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-message".to_string(),
+                "mint response id mismatch".to_string()
             )
         );
     }
