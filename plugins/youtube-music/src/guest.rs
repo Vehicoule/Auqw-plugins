@@ -131,11 +131,11 @@ fn issue_request(state: &mut State) -> Vec<u8> {
 /// a mismatched response id is a protocol violation. Otherwise the
 /// paused pick goes to its tail probe.
 fn on_mint_step(msg: &Value, mint: PendingMint, state: &mut State) -> Vec<u8> {
-    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
-        return issue_probe(state, mint.picked);
-    }
     if msg.get("id").and_then(Value::as_u64) != Some(u64::from(mint.request_id)) {
         return fail("invalid-message", "mint response id mismatch");
+    }
+    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
+        return issue_probe(state, mint.picked);
     }
     if msg.get("status").and_then(Value::as_u64) == Some(200) {
         state.pot_token = msg
@@ -270,11 +270,11 @@ fn issue_probe(state: &mut State, picked: Picked) -> Vec<u8> {
 /// ladder. A probe transport failure is `Transport`, not `Capped`:
 /// nothing about serving was learned.
 fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8> {
-    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
-        return advance(state, RungOutcome::Transport);
-    }
     if msg.get("id").and_then(Value::as_u64) != Some(u64::from(probe.request_id)) {
         return fail("invalid-message", "probe response id mismatch");
+    }
+    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
+        return advance(state, RungOutcome::Transport);
     }
     match msg.get("status").and_then(Value::as_u64).unwrap_or(0) {
         206 | 416 => {
@@ -603,6 +603,38 @@ mod tests {
             (
                 "invalid-message".to_string(),
                 "mint response id mismatch".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn mint_host_error_id_mismatch_fails() {
+        let out = begin("vid12345678");
+        let out = step(&http_response(req_id_of(&out), 200, OK));
+        assert!(mint_id_of(&out).is_some());
+        // A host_error carrying a foreign id is still a protocol
+        // violation — the denial path gets the same check.
+        let out = step(&host_error(99));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-message".to_string(),
+                "mint response id mismatch".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn probe_host_error_id_mismatch_fails() {
+        let out = begin("vid12345678");
+        let out = feed(&out, OK);
+        let _ = probe_of(&out);
+        let out = step(&host_error(99));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-message".to_string(),
+                "probe response id mismatch".to_string()
             )
         );
     }
