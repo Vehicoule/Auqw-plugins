@@ -143,13 +143,17 @@ fn on_http_step(msg: &Value, state: &mut State) -> Vec<u8> {
 fn on_ok_rung(body: &Value, state: &mut State) -> Vec<u8> {
     match format_outcome(body) {
         FormatOutcome::PlainAudio => match pick_audio(body) {
-            Some(picked) => done(&json!({
-                "url": picked.url,
-                "mime": picked.mime,
-                "bitrate_kbps": picked.bitrate_kbps,
-                "expires_at_ms": picked.expires_at_ms,
-                "client": LADDER.get(state.rung).map_or("unknown", |r| r.name),
-            })),
+            Some(picked) => {
+                let rung = LADDER.get(state.rung);
+                done(&json!({
+                    "url": picked.url,
+                    "mime": picked.mime,
+                    "bitrate_kbps": picked.bitrate_kbps,
+                    "expires_at_ms": picked.expires_at_ms,
+                    "client": rung.map_or("unknown", |r| r.name),
+                    "prefix_limited": rung.is_some_and(|r| r.gvs_po_token_required),
+                }))
+            }
             None => advance(state, RungOutcome::NoAudio),
         },
         FormatOutcome::SabrOnly => advance(state, RungOutcome::SabrOnly),
@@ -262,10 +266,10 @@ mod tests {
             header("X-YouTube-Client-Name").as_str(),
             header("X-YouTube-Client-Version").as_str(),
         ) {
-            ("5", "20.10.4") => 0,
-            ("28", "1.61.48") => 1,
-            ("28", "1.43.32") => 2,
-            ("101", "1.02") => 3,
+            ("28", "1.61.48") => 0,
+            ("28", "1.43.32") => 1,
+            ("101", "1.02") => 2,
+            ("5", "20.10.4") => 3,
             other => panic!("unexpected rung headers {other:?} in {msg}"),
         }
     }
@@ -302,7 +306,8 @@ mod tests {
         ));
         let msg = parse(&out);
         assert_eq!(msg["type"], "done");
-        assert_eq!(msg["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(msg["result"]["client"], "ANDROID_VR@1.43.32");
+        assert_eq!(msg["result"]["prefix_limited"], false);
         assert_eq!(msg["result"]["mime"], "audio/mp4");
         assert_eq!(msg["result"]["bitrate_kbps"], 130);
         assert_eq!(msg["result"]["expires_at_ms"], 1_893_456_000_000u64);
@@ -310,6 +315,30 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .starts_with("https://"));
+    }
+
+    #[test]
+    fn ios_rung_success_is_prefix_limited() {
+        let _ = step(&invoke_msg("vid12345678"));
+        // The three anonymous-friendly rungs serve SABR; the IOS
+        // fallback yields plain URLs but flagged prefix_limited.
+        for id in 1..=3u32 {
+            let out = step(&http_response(
+                id,
+                200,
+                include_str!("../fixtures/player-sabr-only.json"),
+            ));
+            assert_eq!(rung_of(&out), id as usize);
+        }
+        let out = step(&http_response(
+            4,
+            200,
+            include_str!("../fixtures/player-ok-plain-urls.json"),
+        ));
+        let msg = parse(&out);
+        assert_eq!(msg["type"], "done");
+        assert_eq!(msg["result"]["client"], "IOS");
+        assert_eq!(msg["result"]["prefix_limited"], true);
     }
 
     #[test]
@@ -371,7 +400,7 @@ mod tests {
         .unwrap_or_default();
         assert!(body.contains("\"videoId\":\"vid12345678\""));
         assert!(body.contains("\"contentCheckOk\":true"));
-        assert!(body.contains("\"clientName\":\"IOS\""));
+        assert!(body.contains("\"clientName\":\"ANDROID_VR\""));
     }
 
     #[test]

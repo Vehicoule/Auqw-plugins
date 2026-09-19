@@ -8,10 +8,10 @@ Resolves a video ID to a direct, fetchable audio URL using anonymous
 InnerTube `player` calls against `music.youtube.com`. It walks a
 four-rung, version-pinned client ladder, in order:
 
-1. `IOS` 20.10.4
-2. `ANDROID_VR` 1.61.48
-3. `ANDROID_VR` 1.43.32
-4. `VISIONOS` 1.02
+1. `ANDROID_VR` 1.61.48
+2. `ANDROID_VR` 1.43.32
+3. `VISIONOS` 1.02
+4. `IOS` 20.10.4
 
 For each rung it POSTs `youtubei/v1/player?prettyPrint=false` with the
 rung's client identity (`User-Agent`, `X-YouTube-Client-Name`/`Version`,
@@ -28,16 +28,26 @@ call lands in Slice 1.
 
 ## Why these versions
 
-Client versions are load-bearing. Live probes (Phase A) showed the
-InnerTube `player` response shape changes with the client pin:
+Client versions are load-bearing. Live probes (Phases A–B) showed the
+InnerTube `player` response shape and the googlevideo behaviour both
+change with the client pin:
 
-- `IOS` 20.10.4 returns plain `url` audio formats — the working rung.
+- `ANDROID_VR` 1.61.48 / 1.43.32 URLs serve the **full stream**
+  anonymously — any `Range: bytes=` chunk is honoured fast; a plain
+  GET succeeds but is throttled. They run first. They are bot-checked
+  (`LOGIN_REQUIRED` / "Sign in to confirm you're not a bot") on some
+  IP reputations — that check is per-IP, so they are kept rather than
+  dropped.
+- `VISIONOS` is likewise often bot-checked but kept as a fallback for
+  IPs where it passes.
+- `IOS` 20.10.4 resolves nearly everywhere but its URLs are
+  **prefix-capped**: GVS requires a PO token for the `ios` client, so
+  only the first ~1 MiB is served before 403s. The result carries
+  `prefix_limited: true` so hosts can label the stream honestly
+  instead of discovering the cap mid-playback.
 - `IOS` 21.26.4 (the version yt-dlp currently tracks) is served
   **SABR-only**: audio formats carry neither `url` nor
   `signatureCipher`, only `serverAbrStreamingUrl`.
-- `ANDROID_VR` and `VISIONOS` are often bot-checked
-  (`LOGIN_REQUIRED` / "Sign in to confirm you're not a bot") but are
-  kept as fallbacks for IPs where they pass.
 
 The versions are pinned deliberately. Do not bump them to track
 upstream — newer clients are served strictly worse responses. If every

@@ -1,4 +1,4 @@
-//! The Slice 0 client ladder: `IOS`, two `ANDROID_VR` pins, `VISIONOS`.
+//! The Slice 0 client ladder: two `ANDROID_VR` pins, `VISIONOS`, `IOS`.
 //!
 //! Client versions are load-bearing: newer IOS builds are served
 //! SABR-only. Pin, don't track upstream.
@@ -16,6 +16,10 @@ pub struct Rung {
     pub client_version: &'static str,
     /// `User-Agent` header value (also embedded in `context.client`).
     pub user_agent: &'static str,
+    /// Whether googlevideo requires a PO token for URLs minted under
+    /// this client. When true the URL serves only a ~1 MiB prefix
+    /// anonymously; the resolve result reports it as `prefix_limited`.
+    pub gvs_po_token_required: bool,
     /// Extra `context.client` fields (device, OS, locale).
     pub context: fn() -> Value,
 }
@@ -27,30 +31,19 @@ impl Rung {
     }
 }
 
-/// The ladder, in evidence order. Do not add rungs (Slice 0 scope);
+/// The ladder, in evidence order. `ANDROID_VR` runs first because its
+/// URLs serve the full stream anonymously; `IOS` resolves everywhere
+/// but its URLs are prefix-capped by GVS PO-token enforcement, so it
+/// is the fallback rung. Do not add rungs (Slice 0 scope);
 /// `WEB_REMIX` is excluded permanently — it requires signature
 /// deciphering, which is out of scope by contract.
 pub const LADDER: &[Rung] = &[
-    Rung {
-        name: "IOS",
-        client_name_id: "5",
-        client_version: "20.10.4",
-        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-        context: || {
-            json!({
-                "deviceMake": "Apple",
-                "deviceModel": "iPhone16,2",
-                "osName": "iPhone",
-                "osVersion": "18.3.2.22F90",
-                "hl": "en",
-            })
-        },
-    },
     Rung {
         name: "ANDROID_VR@1.61.48",
         client_name_id: "28",
         client_version: "1.61.48",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
+        gvs_po_token_required: false,
         context: || {
             json!({
                 "osName": "Android",
@@ -68,6 +61,7 @@ pub const LADDER: &[Rung] = &[
         client_name_id: "28",
         client_version: "1.43.32",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
+        gvs_po_token_required: false,
         context: || {
             json!({
                 "osName": "Android",
@@ -85,6 +79,7 @@ pub const LADDER: &[Rung] = &[
         client_name_id: "101",
         client_version: "1.02",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        gvs_po_token_required: false,
         context: || {
             json!({
                 "deviceMake": "Apple",
@@ -93,6 +88,22 @@ pub const LADDER: &[Rung] = &[
                 "osVersion": "26.5.23O471",
                 "hl": "en",
                 "gl": "US",
+            })
+        },
+    },
+    Rung {
+        name: "IOS",
+        client_name_id: "5",
+        client_version: "20.10.4",
+        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        gvs_po_token_required: true,
+        context: || {
+            json!({
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22F90",
+                "hl": "en",
             })
         },
     },
