@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "plugins/youtube-music",
+    "tooling/validate",
+]
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

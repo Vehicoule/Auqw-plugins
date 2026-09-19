@@ -1,0 +1,21 @@
+{
+  "playabilityStatus": {
+    "status": "OK"
+  },
+  "streamingData": {
+    "adaptiveFormats": [
+      {
+        "itag": 140,
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "bitrate": 130000,
+        "signatureCipher": "s=AAA%3D%3D&sp=sig&url=https%3A%2F%2Frr1---sn-aaax.googlevideo.com%2Fvideoplayback%3Fid%3Dv1"
+      },
+      {
+        "itag": 251,
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "bitrate": 131000,
+        "cipher": "s=BBB%3D%3D&sp=sig&url=https%3A%2F%2Frr1---sn-aaax.googlevideo.com%2Fvideoplayback%3Fid%3Dv1"
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "abi": "0.1.0",
+  "artifact": {
+    "digest": "sha256:9d0a0c282e1d20d4653b629e0b5ad6a323364ff279b5b92c0d4914346042c07d",
+    "path": "dist/youtube-music.wasm"
+  },
+  "capabilities": [
+    "playback.resolve"
+  ],
+  "id": "youtube-music",
+  "permissions": [
+    "network:www.youtube.com",
+    "network:*.googlevideo.com"
+  ],
+  "version": "0.1.0"
+}

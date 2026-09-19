@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# build artifacts (rebuilt via tooling/build.sh; digests are pinned in
+# manifest.json and auqw/providers.lock.json)
+plugins/*/dist/

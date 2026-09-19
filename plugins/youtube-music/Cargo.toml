@@ -1,0 +1,19 @@
+[package]
+name = "auqw-youtube-music"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Slice 0 minimal YouTube Music playback.resolve guest (ABI v0)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Guests need `unsafe` for the ABI pointer handoff; the workspace forbids
+# unsafe_code, so this crate declares its own lints instead of inheriting.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dependencies]
+serde_json = "1.0.149"
+base64 = "0.22.1"

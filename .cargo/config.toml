@@ -1,0 +1,9 @@
+# Release profile for guest artifacts: small, self-contained, zero
+# imports. `panic = "abort"` keeps unwinding machinery (and its imports)
+# out of the module.
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true
