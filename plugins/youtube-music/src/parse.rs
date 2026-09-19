@@ -67,7 +67,10 @@ pub fn classify_playability(body: &Value) -> (Playability, String) {
     if has_whole_word_age(&blob) {
         return (Playability::AgeRestricted, reason);
     }
-    if blob.contains("sign in") {
+    if blob.contains("sign in") || status_str == "LOGIN_REQUIRED" {
+        // `LOGIN_REQUIRED` is the canonical sign-in status even with no
+        // reason text — but bot-check reasons under it were caught
+        // above, so this arm only fires on a real sign-in wall.
         return (Playability::SignInRequired, reason);
     }
     (Playability::Unavailable, reason)
@@ -156,7 +159,13 @@ pub fn pick_audio(body: &Value) -> Option<Picked> {
         if !mime.starts_with("audio/") {
             continue;
         }
-        if format.get("url").and_then(Value::as_str).is_none() {
+        if format
+            .get("url")
+            .and_then(Value::as_str)
+            .is_none_or(|u| !u.starts_with("https://"))
+        {
+            // The host only serves https:// destinations — a non-https
+            // format is unusable, not a reason to kill the resolve.
             continue;
         }
         let bitrate = format.get("bitrate").and_then(Value::as_u64).unwrap_or(0);
@@ -297,6 +306,16 @@ mod tests {
     }
 
     #[test]
+    fn bare_login_status_is_sign_in() {
+        // `LOGIN_REQUIRED` with no reason or messages is still a
+        // sign-in wall, not generic unavailability.
+        let body = serde_json::json!({
+            "playabilityStatus": { "status": "LOGIN_REQUIRED" }
+        });
+        assert_eq!(classify_playability(&body).0, Playability::SignInRequired);
+    }
+
+    #[test]
     fn messages_join_reason_blob() {
         let body = serde_json::json!({
             "playabilityStatus": {
@@ -401,5 +420,15 @@ mod tests {
     fn no_pick_without_plain_url() {
         assert!(pick_audio(&fixture("sabr")).is_none());
         assert!(pick_audio(&fixture("ciphered")).is_none());
+    }
+
+    #[test]
+    fn non_https_url_is_unpickable() {
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "bitrate": 128000, "url": "http://x/v"}
+            ]}
+        });
+        assert!(pick_audio(&body).is_none());
     }
 }

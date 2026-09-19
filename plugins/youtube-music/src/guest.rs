@@ -67,10 +67,14 @@ thread_local! {
 
 /// One ABI step: consume the step message bytes, produce the response
 /// message bytes.
+///
+/// The `fail` kinds emitted here stay inside the guest-visible taxonomy —
+/// off-contract host bytes (unparseable input, foreign response ids) are
+/// `invalid-response`; the host-only kinds are the host's to produce.
 pub fn step(input: &[u8]) -> Vec<u8> {
     let msg: Value = match serde_json::from_slice(input) {
         Ok(v) => v,
-        Err(_) => return fail("invalid-message", "step input is not JSON"),
+        Err(_) => return fail("invalid-response", "step input is not JSON"),
     };
     match msg.get("type").and_then(Value::as_str) {
         Some("invoke") => on_invoke(&msg),
@@ -78,10 +82,10 @@ pub fn step(input: &[u8]) -> Vec<u8> {
             let mut s = s.borrow_mut();
             match s.as_mut() {
                 Some(state) => on_http_step(&msg, state),
-                None => fail("invalid-message", "http step before invoke"),
+                None => fail("invalid-response", "http step before invoke"),
             }
         }),
-        _ => fail("invalid-message", "unknown step message type"),
+        _ => fail("invalid-response", "unknown step message type"),
     }
 }
 
@@ -132,7 +136,7 @@ fn issue_request(state: &mut State) -> Vec<u8> {
 /// paused pick goes to its tail probe.
 fn on_mint_step(msg: &Value, mint: PendingMint, state: &mut State) -> Vec<u8> {
     if msg.get("id").and_then(Value::as_u64) != Some(u64::from(mint.request_id)) {
-        return fail("invalid-message", "mint response id mismatch");
+        return fail("invalid-response", "mint response id mismatch");
     }
     if msg.get("type").and_then(Value::as_str) == Some("host_error") {
         return issue_probe(state, mint.picked);
@@ -169,6 +173,12 @@ fn on_http_step(msg: &Value, state: &mut State) -> Vec<u8> {
     }
     if let Some(probe) = state.pending_probe.take() {
         return on_probe_step(msg, probe, state);
+    }
+    // Otherwise the outstanding request is the rung's player call —
+    // `next_id - 1`, since mint/probe ids are consumed only while
+    // pending. A foreign id is a host protocol violation here too.
+    if msg.get("id").and_then(Value::as_u64) != Some(u64::from(state.next_id - 1)) {
+        return fail("invalid-response", "player response id mismatch");
     }
     if msg.get("type").and_then(Value::as_str) == Some("host_error") {
         return advance(state, RungOutcome::Transport);
@@ -245,7 +255,8 @@ fn issue_probe_or_mint(state: &mut State, picked: Picked) -> Vec<u8> {
 /// a URL that cannot serve the track.
 fn issue_probe(state: &mut State, picked: Picked) -> Vec<u8> {
     let Some(rung) = LADDER.get(state.rung) else {
-        return fail("internal", "probe without rung");
+        // Unreachable: pending_probe is only set by a live rung's pick.
+        return fail("invalid-response", "probe without rung");
     };
     let id = state.next_id;
     state.next_id += 1;
@@ -271,7 +282,7 @@ fn issue_probe(state: &mut State, picked: Picked) -> Vec<u8> {
 /// nothing about serving was learned.
 fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8> {
     if msg.get("id").and_then(Value::as_u64) != Some(u64::from(probe.request_id)) {
-        return fail("invalid-message", "probe response id mismatch");
+        return fail("invalid-response", "probe response id mismatch");
     }
     if msg.get("type").and_then(Value::as_str) == Some("host_error") {
         return advance(state, RungOutcome::Transport);
@@ -579,8 +590,36 @@ mod tests {
         assert_eq!(
             fail_kind(&out),
             (
-                "invalid-message".to_string(),
+                "invalid-response".to_string(),
                 "probe response id mismatch".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn player_response_id_mismatch_fails() {
+        let player_id = req_id_of(&begin("vid12345678"));
+        // A response whose id is not the outstanding player request's is
+        // a host protocol violation, same as on the mint/probe legs.
+        let out = step(&http_response(player_id + 98, 200, OK));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-response".to_string(),
+                "player response id mismatch".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn player_host_error_id_mismatch_fails() {
+        let player_id = req_id_of(&begin("vid12345678"));
+        let out = step(&host_error(player_id + 98));
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "invalid-response".to_string(),
+                "player response id mismatch".to_string()
             )
         );
     }
@@ -601,7 +640,7 @@ mod tests {
         assert_eq!(
             fail_kind(&out),
             (
-                "invalid-message".to_string(),
+                "invalid-response".to_string(),
                 "mint response id mismatch".to_string()
             )
         );
@@ -618,7 +657,7 @@ mod tests {
         assert_eq!(
             fail_kind(&out),
             (
-                "invalid-message".to_string(),
+                "invalid-response".to_string(),
                 "mint response id mismatch".to_string()
             )
         );
@@ -633,7 +672,7 @@ mod tests {
         assert_eq!(
             fail_kind(&out),
             (
-                "invalid-message".to_string(),
+                "invalid-response".to_string(),
                 "probe response id mismatch".to_string()
             )
         );

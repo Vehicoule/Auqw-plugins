@@ -142,7 +142,9 @@ pub fn pot_mint_request(content_binding: &str, request_id: u32) -> Vec<u8> {
         "kind": "pot_token",
         "payload": { "content_binding": content_binding },
     });
-    serde_json::to_vec(&msg).unwrap_or_else(|_| fail("internal", "serialize"))
+    // `to_vec` cannot fail on this shape; if it somehow did, an empty
+    // output is the honest signal — the host reports invalid-message.
+    serde_json::to_vec(&msg).unwrap_or_default()
 }
 
 /// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
@@ -150,11 +152,30 @@ pub fn pot_mint_request(content_binding: &str, request_id: u32) -> Vec<u8> {
 /// token is percent-encoded: providers return URL-safe base64 today,
 /// but a `+`, `&`, or `%` would otherwise corrupt the query.
 pub fn append_pot(url: &str, token: &str) -> String {
-    if !url.contains("googlevideo.com") || url.contains("pot=") {
+    if !is_googlevideo(url) || url.contains("?pot=") || url.contains("&pot=") {
         return url.to_string();
     }
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}pot={}", url_query_value(token))
+}
+
+/// `url` is HTTPS with host `googlevideo.com` or a subdomain — the same
+/// shape the manifest's `*.googlevideo.com` allowlist admits. The host
+/// still validates the `done` URL; this just avoids leaking the token
+/// into a URL shaped like googlevideo that isn't.
+fn is_googlevideo(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host == "googlevideo.com" || host.ends_with(".googlevideo.com")
 }
 
 /// RFC 3986 unreserved characters pass through; everything else is
@@ -210,9 +231,10 @@ pub fn probe_request(
                 ["User-Agent", rung.user_agent],
                 ["Range", probe_range(content_length)],
             ],
+            "body": Value::Null,
         }
     });
-    serde_json::to_vec(&msg).unwrap_or_else(|_| fail("internal", "serialize"))
+    serde_json::to_vec(&msg).unwrap_or_default()
 }
 
 /// Build the `host_request` step message for one rung's player call.
@@ -262,15 +284,7 @@ pub fn player_request(
             "body": base64::engine::general_purpose::STANDARD.encode(body_bytes),
         }
     });
-    serde_json::to_vec(&msg).unwrap_or_else(|_| fail("internal", "serialize"))
-}
-
-fn fail(kind: &str, message: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "type": "fail",
-        "error": { "kind": kind, "message": message },
-    }))
-    .unwrap_or_default()
+    serde_json::to_vec(&msg).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -287,8 +301,15 @@ mod tests {
 
     #[test]
     fn pot_skipped_for_foreign_or_decorated_urls() {
-        let plain = "https://example.com/v";
-        assert_eq!(append_pot(plain, "t"), plain);
+        // The token never lands on a non-googlevideo host, even when the
+        // URL merely contains the string.
+        for url in [
+            "https://example.com/v?redir=googlevideo.com",
+            "http://rr1---sn.googlevideo.com/v",
+            "https://googlevideo.com.evil.com/v",
+        ] {
+            assert_eq!(append_pot(url, "t"), url);
+        }
         let done = "https://rr1---sn.googlevideo.com/v?pot=old";
         assert_eq!(append_pot(done, "new"), done);
     }
