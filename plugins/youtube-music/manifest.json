@@ -1,7 +1,7 @@
 {
   "abi": "0.1.0",
   "artifact": {
-    "digest": "sha256:c22a95277a7cef6cf77203fd70a4856f0c0bacdbde0b7778ebb47d7f415c348f",
+    "digest": "sha256:504c945e93f3cce114bca69f82f68a9aa8d666c3575a6ffefe694b237b4fac60",
     "path": "dist/youtube-music.wasm"
   },
   "capabilities": [
@@ -10,7 +10,8 @@
   "id": "youtube-music",
   "permissions": [
     "network:music.youtube.com",
-    "network:*.googlevideo.com"
+    "network:*.googlevideo.com",
+    "pot-provider"
   ],
   "version": "0.1.0"
 }

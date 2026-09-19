@@ -130,6 +130,31 @@ pub const LADDER: &[Rung] = &[
 /// host for this provider.
 pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false";
 
+/// Build the `pot_token` host request minting a PO token bound to
+/// `content_binding`. The host performs the provider call — guests never
+/// see the provider URL and stay HTTPS-only by contract. A missing
+/// permission or an unconfigured provider returns `host_error`, which
+/// the caller degrades to the anonymous path.
+pub fn pot_mint_request(content_binding: &str, request_id: u32) -> Vec<u8> {
+    let msg = json!({
+        "type": "host_request",
+        "id": request_id,
+        "kind": "pot_token",
+        "payload": { "content_binding": content_binding },
+    });
+    serde_json::to_vec(&msg).unwrap_or_else(|_| fail("internal", "serialize"))
+}
+
+/// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
+/// URLs and URLs already carrying `pot=` pass through unchanged.
+pub fn append_pot(url: &str, token: &str) -> String {
+    if !url.contains("googlevideo.com") || url.contains("pot=") {
+        return url.to_string();
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}pot={token}")
+}
+
 /// Bytes requested by a minted-URL probe: the file's last 64 KiB.
 /// Strict-mode mints carry a served horizon H (~1 MiB, varies per
 /// mint): windows must end at or below H. A tail window ends at the
@@ -175,6 +200,9 @@ pub fn probe_request(
 }
 
 /// Build the `host_request` step message for one rung's player call.
+/// PO tokens never ride player requests — a web-minted BotGuard token
+/// cannot attest a non-web client; they decorate googlevideo stream
+/// URLs only, via [`append_pot`].
 pub fn player_request(
     rung: &Rung,
     video_id: &str,
