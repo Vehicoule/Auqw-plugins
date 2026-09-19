@@ -1,6 +1,5 @@
-//! The Slice 0 client ladder: two `ANDROID_VR` pins, `VISIONOS`, `IOS`.
-//!
-//! Client versions are load-bearing: newer IOS builds are served
+//! The Slice 0 client ladder: `VISIONOS`, `IOS`, three `ANDROID_VR`
+//! pins. Client versions are load-bearing: newer IOS builds are served
 //! SABR-only. Pin, don't track upstream.
 
 use base64::Engine as _;
@@ -16,10 +15,6 @@ pub struct Rung {
     pub client_version: &'static str,
     /// `User-Agent` header value (also embedded in `context.client`).
     pub user_agent: &'static str,
-    /// Whether googlevideo requires a PO token for URLs minted under
-    /// this client. When true the URL serves only a ~1 MiB prefix
-    /// anonymously; the resolve result reports it as `prefix_limited`.
-    pub gvs_po_token_required: bool,
     /// Extra `context.client` fields (device, OS, locale).
     pub context: fn() -> Value,
 }
@@ -31,19 +26,75 @@ impl Rung {
     }
 }
 
-/// The ladder, in evidence order. `ANDROID_VR` runs first because its
-/// URLs serve the full stream anonymously; `IOS` resolves everywhere
-/// but its URLs are prefix-capped by GVS PO-token enforcement, so it
-/// is the fallback rung. Do not add rungs (Slice 0 scope);
-/// `WEB_REMIX` is excluded permanently — it requires signature
-/// deciphering, which is out of scope by contract.
+/// The ladder, in fallback order. `VISIONOS` runs first: it resolves
+/// nearly everywhere and almost never bot-checks from residential IPs.
+/// `ANDROID_VR` rungs are the fallback — their URLs serve full streams
+/// but the rung itself is the most bot-checked from residential IPs, so
+/// it runs only after the Apple clients fail. `IOS` sits between:
+/// resolves widely, occasionally SABR-only on newer versions (hence the
+/// 20.10.4 pin). `WEB_REMIX` is excluded permanently — it requires
+/// signature deciphering, which is out of scope by contract.
+///
+/// Stream caps: any minted URL may be GVS-capped to a ~1 MiB served
+/// budget; enforcement is stochastic per-mint, not client-deterministic
+/// (live-verified 2026-09: both VISIONOS and ANDROID_VR mints have been
+/// observed capped and uncapped). Recovery is a downloader concern —
+/// re-resolve for a fresh mint and resume at the written offset — so no
+/// rung carries a cap flag.
 pub const LADDER: &[Rung] = &[
+    Rung {
+        name: "VISIONOS",
+        client_name_id: "101",
+        client_version: "1.02",
+        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        context: || {
+            json!({
+                "deviceMake": "Apple",
+                "deviceModel": "RealityDevice17,1",
+                "osName": "visionOS",
+                "osVersion": "26.5.23O471",
+                "hl": "en",
+                "gl": "US",
+            })
+        },
+    },
+    Rung {
+        name: "IOS",
+        client_name_id: "5",
+        client_version: "20.10.4",
+        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+        context: || {
+            json!({
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22F90",
+                "hl": "en",
+            })
+        },
+    },
     Rung {
         name: "ANDROID_VR@1.61.48",
         client_name_id: "28",
         client_version: "1.61.48",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
-        gvs_po_token_required: false,
+        context: || {
+            json!({
+                "osName": "Android",
+                "osVersion": "12",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": "32",
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
+        name: "ANDROID_VR@1.60.19",
+        client_name_id: "28",
+        client_version: "1.60.19",
+        user_agent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
         context: || {
             json!({
                 "osName": "Android",
@@ -61,7 +112,6 @@ pub const LADDER: &[Rung] = &[
         client_name_id: "28",
         client_version: "1.43.32",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
-        gvs_po_token_required: false,
         context: || {
             json!({
                 "osName": "Android",
@@ -74,44 +124,55 @@ pub const LADDER: &[Rung] = &[
             })
         },
     },
-    Rung {
-        name: "VISIONOS",
-        client_name_id: "101",
-        client_version: "1.02",
-        user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
-        gvs_po_token_required: false,
-        context: || {
-            json!({
-                "deviceMake": "Apple",
-                "deviceModel": "RealityDevice17,1",
-                "osName": "visionOS",
-                "osVersion": "26.5.23O471",
-                "hl": "en",
-                "gl": "US",
-            })
-        },
-    },
-    Rung {
-        name: "IOS",
-        client_name_id: "5",
-        client_version: "20.10.4",
-        user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-        gvs_po_token_required: true,
-        context: || {
-            json!({
-                "deviceMake": "Apple",
-                "deviceModel": "iPhone16,2",
-                "osName": "iPhone",
-                "osVersion": "18.3.2.22F90",
-                "hl": "en",
-            })
-        },
-    },
 ];
 
 /// The InnerTube `player` endpoint. `music.youtube.com` is the canonical
 /// host for this provider.
 pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false";
+
+/// Bytes requested by a minted-URL probe: the file's last 64 KiB.
+/// Strict-mode mints carry a served horizon H (~1 MiB, varies per
+/// mint): windows must end at or below H. A tail window ends at the
+/// file's last byte, so a 206 proves this mint serves the whole file;
+/// a 403 marks the rung capped. When `contentLength` is unknown the
+/// probe falls back to a window past the most-observed ~1 MiB horizon
+/// — a weaker guarantee (a higher H can still pass and cap later).
+const PROBE_TAIL_BYTES: u64 = 65536;
+const PROBE_FALLBACK_RANGE: &str = "bytes=1048576-1114111";
+
+/// The Range header value for a probe over `content_length` bytes.
+fn probe_range(content_length: Option<u64>) -> String {
+    match content_length {
+        Some(len) => {
+            let start = len.saturating_sub(PROBE_TAIL_BYTES);
+            format!("bytes={start}-{}", len - 1)
+        }
+        None => PROBE_FALLBACK_RANGE.to_string(),
+    }
+}
+
+/// Build the tail-probe `host_request` for a minted stream URL.
+pub fn probe_request(
+    rung: &Rung,
+    url: &str,
+    request_id: u32,
+    content_length: Option<u64>,
+) -> Vec<u8> {
+    let msg = json!({
+        "type": "host_request",
+        "id": request_id,
+        "kind": "http_request",
+        "payload": {
+            "method": "GET",
+            "url": url,
+            "headers": [
+                ["User-Agent", rung.user_agent],
+                ["Range", probe_range(content_length)],
+            ],
+        }
+    });
+    serde_json::to_vec(&msg).unwrap_or_else(|_| fail("internal", "serialize"))
+}
 
 /// Build the `host_request` step message for one rung's player call.
 pub fn player_request(

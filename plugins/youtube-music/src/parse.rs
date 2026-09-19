@@ -42,6 +42,8 @@ pub struct Picked {
     pub bitrate_kbps: Option<u64>,
     /// `expire=` query param converted to epoch milliseconds.
     pub expires_at_ms: Option<u64>,
+    /// `contentLength` of the format in bytes, when reported.
+    pub content_length: Option<u64>,
 }
 
 /// Classify `playabilityStatus`. `status` is checked first; when the
@@ -186,7 +188,18 @@ pub fn pick_audio(body: &Value) -> Option<Picked> {
         mime: mime.to_string(),
         bitrate_kbps,
         expires_at_ms: expire_ms(url),
+        content_length: content_length(format),
     })
+}
+
+/// `contentLength` arrives as a JSON string on live responses; accept a
+/// number too so fixtures can use either shape.
+fn content_length(format: &Value) -> Option<u64> {
+    let v = format.get("contentLength")?;
+    v.as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| v.as_u64())
+        .filter(|len| *len > 0)
 }
 
 /// Pull `expire=<unix seconds>` out of the URL and convert to ms.

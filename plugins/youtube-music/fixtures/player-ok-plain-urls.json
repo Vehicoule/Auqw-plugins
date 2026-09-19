@@ -9,28 +9,32 @@
         "itag": 18,
         "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
         "bitrate": 450000,
-        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1"
+        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1",
+        "contentLength": "4557665"
       },
       {
         "itag": 250,
         "mimeType": "audio/webm; codecs=\"opus\"",
         "bitrate": 72000,
         "averageBitrate": 70000,
-        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1&itag=250"
+        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1&itag=250",
+        "contentLength": "4557665"
       },
       {
         "itag": 251,
         "mimeType": "audio/webm; codecs=\"opus\"",
         "bitrate": 132000,
         "averageBitrate": 131000,
-        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1&itag=251"
+        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1&itag=251",
+        "contentLength": "4557665"
       },
       {
         "itag": 140,
         "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
         "bitrate": 130000,
         "averageBitrate": 129500,
-        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1&itag=140"
+        "url": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&id=v1&itag=140",
+        "contentLength": "4557665"
       }
     ]
   }
