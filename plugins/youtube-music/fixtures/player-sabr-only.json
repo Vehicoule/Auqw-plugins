@@ -1,0 +1,26 @@
+{
+  "responseContext": {
+    "visitorData": "Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D"
+  },
+  "playabilityStatus": {
+    "status": "OK"
+  },
+  "streamingData": {
+    "expiresInSeconds": "21540",
+    "serverAbrStreamingUrl": "https://rr1---sn-aaax.googlevideo.com/videoplayback?expire=1893456000&xtags=sabr",
+    "adaptiveFormats": [
+      {
+        "itag": 140,
+        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "bitrate": 130000,
+        "averageBitrate": 129500
+      },
+      {
+        "itag": 251,
+        "mimeType": "audio/webm; codecs=\"opus\"",
+        "bitrate": 132000,
+        "averageBitrate": 131000
+      }
+    ]
+  }
+}

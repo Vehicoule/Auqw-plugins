@@ -1,9 +1,9 @@
 //! Minimal YouTube Music `playback.resolve` guest (ABI v0).
 //!
-//! Slice 0 scope: resolve one video ID through a two-rung client ladder
-//! (`IOS`, `ANDROID_VR`) via host-performed HTTP. No cookies, no
-//! signature deciphering, no KV, no search/radio/candidates — see
-//! `README.md`.
+//! Slice 0 scope: resolve one video ID through a four-rung,
+//! version-pinned client ladder (`IOS`, two `ANDROID_VR` pins,
+//! `VISIONOS`) via host-performed HTTP. No cookies, no signature
+//! deciphering, no KV, no search/radio/candidates — see `README.md`.
 
 mod guest;
 mod parse;
