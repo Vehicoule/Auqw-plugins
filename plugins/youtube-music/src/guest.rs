@@ -275,11 +275,16 @@ fn issue_probe(state: &mut State, picked: Picked) -> Vec<u8> {
     req
 }
 
-/// The probe verdict: 206 serves the file's tail, 416 is a defensive
-/// pass (a tail probe can't legitimately 416) — both return the picked
-/// resource. Anything else marks the mint capped and advances the
-/// ladder. A probe transport failure is `Transport`, not `Capped`:
-/// nothing about serving was learned.
+/// The probe verdict: 206 serves the file's tail and returns the picked
+/// resource. A 416 is a pass only when the probe used the fallback
+/// range — `content_length` was unknown, so the file may legitimately
+/// end before the probe start. A 416 on a known-length tail probe means
+/// the mint refuses bytes inside the advertised length (a cap, or a
+/// `contentLength` lie): the rung is `Capped`, same as a 403 — the
+/// downloader's strict-206 loop would only re-mint the same lie.
+/// Anything else marks the mint capped and advances the ladder. A probe
+/// transport failure is `Transport`, not `Capped`: nothing about
+/// serving was learned.
 fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8> {
     if msg.get("id").and_then(Value::as_u64) != Some(u64::from(probe.request_id)) {
         return fail("invalid-response", "probe response id mismatch");
@@ -287,20 +292,21 @@ fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8>
     if msg.get("type").and_then(Value::as_str) == Some("host_error") {
         return advance(state, RungOutcome::Transport);
     }
-    match msg.get("status").and_then(Value::as_u64).unwrap_or(0) {
-        206 | 416 => {
-            let rung = LADDER.get(state.rung);
-            let picked = probe.picked;
-            done(&json!({
-                "url": picked.url,
-                "mime": picked.mime,
-                "bitrate_kbps": picked.bitrate_kbps,
-                "expires_at_ms": picked.expires_at_ms,
-                "content_length": picked.content_length,
-                "client": rung.map_or("unknown", |r| r.name),
-            }))
-        }
-        _ => advance(state, RungOutcome::Capped),
+    let status = msg.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let served = status == 206 || (status == 416 && probe.picked.content_length.is_none());
+    if served {
+        let rung = LADDER.get(state.rung);
+        let picked = probe.picked;
+        done(&json!({
+            "url": picked.url,
+            "mime": picked.mime,
+            "bitrate_kbps": picked.bitrate_kbps,
+            "expires_at_ms": picked.expires_at_ms,
+            "content_length": picked.content_length,
+            "client": rung.map_or("unknown", |r| r.name),
+        }))
+    } else {
+        advance(state, RungOutcome::Capped)
     }
 }
 
@@ -554,11 +560,41 @@ mod tests {
     }
 
     #[test]
-    fn probe_416_means_short_file_done() {
+    fn probe_416_with_known_length_is_capped() {
         let out = begin("vid12345678");
         let out = feed(&out, OK);
         let probe_id = probe_of(&out);
-        // File shorter than the probe window cannot cap -> done.
+        // The probe window was inside the advertised contentLength, so a
+        // 416 is a serving refusal — the rung is capped, not done.
+        let out = step(&http_response(probe_id, 416, ""));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_416_without_length_means_short_file_done() {
+        let out = begin("vid12345678");
+        // Strip contentLength so the probe falls back to a fixed window
+        // past the ~1 MiB horizon; a 416 there just means a short file.
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body
+            .pointer_mut("/streamingData/adaptiveFormats")
+            .and_then(Value::as_array_mut)
+        else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        for f in fmts {
+            if let Some(o) = f.as_object_mut() {
+                o.remove("contentLength");
+            }
+        }
+        let out = feed(&out, &body.to_string());
+        let msg = parse(&out);
+        assert_eq!(msg["payload"]["method"], "GET");
+        assert_eq!(
+            header_of(&out, "Range").as_deref(),
+            Some("bytes=1048576-1114111")
+        );
+        let probe_id = req_id_of(&out);
         let out = step(&http_response(probe_id, 416, ""));
         let msg = parse(&out);
         assert_eq!(msg["type"], "done");
