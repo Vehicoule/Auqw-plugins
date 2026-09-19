@@ -208,7 +208,7 @@ fn expire_ms(url: &str) -> Option<u64> {
         if let Some((_, rest)) = url.split_once(marker) {
             let value = rest.split('&').next().unwrap_or(rest);
             let secs = value.parse::<u64>().ok()?;
-            return Some(secs * 1000);
+            return secs.checked_mul(1000);
         }
     }
     None
@@ -373,6 +373,22 @@ mod tests {
         let body = serde_json::json!({
             "streamingData": { "adaptiveFormats": [
                 {"mimeType": "audio/mp4", "bitrate": 128000, "url": "https://x/v?foo=1"}
+            ]}
+        });
+        let Some(p) = pick_audio(&body) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.expires_at_ms, None);
+    }
+
+    #[test]
+    fn absurd_expire_is_none_not_wrapped() {
+        // u64::MAX seconds cannot become milliseconds — the expiry is
+        // unknown rather than a wrapped timestamp in the distant past.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "bitrate": 128000,
+                 "url": format!("https://x/v?expire={}", u64::MAX)}
             ]}
         });
         let Some(p) = pick_audio(&body) else {

@@ -146,13 +146,29 @@ pub fn pot_mint_request(content_binding: &str, request_id: u32) -> Vec<u8> {
 }
 
 /// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
-/// URLs and URLs already carrying `pot=` pass through unchanged.
+/// URLs and URLs already carrying `pot=` pass through unchanged. The
+/// token is percent-encoded: providers return URL-safe base64 today,
+/// but a `+`, `&`, or `%` would otherwise corrupt the query.
 pub fn append_pot(url: &str, token: &str) -> String {
     if !url.contains("googlevideo.com") || url.contains("pot=") {
         return url.to_string();
     }
     let separator = if url.contains('?') { '&' } else { '?' };
-    format!("{url}{separator}pot={token}")
+    format!("{url}{separator}pot={}", url_query_value(token))
+}
+
+/// RFC 3986 unreserved characters pass through; everything else is
+/// percent-encoded (UTF-8, though tokens are ASCII in practice).
+fn url_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_' || b == b'~' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Bytes requested by a minted-URL probe: the file's last 64 KiB.
@@ -255,4 +271,25 @@ fn fail(kind: &str, message: &str) -> Vec<u8> {
         "error": { "kind": kind, "message": message },
     }))
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pot_appended_url_encoded() {
+        assert_eq!(
+            append_pot("https://rr1---sn.googlevideo.com/v?x=1", "tok+en&=%"),
+            "https://rr1---sn.googlevideo.com/v?x=1&pot=tok%2Ben%26%3D%25"
+        );
+    }
+
+    #[test]
+    fn pot_skipped_for_foreign_or_decorated_urls() {
+        let plain = "https://example.com/v";
+        assert_eq!(append_pot(plain, "t"), plain);
+        let done = "https://rr1---sn.googlevideo.com/v?pot=old";
+        assert_eq!(append_pot(done, "new"), done);
+    }
 }
