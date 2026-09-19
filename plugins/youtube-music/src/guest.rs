@@ -206,6 +206,16 @@ fn on_http_step(msg: &Value, state: &mut State) -> Vec<u8> {
     if let Some(visitor) = visitor_data(&body) {
         state.visitor_id = Some(visitor);
     }
+    // A player response naming a different video is not this resolve's
+    // resource — the rung answered, just not what was asked. Its stream
+    // URL must never reach the picker; the rung counts as unavailable.
+    if body
+        .pointer("/videoDetails/videoId")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id != state.video_id)
+    {
+        return advance(state, RungOutcome::Unavailable);
+    }
     match classify_playability(&body) {
         (Playability::Ok, _) => on_ok_rung(&body, state),
         (Playability::BotCheck, _) => advance(state, RungOutcome::Bot),
@@ -892,5 +902,29 @@ mod tests {
         let out = begin("vid12345678");
         let out = step(&host_error(req_id_of(&out)));
         assert_eq!(rung_of(&out), 1);
+    }
+
+    /// A player response whose `videoDetails.videoId` is not the
+    /// requested id never reaches the picker — its stream URL would be
+    /// the wrong song. The rung counts as unavailable and the ladder
+    /// advances; a response carrying no `videoDetails` at all is not
+    /// penalized (some rungs omit it).
+    #[test]
+    fn wrong_video_id_never_reaches_picker() {
+        let mut wrong: Value = serde_json::from_str(OK).unwrap_or_default();
+        wrong["videoDetails"] = json!({ "videoId": "a-different-video" });
+        let wrong = wrong.to_string();
+        let out = begin("vid12345678");
+        let out = feed(&out, &wrong);
+        assert_eq!(rung_of(&out), 1);
+        // Every rung answering the wrong video -> honest no-result.
+        let mut out = begin("vid12345678");
+        for _ in 0..5 {
+            out = feed(&out, &wrong);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("no-result".to_string(), "unavailable".to_string())
+        );
     }
 }

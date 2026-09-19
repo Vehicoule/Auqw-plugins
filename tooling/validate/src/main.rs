@@ -2,12 +2,13 @@
 //!
 //! `auqw-validate <plugin.wasm> <manifest.json> [--update-digest]`
 //!
-//! Checks artifact size (<= 5 MiB), zero imports, no start section, and
-//! the required exports (`memory`, `alloc`, `handle`) with exact
-//! signatures; computes the artifact's sha256 and verifies or updates
-//! `manifest.artifact.digest`.
+//! Checks artifact size (<= 5 MiB), full module validity, zero imports,
+//! no start section, and the required exports (`memory`, `alloc`,
+//! `handle`) with exact signatures; enforces the manifest schema
+//! (`sdk/contract/manifest.schema.json`); computes the artifact's
+//! sha256 and verifies or updates `manifest.artifact.digest`.
 //!
-//! Deliberately independent of the auqw host crate: a duplicated ~80-line
+//! Deliberately independent of the auqw host crate: a duplicated
 //! inspection is the intended cost of keeping the repos decoupled.
 
 use std::process::ExitCode;
@@ -57,6 +58,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Err(e) = check_manifest(&manifest) {
+        eprintln!("validate: {e}");
+        return ExitCode::FAILURE;
+    }
     let pinned = manifest
         .get("artifact")
         .and_then(|a| a.get("digest"))
@@ -139,6 +144,13 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
         }
     }
 
+    // Structural checks inspect sections without executing anything —
+    // full validation (type-checking bodies, export-name uniqueness,
+    // index resolution) is wasmparser's job.
+    wasmparser::Validator::new()
+        .validate_all(wasm)
+        .map_err(|e| format!("invalid module: {e}"))?;
+
     if has_start {
         return Err("module has a start section".into());
     }
@@ -191,6 +203,123 @@ fn check_func(
         .ok_or_else(|| format!("{name} type index out of range"))?;
     if p.as_slice() != params || r.as_slice() != results {
         return Err(format!("{name} has wrong signature"));
+    }
+    Ok(())
+}
+
+/// The manifest schema (`sdk/contract/manifest.schema.json`), enforced
+/// field by field: required keys, no unknown keys, and each field's
+/// grammar. Kept in sync by hand — the schema is the contract.
+fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
+    const FIELDS: [&str; 6] = [
+        "id",
+        "version",
+        "abi",
+        "capabilities",
+        "permissions",
+        "artifact",
+    ];
+    let obj = manifest
+        .as_object()
+        .ok_or_else(|| "manifest is not an object".to_string())?;
+    for key in obj.keys() {
+        if !FIELDS.contains(&key.as_str()) {
+            return Err(format!("manifest: unknown field {key:?}"));
+        }
+    }
+    for field in FIELDS {
+        if !obj.contains_key(field) {
+            return Err(format!("manifest: missing required field {field:?}"));
+        }
+    }
+
+    let field_str = |name: &str| -> Result<&str, String> {
+        manifest[name]
+            .as_str()
+            .ok_or_else(|| format!("manifest.{name} must be a string"))
+    };
+
+    // id: ^[a-z0-9][a-z0-9-]*$
+    let id = field_str("id")?;
+    let mut chars = id.chars();
+    let id_ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !id_ok {
+        return Err("manifest.id must match ^[a-z0-9][a-z0-9-]*$".into());
+    }
+    // version: ^[0-9]+\.[0-9]+\.[0-9]+$
+    let version = field_str("version")?;
+    let version_ok = version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    if !version_ok {
+        return Err("manifest.version must be semver x.y.z".into());
+    }
+    // abi: const "0.1.0"
+    if field_str("abi")? != "0.1.0" {
+        return Err("manifest.abi must be \"0.1.0\"".into());
+    }
+    // capabilities: non-empty subset of [playback.resolve]
+    let caps = manifest["capabilities"]
+        .as_array()
+        .ok_or_else(|| "manifest.capabilities must be an array".to_string())?;
+    if caps.is_empty() {
+        return Err("manifest.capabilities must not be empty".into());
+    }
+    if caps.iter().any(|c| c.as_str() != Some("playback.resolve")) {
+        return Err("manifest.capabilities must be a subset of [playback.resolve]".into());
+    }
+    // permissions: each ^(network:(\*\.)?[a-z0-9.-]+|pot-provider)$
+    let perms = manifest["permissions"]
+        .as_array()
+        .ok_or_else(|| "manifest.permissions must be an array".to_string())?;
+    for perm in perms {
+        let Some(p) = perm.as_str() else {
+            return Err("manifest.permissions entries must be strings".into());
+        };
+        if p == "pot-provider" {
+            continue;
+        }
+        let body = p
+            .strip_prefix("network:")
+            .map(|rest| rest.strip_prefix("*.").unwrap_or(rest))
+            .filter(|body| !body.is_empty())
+            .ok_or_else(|| format!("manifest.permissions entry {p:?} is malformed"))?;
+        if !body
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        {
+            return Err(format!("manifest.permissions entry {p:?} is malformed"));
+        }
+    }
+    // artifact: exactly {path: non-empty string, digest: sha256:<64 hex>}
+    let artifact = manifest["artifact"]
+        .as_object()
+        .ok_or_else(|| "manifest.artifact must be an object".to_string())?;
+    for key in artifact.keys() {
+        if key != "path" && key != "digest" {
+            return Err(format!("manifest.artifact: unknown field {key:?}"));
+        }
+    }
+    let path = artifact
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty());
+    if path.is_none() {
+        return Err("manifest.artifact.path must be a non-empty string".into());
+    }
+    let digest_ok = artifact
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|d| d.strip_prefix("sha256:"))
+        .is_some_and(|h| {
+            h.len() == 64
+                && h.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    if !digest_ok {
+        return Err("manifest.artifact.digest must be sha256:<64 lowercase hex>".into());
     }
     Ok(())
 }
