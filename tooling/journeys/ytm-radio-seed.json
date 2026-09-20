@@ -1,0 +1,23 @@
+{
+  "name": "youtube-music radio.seed \u2014 automix first page",
+  "plugin": "youtube-music",
+  "capability": "radio.seed",
+  "request": {
+    "source_ref": {
+      "provider": "youtube-music",
+      "kind": "track",
+      "id": "dQw4w9WgXcQ"
+    }
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/next",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/next-automix-seed.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "max_http_calls": 1
+  }
+}

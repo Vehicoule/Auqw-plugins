@@ -1,0 +1,17 @@
+{
+  "name": "lyrics-lrclib lyrics.plain — direct hit",
+  "plugin": "lyrics-lrclib",
+  "capability": "lyrics.plain",
+  "request": { "query": { "title": "Roads", "artist": "Portishead", "album": "Dummy", "duration_ms": 307000, "isrc": null } },
+  "upstreams": [
+    {
+      "url_contains": "lrclib.net/api/get",
+      "status": 200,
+      "body_file": "../../plugins/lyrics-lrclib/fixtures/get-plain.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "max_http_calls": 3
+  }
+}

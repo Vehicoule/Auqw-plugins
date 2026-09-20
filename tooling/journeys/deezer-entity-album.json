@@ -1,0 +1,23 @@
+{
+  "name": "deezer catalog.entity \u2014 album page",
+  "plugin": "deezer",
+  "capability": "catalog.entity",
+  "request": {
+    "ref": {
+      "provider": "deezer",
+      "kind": "album",
+      "id": "109301"
+    }
+  },
+  "upstreams": [
+    {
+      "url_contains": "api.deezer.com/album/",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/album.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "max_http_calls": 2
+  }
+}

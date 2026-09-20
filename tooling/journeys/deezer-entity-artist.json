@@ -1,0 +1,27 @@
+{
+  "name": "deezer catalog.entity — artist composite",
+  "plugin": "deezer",
+  "capability": "catalog.entity",
+  "request": { "ref": { "provider": "deezer", "kind": "artist", "id": "1069" } },
+  "upstreams": [
+    {
+      "url_contains": "api.deezer.com/artist/1069/top",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/artist-top.json"
+    },
+    {
+      "url_contains": "api.deezer.com/artist/1069/albums",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/artist-albums.json"
+    },
+    {
+      "url_contains": "api.deezer.com/artist/1069",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/artist.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "max_http_calls": 3
+  }
+}

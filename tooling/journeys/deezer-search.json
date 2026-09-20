@@ -1,0 +1,17 @@
+{
+  "name": "deezer catalog.search — track rows",
+  "plugin": "deezer",
+  "capability": "catalog.search",
+  "request": { "query": "roads portishead", "limit": 10, "storefront": null },
+  "upstreams": [
+    {
+      "url_contains": "api.deezer.com/search",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/search.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "max_http_calls": 1
+  }
+}

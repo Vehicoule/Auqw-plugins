@@ -1,0 +1,22 @@
+{
+  "name": "youtube-music radio.seed \u2014 honest terminal continuation",
+  "plugin": "youtube-music",
+  "capability": "radio.seed",
+  "request": {
+    "continuation": "radio-cont-002"
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/next",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/next-automix-terminal.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "continuation": null
+    },
+    "max_http_calls": 1
+  }
+}
