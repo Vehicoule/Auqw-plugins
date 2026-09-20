@@ -1,0 +1,13 @@
+{
+  "plugin": "itunes",
+  "version": "0.1.0",
+  "abi_version": "0.2.0",
+  "wasm_sha256": "sha256:a91bbdfca835784adca2dd10b8fa817bedd054e9386b05aa815714a35a99567d",
+  "manifest_sha256": "sha256:bf8c3b0afcabc90879dc080e919b6401e1e59e76782f9f78a32ca22a6ce640df",
+  "signed_at": "2026-09-20T19:11:06.386Z",
+  "key_id": "e6023b53aa9bfb3c",
+  "toolchain": {
+    "node": "v26.8.2",
+    "platform": "darwin/arm64"
+  }
+}

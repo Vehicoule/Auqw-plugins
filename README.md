@@ -29,6 +29,18 @@ Builds the guest for `wasm32-unknown-unknown`, copies the artifact to
 checks size/imports/exports/start-section and updates
 `manifest.artifact.digest`.
 
+## Sign a release
+
+```sh
+node tooling/sign.mjs sign plugins/<id>
+node tooling/sign.mjs verify releases/<id>/<version>
+```
+
+Stages the artifact + manifest into `releases/<id>/<version>/` with
+provenance and an ed25519 signature. Signing keys live outside every
+repo — layout, payload format, and key custody are documented in
+[releases/README.md](releases/README.md).
+
 ## Vendored guest SDK
 
 Guest crates depend on `auqw-guest-sdk` by path under
@@ -56,4 +68,6 @@ The script packages `../auqw/sdk/rust`, verifies the package is exactly
 | `vendor/auqw-guest-sdk-0.2.0` | Packaged guest SDK 0.2.0 source |
 | `tooling/validate` | Standalone artifact validator |
 | `tooling/build.sh` | Build + stage + validate one plugin |
+| `tooling/sign.mjs` | ed25519 release signing: keygen/sign/verify/pubkey |
 | `tooling/vendor-sdk.sh` | Refresh the vendored SDK (needs `../auqw`) |
+| `releases/<id>/<version>` | Signed immutable release artifacts (see `releases/README.md`) |
