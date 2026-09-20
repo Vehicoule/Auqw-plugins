@@ -12,6 +12,6 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-auqw-guest-sdk = { path = "../../vendor/auqw-guest-sdk-0.2.0" }
+auqw-guest-sdk = { path = "../../vendor/auqw-guest-sdk-0.3.0" }
 serde_json = "1.0.149"
 base64 = "0.22.1"
