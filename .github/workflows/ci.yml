@@ -19,7 +19,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - run: cargo build --target wasm32-unknown-unknown --release -p auqw-youtube-music -p auqw-itunes
+      - run: cargo build --target wasm32-unknown-unknown --release -p auqw-youtube-music -p auqw-itunes -p auqw-deezer
       - name: validate artifact
         run: |
           mkdir -p plugins/youtube-music/dist
@@ -34,3 +34,9 @@ jobs:
           cargo run -q -p auqw-validate -- \
             plugins/itunes/dist/itunes.wasm \
             plugins/itunes/manifest.json
+          mkdir -p plugins/deezer/dist
+          cp target/wasm32-unknown-unknown/release/auqw_deezer.wasm \
+             plugins/deezer/dist/deezer.wasm
+          cargo run -q -p auqw-validate -- \
+            plugins/deezer/dist/deezer.wasm \
+            plugins/deezer/manifest.json

@@ -1,0 +1,127 @@
+{
+  "data": [
+    {
+      "id": 982668,
+      "readable": true,
+      "title": "Roads",
+      "title_short": "Roads",
+      "title_version": "",
+      "isrc": "GBAQT9400064",
+      "link": "https://www.deezer.com/track/982668",
+      "duration": 303,
+      "rank": 718292,
+      "explicit_lyrics": false,
+      "explicit_content_lyrics": 0,
+      "explicit_content_cover": 2,
+      "preview": "https://cdnt-preview.dzcdn.net/api/1/1/f/d/0/0/fd0ad7464f8aba5aea5c1070f6ec49c4.mp3?hdnea=exp~acl~hmac=aaaa",
+      "md5_image": "5942b88996f33c82790023d5d99395d3",
+      "artist": {
+        "id": 1069,
+        "name": "Portishead",
+        "picture_xl": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/1000x1000-000000-80-0-0.jpg",
+        "tracklist": "https://api.deezer.com/artist/1069/top?limit=50",
+        "type": "artist"
+      },
+      "album": {
+        "id": 109301,
+        "title": "Dummy",
+        "cover_xl": "https://cdn-images.dzcdn.net/images/cover/5942b88996f33c82790023d5d99395d3/1000x1000-000000-80-0-0.jpg",
+        "md5_image": "5942b88996f33c82790023d5d99395d3",
+        "tracklist": "https://api.deezer.com/album/109301/tracks",
+        "type": "album"
+      },
+      "type": "track"
+    },
+    {
+      "id": 1125632,
+      "readable": true,
+      "title": "Roads (Live)",
+      "title_short": "Roads",
+      "title_version": "(Live)",
+      "isrc": "GBARA9800070",
+      "duration": 350,
+      "rank": 390309,
+      "explicit_lyrics": false,
+      "preview": "https://cdnt-preview.dzcdn.net/api/1/1/d/7/d/0/d7d6ea7efa1dc121689d8b402895f7fb.mp3?hdnea=exp~hmac=bbbb",
+      "artist": {
+        "id": 1069,
+        "name": "Portishead",
+        "type": "artist"
+      },
+      "album": {
+        "id": 109302,
+        "title": "Roseland NYC Live",
+        "cover_xl": "https://cdn-images.dzcdn.net/images/cover/6e13dc3331a9a515f3e8571dd3e2f71b/1000x1000-000000-80-0-0.jpg",
+        "type": "album"
+      },
+      "type": "track"
+    },
+    {
+      "id": 982668,
+      "readable": true,
+      "title": "Roads",
+      "duration": 303,
+      "explicit_lyrics": false,
+      "preview": "https://cdnt-preview.dzcdn.net/dup.mp3",
+      "artist": { "id": 1069, "name": "Portishead", "type": "artist" },
+      "album": { "id": 109301, "title": "Dummy", "type": "album" },
+      "type": "track"
+    },
+    {
+      "id": 5550001,
+      "title": "Explicit Cut",
+      "duration": 200,
+      "explicit_lyrics": true,
+      "isrc": "USXX19900001",
+      "artist": { "id": 42, "name": "Test Artist", "type": "artist" },
+      "album": {
+        "id": 77001,
+        "title": "Explicit Album",
+        "cover_xl": "https://cdn-images.dzcdn.net/images/cover/ee/1000x1000-000000-80-0-0.jpg",
+        "type": "album"
+      },
+      "type": "track"
+    },
+    {
+      "id": 5550002,
+      "title": "Quiet Row",
+      "duration": 180,
+      "explicit_lyrics": false,
+      "artist": { "id": 42, "name": "Test Artist", "type": "artist" },
+      "album": {
+        "id": 77002,
+        "title": "Quiet Album",
+        "cover_xl": "http://insecure.example.com/not-https.jpg",
+        "type": "album"
+      },
+      "type": "track"
+    },
+    {
+      "id": 0,
+      "title": "Zero Id Song",
+      "duration": 100,
+      "artist": { "id": 42, "name": "Test Artist", "type": "artist" },
+      "type": "track"
+    },
+    {
+      "id": 5550003,
+      "title": "Not A Track",
+      "duration": 600,
+      "artist": { "id": 42, "name": "Test Artist", "type": "artist" },
+      "type": "episode"
+    },
+    {
+      "id": 5550004,
+      "type": "track",
+      "duration": 100
+    },
+    "a bare string is not a row",
+    {
+      "id": "5550005",
+      "title": "",
+      "title_short": "  ",
+      "type": "track"
+    }
+  ],
+  "total": 10
+}

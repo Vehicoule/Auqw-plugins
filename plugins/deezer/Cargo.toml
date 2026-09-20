@@ -1,0 +1,19 @@
+[package]
+name = "auqw-deezer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Deezer catalog guest: catalog.search/metadata/entity (ABI 0.3.0)"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+auqw-guest-sdk = { path = "../../vendor/auqw-guest-sdk-0.3.0" }
+serde_json = "1.0.149"
+
+[dev-dependencies]
+base64 = "0.22.1"

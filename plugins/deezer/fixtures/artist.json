@@ -1,0 +1,15 @@
+{
+  "id": 1069,
+  "name": "Portishead",
+  "link": "https://www.deezer.com/artist/1069",
+  "picture": "https://api.deezer.com/artist/1069/image",
+  "picture_small": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/56x56-000000-80-0-0.jpg",
+  "picture_medium": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/250x250-000000-80-0-0.jpg",
+  "picture_big": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/500x500-000000-80-0-0.jpg",
+  "picture_xl": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/1000x1000-000000-80-0-0.jpg",
+  "nb_album": 15,
+  "nb_fan": 582445,
+  "radio": true,
+  "tracklist": "https://api.deezer.com/artist/1069/top?limit=50",
+  "type": "artist"
+}

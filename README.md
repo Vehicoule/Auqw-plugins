@@ -65,7 +65,9 @@ The script packages `../auqw/sdk/rust`, verifies the package is exactly
 | --- | --- |
 | `plugins/youtube-music` | `playback.resolve` + `playback.candidates` guest (ABI 0.2.0) |
 | `plugins/itunes` | iTunes catalog guest (`catalog.search`/`metadata`/`artwork`) |
+| `plugins/deezer` | Deezer catalog guest (`catalog.search`/`metadata`/`entity`, ABI 0.3.0) |
 | `vendor/auqw-guest-sdk-0.2.0` | Packaged guest SDK 0.2.0 source |
+| `vendor/auqw-guest-sdk-0.3.0` | Packaged guest SDK 0.3.0 source |
 | `tooling/validate` | Standalone artifact validator |
 | `tooling/build.sh` | Build + stage + validate one plugin |
 | `tooling/sign.mjs` | ed25519 release signing: keygen/sign/verify/pubkey |
