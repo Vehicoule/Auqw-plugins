@@ -234,12 +234,16 @@ pub fn probe_request(rung: &Rung, url: &str, content_length: Option<u64>) -> Htt
 /// `context.serviceIntegrityDimensions.poToken`, attesting the player
 /// request itself on the rungs that accept web attestation. The same
 /// token decorates googlevideo stream URLs via [`append_pot`] — one
-/// mint serves both contexts.
+/// mint serves both contexts. `auth` is the app-held OAuth access
+/// token: when present it rides `Authorization: Bearer`, the
+/// session-trust header that lifts bot-check walls for account-backed
+/// sessions.
 pub fn player_request(
     rung: &Rung,
     video_id: &str,
     visitor_id: Option<&str>,
     pot: Option<&str>,
+    auth: Option<&str>,
 ) -> HttpRequest {
     let mut client = serde_json::Map::new();
     client.insert("clientName".into(), json!(rung.innertube_name()));
@@ -276,6 +280,9 @@ pub fn player_request(
     ];
     if let Some(visitor) = visitor_id {
         headers.push(("X-Goog-Visitor-Id".into(), visitor.into()));
+    }
+    if let Some(token) = auth {
+        headers.push(("Authorization".into(), format!("Bearer {token}")));
     }
     HttpRequest {
         method: "POST".into(),

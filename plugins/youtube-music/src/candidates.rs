@@ -28,6 +28,7 @@ const MAX_NODES: usize = 10_000;
 struct CandidatesPayload {
     search_text: String,
     limit: usize,
+    access_token: Option<String>,
 }
 
 /// An optional query string: null or a nonempty string after trimming;
@@ -48,7 +49,11 @@ fn opt_string(obj: &Map<String, Value>, key: &str) -> Result<Option<String>, Gue
 }
 
 fn parse_candidates_payload(payload: &Value) -> Result<CandidatesPayload, GuestError> {
-    let obj = payload_keys(payload, &["query", "limit"], &["query", "limit"])?;
+    let obj = payload_keys(
+        payload,
+        &["query", "limit", "access_token"],
+        &["query", "limit"],
+    )?;
     let q = payload_keys(
         &obj["query"],
         &[
@@ -131,9 +136,17 @@ fn parse_candidates_payload(payload: &Value) -> Result<CandidatesPayload, GuestE
     if let Some(a) = album {
         parts.push(a);
     }
+    // The app-held OAuth access token — same contract as
+    // `playback.resolve`: nonempty, bounded, absent means anonymous.
+    let access_token = match obj.get("access_token") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && s.len() <= 8192 => Some(s.clone()),
+        Some(_) => return Err(bad_payload("access_token must be a string 1..8192 chars")),
+    };
     Ok(CandidatesPayload {
         search_text: parts.join(" "),
         limit,
+        access_token,
     })
 }
 
@@ -154,7 +167,13 @@ pub(crate) fn web_remix_context() -> Value {
 /// A WEB_REMIX InnerTube POST: one client identity and header set for
 /// every metadata surface. Visitor replay comes from
 /// `visitor/web-remix`, the same per-client KV pattern as the ladder.
-pub(crate) fn web_remix_request(url: &str, body: Value, visitor: Option<&str>) -> HttpRequest {
+/// `auth` rides `Authorization: Bearer` — the session-trust header.
+pub(crate) fn web_remix_request(
+    url: &str,
+    body: Value,
+    visitor: Option<&str>,
+    auth: Option<&str>,
+) -> HttpRequest {
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
         ("User-Agent".into(), USER_AGENT.into()),
@@ -168,6 +187,9 @@ pub(crate) fn web_remix_request(url: &str, body: Value, visitor: Option<&str>) -
     if let Some(v) = visitor {
         headers.push(("X-Goog-Visitor-Id".into(), v.into()));
     }
+    if let Some(token) = auth {
+        headers.push(("Authorization".into(), format!("Bearer {token}")));
+    }
     HttpRequest {
         method: "POST".into(),
         url: url.into(),
@@ -177,13 +199,13 @@ pub(crate) fn web_remix_request(url: &str, body: Value, visitor: Option<&str>) -
 }
 
 /// The WEB_REMIX InnerTube `search` call.
-fn search_request(query: &str, visitor: Option<&str>) -> HttpRequest {
+fn search_request(query: &str, visitor: Option<&str>, auth: Option<&str>) -> HttpRequest {
     let body = json!({
         "context": web_remix_context(),
         "query": query,
         "params": SONGS_PARAMS,
     });
-    web_remix_request(SEARCH_URL, body, visitor)
+    web_remix_request(SEARCH_URL, body, visitor, auth)
 }
 
 pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
@@ -198,7 +220,13 @@ pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
         },
         None => None,
     };
-    let resp = match http_request(search_request(&p.search_text, visitor.as_deref())).await {
+    let mut resp = match http_request(search_request(
+        &p.search_text,
+        visitor.as_deref(),
+        p.access_token.as_deref(),
+    ))
+    .await
+    {
         Ok(r) => r,
         Err(GuestError::Host { kind, message }) => match kind.as_str() {
             "cancelled" | "permission-denied" | "invalid-response" => {
@@ -208,6 +236,20 @@ pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
         },
         Err(e) => return Err(e),
     };
+    // A 401 proves the token dead — retry once bare so a stale token
+    // can't wall the search, matching the ladder's drop rule.
+    if resp.status == 401 && p.access_token.is_some() {
+        resp = match http_request(search_request(&p.search_text, visitor.as_deref(), None)).await {
+            Ok(r) => r,
+            Err(GuestError::Host { kind, message }) => match kind.as_str() {
+                "cancelled" | "permission-denied" | "invalid-response" => {
+                    return Err(GuestError::Host { kind, message });
+                }
+                _ => return Err(failed("transient", "search transport".into())),
+            },
+            Err(e) => return Err(e),
+        };
+    }
     match resp.status {
         s if (200..300).contains(&s) => {}
         429 => return Err(failed("rate-limit", "rate-limit".into())),
@@ -1021,5 +1063,46 @@ mod tests {
         let mut h = Harness::new();
         let out = h.invoke(json!({ "query": q, "limit": 5 }));
         assert_eq!(fail_kind(&out).0, "invalid-response");
+    }
+
+    // ---- Session trust (access_token) -------------------------------
+
+    #[test]
+    fn access_token_rides_search_request() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "query": query(), "limit": 5, "access_token": "tok-abc" }));
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer tok-abc")
+        );
+    }
+
+    #[test]
+    fn unauthorized_token_retries_bare() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "query": query(), "limit": 5, "access_token": "dead-tok" }));
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer dead-tok")
+        );
+        // The 401 proves the token dead — the retry runs bare rather
+        // than failing the search.
+        let out = h.answer(&out, 401, "{}");
+        assert_eq!(out["kind"], "http_request");
+        assert_eq!(header_of(&out, "Authorization"), None);
+        let out = h.answer(&out, 200, SONGS);
+        assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn malformed_access_token_is_invalid_response() {
+        for p in [
+            json!({ "query": query(), "limit": 5, "access_token": 42 }),
+            json!({ "query": query(), "limit": 5, "access_token": "x".repeat(8193) }),
+        ] {
+            let mut h = Harness::new();
+            let out = h.invoke(p.clone());
+            assert_eq!(fail_kind(&out).0, "invalid-response", "{p}");
+        }
     }
 }

@@ -109,6 +109,7 @@ struct ResolvePayload {
     prefer: Vec<String>,
     pin_itag: Option<u32>,
     resume_offset: Option<u64>,
+    access_token: Option<String>,
 }
 
 fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> {
@@ -120,6 +121,7 @@ fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> 
             "prefer",
             "pin_itag",
             "resume_offset",
+            "access_token",
         ],
         &["source_ref"],
     )?;
@@ -208,12 +210,21 @@ fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> 
                 .ok_or_else(|| bad_payload("resume_offset must be a u64 or null"))?,
         ),
     };
+    // The app-held OAuth access token. Bounded like a header value;
+    // empty is treated as absent so a cleared app token degrades to
+    // the anonymous ladder rather than sending `Bearer `.
+    let access_token = match obj.get("access_token") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && s.len() <= 8192 => Some(s.clone()),
+        Some(_) => return Err(bad_payload("access_token must be a string 1..8192 chars")),
+    };
     Ok(ResolvePayload {
         video_id,
         target_bitrate_kbps,
         prefer,
         pin_itag,
         resume_offset,
+        access_token,
     })
 }
 
@@ -344,6 +355,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // rungs ahead of their persisted KV value, matching the Slice 0
     // cross-rung propagation.
     let mut fresh_visitor: Option<String> = None;
+    // The session-trust token rides every rung until a 401 proves it
+    // dead — then the remaining ladder runs bare rather than failing
+    // authenticated requests repeatedly.
+    let mut access_token = p.access_token.clone();
 
     // Two passes over the ladder. Pass 1 runs bare — free on a clean
     // IP. Pass 2 replays only the bot-checked rungs with the shared
@@ -382,6 +397,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 &p.video_id,
                 rung_visitor.as_deref(),
                 if attested { pot.as_deref() } else { None },
+                access_token.as_deref(),
             ))
             .await
             {
@@ -401,6 +417,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 } else {
                     RungOutcome::Transport
                 };
+                // A 401 marks the access token dead — subsequent rungs
+                // retry bare so a stale token can't wall the ladder.
+                if resp.status == 401 {
+                    access_token = None;
+                }
                 if let Some((reason, ms)) = backoff_for(outcome) {
                     stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
@@ -2208,5 +2229,76 @@ mod tests {
         .unwrap_or_default();
         assert_eq!(staged["until_ms"], u64::MAX);
         assert_eq!(staged["reason"], "rate-limit");
+    }
+
+    // ---- Session trust (access_token) -------------------------------
+
+    #[test]
+    fn access_token_rides_authorization_header() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "access_token": "tok-abc" }));
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer tok-abc")
+        );
+        let out = feed(&mut h, &out, SABR);
+        // The token rides every rung while it stays valid.
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer tok-abc")
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // But never the googlevideo probe — Bearer is innertube-only.
+        assert_eq!(header_of(&out, "Authorization"), None);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // The token never reaches a guest log line.
+        assert!(h.logs.iter().all(|m| !m.contains("tok-abc")));
+    }
+
+    #[test]
+    fn absent_access_token_sends_no_authorization() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        assert_eq!(header_of(&out, "Authorization"), None);
+    }
+
+    #[test]
+    fn empty_access_token_is_anonymous() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "access_token": "" }));
+        assert_eq!(header_of(&out, "Authorization"), None);
+    }
+
+    #[test]
+    fn unauthorized_token_drops_for_remaining_rungs() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "access_token": "dead-tok" }));
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer dead-tok")
+        );
+        // rung 0 answers 401: the token is dead — rung 1 retries bare.
+        let out = h.answer(&out, 401, "{}");
+        assert_eq!(rung_of(&out), 1);
+        assert_eq!(header_of(&out, "Authorization"), None);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "IOS");
+    }
+
+    #[test]
+    fn malformed_access_token_is_invalid_response() {
+        for payload in [
+            json!({ "source_ref": VID, "access_token": 42 }),
+            json!({ "source_ref": VID, "access_token": "x".repeat(8193) }),
+        ] {
+            let mut h = Harness::new();
+            let out = h.invoke(payload.clone());
+            assert_eq!(fail_kind(&out).0, "invalid-response", "{payload}");
+        }
     }
 }

@@ -30,9 +30,20 @@ enum RadioPayload {
     Continuation(String),
 }
 
-fn parse_radio_payload(payload: &Value) -> Result<RadioPayload, GuestError> {
-    let obj = payload_keys(payload, &["source_ref", "continuation"], &[])?;
-    match (obj.get("source_ref"), obj.get("continuation")) {
+fn parse_radio_payload(payload: &Value) -> Result<(RadioPayload, Option<String>), GuestError> {
+    let obj = payload_keys(
+        payload,
+        &["source_ref", "continuation", "access_token"],
+        &[],
+    )?;
+    // The app-held OAuth access token — same contract as
+    // `playback.resolve`: nonempty, bounded, absent means anonymous.
+    let access_token = match obj.get("access_token") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if !s.is_empty() && s.len() <= 8192 => Some(s.clone()),
+        Some(_) => return Err(bad_payload("access_token must be a string 1..8192 chars")),
+    };
+    let shaped = match (obj.get("source_ref"), obj.get("continuation")) {
         (Some(_), None) => {
             let o = payload_keys(
                 &obj["source_ref"],
@@ -71,7 +82,8 @@ fn parse_radio_payload(payload: &Value) -> Result<RadioPayload, GuestError> {
         _ => Err(bad_payload(
             "exactly one of source_ref or continuation is required",
         )),
-    }
+    }?;
+    Ok((shaped, access_token))
 }
 
 /// The `next` body for each payload shape. The seed asks for the
@@ -294,12 +306,13 @@ fn next_continuation(panel: &Map<String, Value>) -> Option<String> {
 /// seed's radio — like the player path answering a foreign video id,
 /// it counts as unavailable rather than a substituted mix.
 pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
-    let p = parse_radio_payload(payload)?;
+    let (p, access_token) = parse_radio_payload(payload)?;
     let visitor = load_visitor(VISITOR_KEY).await?;
-    let resp = match http_request(web_remix_request(
+    let mut resp = match http_request(web_remix_request(
         NEXT_URL,
         next_body(&p),
         visitor.as_deref(),
+        access_token.as_deref(),
     ))
     .await
     {
@@ -312,6 +325,27 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         },
         Err(e) => return Err(e),
     };
+    // A 401 proves the token dead — retry once bare so a stale token
+    // can't wall the seed, matching the ladder's drop rule.
+    if resp.status == 401 && access_token.is_some() {
+        resp = match http_request(web_remix_request(
+            NEXT_URL,
+            next_body(&p),
+            visitor.as_deref(),
+            None,
+        ))
+        .await
+        {
+            Ok(r) => r,
+            Err(GuestError::Host { kind, message }) => match kind.as_str() {
+                "cancelled" | "permission-denied" | "invalid-response" => {
+                    return Err(GuestError::Host { kind, message });
+                }
+                _ => return Err(failed("transient", "next transport".into())),
+            },
+            Err(e) => return Err(e),
+        };
+    }
     match resp.status {
         s if (200..300).contains(&s) => {}
         429 => return Err(failed("rate-limit", "rate-limit".into())),
@@ -775,5 +809,52 @@ mod tests {
             h.committed.get("visitor/web-remix").map(Vec::as_slice),
             Some(b"visitor-wr-002".as_slice())
         );
+    }
+
+    // ---- Session trust (access_token) -------------------------------
+
+    #[test]
+    fn access_token_rides_next_request() {
+        let mut h = Harness::new();
+        let mut p = seed_payload();
+        p["access_token"] = json!("tok-abc");
+        let out = h.invoke(p);
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer tok-abc")
+        );
+        let out = h.answer(&out, 200, SEED);
+        assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn unauthorized_token_retries_bare() {
+        let mut h = Harness::new();
+        let mut p = seed_payload();
+        p["access_token"] = json!("dead-tok");
+        let out = h.invoke(p);
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer dead-tok")
+        );
+        // The 401 proves the token dead — the retry carries no
+        // Authorization header rather than failing the seed.
+        let out = h.answer(&out, 401, "{}");
+        assert_eq!(out["kind"], "http_request");
+        assert_eq!(header_of(&out, "Authorization"), None);
+        let out = h.answer(&out, 200, SEED);
+        assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn malformed_access_token_is_invalid_response() {
+        for p in [
+            json!({ "source_ref": { "provider": "youtube-music", "kind": "track", "id": VID }, "access_token": 42 }),
+            json!({ "continuation": "c", "access_token": "x".repeat(8193) }),
+        ] {
+            let mut h = Harness::new();
+            let out = h.invoke(p.clone());
+            assert_eq!(fail_kind(&out).0, "invalid-response", "{p}");
+        }
     }
 }
