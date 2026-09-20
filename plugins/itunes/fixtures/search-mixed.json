@@ -1,0 +1,73 @@
+{
+  "resultCount": 6,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 1440761789,
+      "trackName": "Roads",
+      "artistName": "Portishead",
+      "collectionName": "Dummy",
+      "releaseDate": "1994-08-22T07:00:00Z",
+      "trackTimeMillis": 307013,
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/100x100bb.jpg",
+      "primaryGenreName": "Alternative",
+      "trackExplicitness": "notExplicit",
+      "previewUrl": "https://audio-ssl.itunes.apple.com/itunes-assets/preview.m4a"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "music-video",
+      "trackId": 1440762000,
+      "trackName": "Roads (Video)",
+      "artistName": "Portishead",
+      "trackTimeMillis": 310000,
+      "trackExplicitness": "notExplicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 900001,
+      "trackName": "No Art Song",
+      "artistName": "Test Artist",
+      "collectionName": "Singles",
+      "releaseDate": "2001-01-01T08:00:00Z",
+      "trackTimeMillis": 180000,
+      "trackExplicitness": "cleaned",
+      "previewUrl": "https://audio-ssl.itunes.apple.com/itunes-assets/preview2.m4a"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 900002,
+      "trackName": "夜の歌",
+      "artistName": "東京サウンド",
+      "collectionName": "夜のアルバム",
+      "releaseDate": "2010-05-05T07:00:00Z",
+      "trackTimeMillis": 210500,
+      "artworkUrl100": "https://is2-ssl.mzstatic.com/image/thumb/Music111/v4/11/22/33/source/100x100bb.jpg",
+      "primaryGenreName": "J-Pop",
+      "trackExplicitness": "notExplicit",
+      "previewUrl": "https://audio-ssl.itunes.apple.com/itunes-assets/preview3.m4a"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 900003,
+      "trackName": "Explicit Song",
+      "artistName": "Test Artist",
+      "releaseDate": "2015-03-03T08:00:00Z",
+      "trackTimeMillis": 200000,
+      "trackExplicitness": "explicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 0,
+      "trackName": "Zero Id Song",
+      "artistName": "Test Artist",
+      "trackTimeMillis": 100000,
+      "trackExplicitness": "notExplicit"
+    }
+  ]
+}

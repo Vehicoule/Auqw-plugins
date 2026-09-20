@@ -3,6 +3,18 @@
 
 use serde_json::Value;
 
+/// A visitor string safe to replay as `X-Goog-Visitor-Id` or persist
+/// under a `visitor/` KV key: nonempty, at most 1024 bytes, every byte
+/// visible ASCII (`0x21..=0x7e`) — no controls, space, or DEL, so a
+/// poisoned persisted/upstream value can never become header syntax.
+/// Input `&str` is already UTF-8 by construction.
+pub fn visitor_token(s: &str) -> Option<&str> {
+    if s.is_empty() || s.len() > 1024 || !s.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return None;
+    }
+    Some(s)
+}
+
 /// The playability bucket a rung landed in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Playability {
@@ -44,6 +56,8 @@ pub struct Picked {
     pub expires_at_ms: Option<u64>,
     /// `contentLength` of the format in bytes, when reported.
     pub content_length: Option<u64>,
+    /// The format's itag, when upstream reports it.
+    pub itag: Option<u32>,
 }
 
 /// Classify `playabilityStatus`. `status` is checked first; when the
@@ -147,13 +161,38 @@ pub fn format_outcome(body: &Value) -> FormatOutcome {
     FormatOutcome::SabrOnly
 }
 
-/// Pick the best plain audio format: score by |bitrate − 128 kbps|,
-/// prefer `audio/mp4` over `audio/webm` on equal distance.
-pub fn pick_audio(body: &Value) -> Option<Picked> {
+/// Selection inputs for [`pick_audio`].
+pub struct PickOptions<'a> {
+    /// Bitrate to land nearest, in kbps.
+    pub target_bitrate_kbps: u32,
+    /// MIME bases in preference order (`audio/mp4`, `audio/webm`);
+    /// unlisted bases rank after all listed ones.
+    pub prefer: &'a [&'a str],
+    /// Exact itag requirement — `Some` picks only that itag, never a
+    /// fallback.
+    pub pin_itag: Option<u32>,
+}
+
+/// A format's itag as `u32`, from either the numeric or the
+/// numeric-string shape upstream uses.
+fn itag_of(format: &Value) -> Option<u32> {
+    let v = format.get("itag")?;
+    v.as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .or_else(|| v.as_str().and_then(|s| s.parse::<u32>().ok()))
+}
+
+/// Pick the best plain audio format. Audio-only, plain-HTTPS-URL
+/// formats are eligible; ciphered rows never are. When `pin_itag` is
+/// set only that exact itag can pick. Ranking: preferred MIME base
+/// first (unlisted bases after all listed), then absolute bitrate
+/// distance to the target, then stable upstream order.
+pub fn pick_audio(body: &Value, options: PickOptions<'_>) -> Option<Picked> {
     let formats = body
         .pointer("/streamingData/adaptiveFormats")
         .and_then(Value::as_array)?;
-    let mut best: Option<(i64, u8, &Value)> = None;
+    let target = i64::from(options.target_bitrate_kbps) * 1000;
+    let mut best: Option<(usize, i64, &Value)> = None;
     for format in formats {
         let mime = format.get("mimeType").and_then(Value::as_str).unwrap_or("");
         if !mime.starts_with("audio/") {
@@ -168,15 +207,27 @@ pub fn pick_audio(body: &Value) -> Option<Picked> {
             // format is unusable, not a reason to kill the resolve.
             continue;
         }
+        if let Some(pin) = options.pin_itag {
+            if itag_of(format) != Some(pin) {
+                continue;
+            }
+        }
+        let base = mime.split(';').next().unwrap_or("");
+        let pref = options
+            .prefer
+            .iter()
+            .position(|p| *p == base)
+            .unwrap_or(options.prefer.len());
         let bitrate = format.get("bitrate").and_then(Value::as_u64).unwrap_or(0);
-        let distance = (i64::try_from(bitrate).unwrap_or(i64::MAX) - 128_000).abs();
-        let codec_rank = if mime.contains("mp4") { 1 } else { 0 };
+        let distance = (i64::try_from(bitrate).unwrap_or(i64::MAX) - target).abs();
+        // Strictly-better replacement keeps upstream order stable on
+        // ties (first seen wins).
         let better = match &best {
             None => true,
-            Some((d, r, _)) => distance < *d || (distance == *d && codec_rank > *r),
+            Some((p, d, _)) => (pref, distance) < (*p, *d),
         };
         if better {
-            best = Some((distance, codec_rank, format));
+            best = Some((pref, distance, format));
         }
     }
     let (_, _, format) = best?;
@@ -198,6 +249,7 @@ pub fn pick_audio(body: &Value) -> Option<Picked> {
         bitrate_kbps,
         expires_at_ms: expire_ms(url),
         content_length: content_length(format),
+        itag: itag_of(format),
     })
 }
 
@@ -361,16 +413,43 @@ mod tests {
         );
     }
 
+    fn default_opts<'a>() -> PickOptions<'a> {
+        PickOptions {
+            target_bitrate_kbps: 128,
+            prefer: &["audio/mp4", "audio/webm"],
+            pin_itag: None,
+        }
+    }
+
     #[test]
     fn picks_best_plain_audio() {
-        let Some(p) = pick_audio(&fixture("ok")) else {
+        let Some(p) = pick_audio(&fixture("ok"), default_opts()) else {
             panic!("expected a pick");
         };
         // mp4 at 130k (dist 2k) beats webm at 131k/132k and webm 72k.
         assert_eq!(p.mime, "audio/mp4");
         assert_eq!(p.bitrate_kbps, Some(130));
         assert!(p.url.contains("itag=140"));
+        assert_eq!(p.itag, Some(140));
         assert_eq!(p.expires_at_ms, Some(1_893_456_000_000));
+    }
+
+    #[test]
+    fn prefer_webm_outranks_closer_mp4() {
+        // `prefer` order outranks bitrate distance: a webm-first
+        // caller gets the webm format even though the mp4 sits closer
+        // to the target bitrate.
+        let Some(p) = pick_audio(
+            &fixture("ok"),
+            PickOptions {
+                prefer: &["audio/webm", "audio/mp4"],
+                ..default_opts()
+            },
+        ) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.mime, "audio/webm");
+        assert_eq!(p.itag, Some(251));
     }
 
     #[test]
@@ -381,10 +460,107 @@ mod tests {
                 {"mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 128000, "url": "https://x/m"}
             ]}
         });
-        let Some(p) = pick_audio(&body) else {
+        let Some(p) = pick_audio(&body, default_opts()) else {
             panic!("expected a pick");
         };
         assert_eq!(p.mime, "audio/mp4");
+    }
+
+    #[test]
+    fn target_bitrate_selects_within_container() {
+        // Within the preferred container the closest bitrate wins.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"itag": 139, "mimeType": "audio/mp4", "bitrate": 50000, "url": "https://x/l"},
+                {"itag": 140, "mimeType": "audio/mp4", "bitrate": 130000, "url": "https://x/h"}
+            ]}
+        });
+        let Some(p) = pick_audio(
+            &body,
+            PickOptions {
+                target_bitrate_kbps: 64,
+                ..default_opts()
+            },
+        ) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.itag, Some(139));
+    }
+
+    #[test]
+    fn pin_itag_picks_exactly() {
+        let Some(p) = pick_audio(
+            &fixture("ok"),
+            PickOptions {
+                pin_itag: Some(251),
+                ..default_opts()
+            },
+        ) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.itag, Some(251));
+        assert_eq!(p.mime, "audio/webm");
+    }
+
+    #[test]
+    fn pin_itag_accepts_string_shaped_itag() {
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"itag": "140", "mimeType": "audio/mp4", "bitrate": 130000, "url": "https://x/m"}
+            ]}
+        });
+        let Some(p) = pick_audio(
+            &body,
+            PickOptions {
+                pin_itag: Some(140),
+                ..default_opts()
+            },
+        ) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.itag, Some(140));
+    }
+
+    #[test]
+    fn pin_itag_missing_picks_nothing() {
+        assert!(pick_audio(
+            &fixture("ok"),
+            PickOptions {
+                pin_itag: Some(774),
+                ..default_opts()
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn malformed_itag_never_matches_pin() {
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"itag": "abc", "mimeType": "audio/mp4", "bitrate": 130000, "url": "https://x/m"}
+            ]}
+        });
+        assert!(pick_audio(
+            &body,
+            PickOptions {
+                pin_itag: Some(140),
+                ..default_opts()
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn absent_itag_surfaces_null_unpinned() {
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "bitrate": 130000, "url": "https://x/m"}
+            ]}
+        });
+        let Some(p) = pick_audio(&body, default_opts()) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.itag, None);
     }
 
     #[test]
@@ -394,7 +570,7 @@ mod tests {
                 {"mimeType": "audio/mp4", "bitrate": 128000, "url": "https://x/v?foo=1"}
             ]}
         });
-        let Some(p) = pick_audio(&body) else {
+        let Some(p) = pick_audio(&body, default_opts()) else {
             panic!("expected a pick");
         };
         assert_eq!(p.expires_at_ms, None);
@@ -410,7 +586,7 @@ mod tests {
                  "url": format!("https://x/v?expire={}", u64::MAX)}
             ]}
         });
-        let Some(p) = pick_audio(&body) else {
+        let Some(p) = pick_audio(&body, default_opts()) else {
             panic!("expected a pick");
         };
         assert_eq!(p.expires_at_ms, None);
@@ -418,8 +594,8 @@ mod tests {
 
     #[test]
     fn no_pick_without_plain_url() {
-        assert!(pick_audio(&fixture("sabr")).is_none());
-        assert!(pick_audio(&fixture("ciphered")).is_none());
+        assert!(pick_audio(&fixture("sabr"), default_opts()).is_none());
+        assert!(pick_audio(&fixture("ciphered"), default_opts()).is_none());
     }
 
     #[test]
@@ -429,6 +605,6 @@ mod tests {
                 {"mimeType": "audio/mp4", "bitrate": 128000, "url": "http://x/v"}
             ]}
         });
-        assert!(pick_audio(&body).is_none());
+        assert!(pick_audio(&body, default_opts()).is_none());
     }
 }

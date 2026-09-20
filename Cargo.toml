@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "plugins/itunes",
     "plugins/youtube-music",
     "tooling/validate",
 ]

@@ -17,6 +17,9 @@ use sha2::Digest;
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, ValType};
 
 const MAX_ARTIFACT_BYTES: usize = 5 * 1024 * 1024;
+/// Guest linear memory cap (64 MiB) expressed in 64 KiB pages; the
+/// host runtime enforces the same bound.
+const MAX_MEMORY_PAGES: u64 = 64 * 1024 * 1024 / 65536;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -111,6 +114,7 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
     let mut func_types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut exports: Vec<(String, ExternalKind, u32)> = Vec::new();
+    let mut memories: Vec<wasmparser::MemoryType> = Vec::new();
     let mut import_count = 0usize;
     let mut has_start = false;
 
@@ -128,6 +132,11 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
                 }
             }
             Payload::ImportSection(reader) => import_count += reader.count() as usize,
+            Payload::MemorySection(reader) => {
+                for m in reader {
+                    memories.push(m.map_err(|e| format!("memory section: {e}"))?);
+                }
+            }
             Payload::FunctionSection(reader) => {
                 for f in reader {
                     func_type_idx.push(f.map_err(|e| format!("function section: {e}"))?);
@@ -158,6 +167,25 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
         return Err(format!(
             "module declares {import_count} import(s); v0 allows none"
         ));
+    }
+    if memories.len() > 1 {
+        return Err(format!(
+            "module declares {} memories; v0 allows one",
+            memories.len()
+        ));
+    }
+    for mem in &memories {
+        // `page_size_log2` overrides the 64 KiB page unit when present.
+        let page = 1u64 << mem.page_size_log2.unwrap_or(16);
+        if mem.initial.saturating_mul(page) > MAX_MEMORY_PAGES * 65536 {
+            return Err("declared memory initial exceeds 64 MiB".into());
+        }
+        if mem
+            .maximum
+            .is_some_and(|m| m.saturating_mul(page) > MAX_MEMORY_PAGES * 65536)
+        {
+            return Err("declared memory maximum exceeds 64 MiB".into());
+        }
     }
 
     let find = |name: &str| exports.iter().find(|(n, _, _)| n == name);
@@ -256,21 +284,34 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     if !version_ok {
         return Err("manifest.version must be semver x.y.z".into());
     }
-    // abi: const "0.1.0"
-    if field_str("abi")? != "0.1.0" {
-        return Err("manifest.abi must be \"0.1.0\"".into());
-    }
-    // capabilities: non-empty subset of [playback.resolve]
+    // abi: "0.1.0" or "0.2.0"; the capability set is version-specific.
+    let abi = field_str("abi")?;
+    let allowed_caps: &[&str] = match abi {
+        "0.1.0" => &["playback.resolve"],
+        "0.2.0" => &[
+            "catalog.search",
+            "catalog.metadata",
+            "catalog.artwork",
+            "playback.resolve",
+            "playback.candidates",
+        ],
+        _ => return Err("manifest.abi must be \"0.1.0\" or \"0.2.0\"".into()),
+    };
+    // capabilities: non-empty subset of the ABI's set
     let caps = manifest["capabilities"]
         .as_array()
         .ok_or_else(|| "manifest.capabilities must be an array".to_string())?;
     if caps.is_empty() {
         return Err("manifest.capabilities must not be empty".into());
     }
-    if caps.iter().any(|c| c.as_str() != Some("playback.resolve")) {
-        return Err("manifest.capabilities must be a subset of [playback.resolve]".into());
+    if caps
+        .iter()
+        .any(|c| !c.as_str().is_some_and(|s| allowed_caps.contains(&s)))
+    {
+        return Err("manifest.capabilities outside the set this ABI serves".into());
     }
-    // permissions: each ^(network:(\*\.)?[a-z0-9.-]+|pot-provider)$
+    // permissions: ^(network:(\*\.)?[a-z0-9.-]+|pot-provider|kv)$ —
+    // `kv` is a 0.2 permission and forbidden on a 0.1 manifest.
     let perms = manifest["permissions"]
         .as_array()
         .ok_or_else(|| "manifest.permissions must be an array".to_string())?;
@@ -279,6 +320,12 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             return Err("manifest.permissions entries must be strings".into());
         };
         if p == "pot-provider" {
+            continue;
+        }
+        if p == "kv" {
+            if abi == "0.1.0" {
+                return Err("manifest.permissions entry \"kv\" requires abi \"0.2.0\"".into());
+            }
             continue;
         }
         let body = p
@@ -322,4 +369,128 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
         return Err("manifest.artifact.digest must be sha256:<64 lowercase hex>".into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VALID_WAT: &str = "(module
+        (memory (export \"memory\") 1)
+        (func (export \"alloc\") (param i32) (result i32) (i32.const 0))
+        (func (export \"handle\") (param i32 i32) (result i64) (i64.const 0)))";
+
+    fn manifest(abi: &str, caps: &str, perms: &str) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            "{{\"id\":\"p\",\"version\":\"0.1.0\",\"abi\":\"{abi}\",\
+             \"capabilities\":{caps},\"permissions\":{perms},\
+             \"artifact\":{{\"path\":\"p.wasm\",\"digest\":\"sha256:{}\"}}}}",
+            "a".repeat(64)
+        ))
+        .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn shape(wat: &str) -> Result<(), String> {
+        check_shape(&wat::parse_str(wat).unwrap_or_default())
+    }
+
+    #[test]
+    fn valid_module_passes() {
+        assert_eq!(shape(VALID_WAT), Ok(()));
+    }
+
+    #[test]
+    fn imports_rejected() {
+        let wat = "(module
+            (import \"env\" \"f\" (func))
+            (memory (export \"memory\") 1)
+            (func (export \"alloc\") (param i32) (result i32) (i32.const 0))
+            (func (export \"handle\") (param i32 i32) (result i64) (i64.const 0)))";
+        assert!(shape(wat).is_err_and(|e| e.contains("import")));
+    }
+
+    #[test]
+    fn start_section_rejected() {
+        let wat = "(module
+            (memory (export \"memory\") 1)
+            (func (export \"alloc\") (param i32) (result i32) (i32.const 0))
+            (func (export \"handle\") (param i32 i32) (result i64) (i64.const 0))
+            (func $noop)
+            (start $noop))";
+        assert!(shape(wat).is_err_and(|e| e.contains("start")));
+    }
+
+    #[test]
+    fn memory_over_cap_rejected() {
+        // 1025 pages of 64 KiB initial exceeds the 64 MiB bound.
+        let wat = "(module
+            (memory (export \"memory\") 1025)
+            (func (export \"alloc\") (param i32) (result i32) (i32.const 0))
+            (func (export \"handle\") (param i32 i32) (result i64) (i64.const 0)))";
+        assert!(shape(wat).is_err_and(|e| e.contains("memory")));
+    }
+
+    #[test]
+    fn memory_max_over_cap_rejected() {
+        let wat = "(module
+            (memory (export \"memory\") 1 1025)
+            (func (export \"alloc\") (param i32) (result i32) (i32.const 0))
+            (func (export \"handle\") (param i32 i32) (result i64) (i64.const 0)))";
+        assert!(shape(wat).is_err_and(|e| e.contains("memory")));
+    }
+
+    #[test]
+    fn missing_exports_rejected() {
+        let wat = "(module (memory (export \"memory\") 1))";
+        assert!(shape(wat).is_err());
+    }
+
+    #[test]
+    fn abi_versions_and_capability_sets() {
+        assert_eq!(
+            check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", "[]")),
+            Ok(())
+        );
+        assert!(check_manifest(&manifest("0.1.0", "[\"catalog.search\"]", "[]")).is_err());
+        assert_eq!(
+            check_manifest(&manifest(
+                "0.2.0",
+                "[\"catalog.search\",\"playback.candidates\"]",
+                "[]"
+            )),
+            Ok(())
+        );
+        assert!(check_manifest(&manifest("0.2.0", "[\"bogus.cap\"]", "[]")).is_err());
+        assert!(check_manifest(&manifest("0.3.0", "[\"playback.resolve\"]", "[]")).is_err());
+    }
+
+    #[test]
+    fn kv_and_network_permissions() {
+        assert_eq!(
+            check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", "[\"kv\"]")),
+            Ok(())
+        );
+        assert_eq!(
+            check_manifest(&manifest(
+                "0.2.0",
+                "[\"playback.resolve\"]",
+                "[\"pot-provider\",\"network:*.googlevideo.com\",\"kv\"]"
+            )),
+            Ok(())
+        );
+        assert!(check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", "[\"fs\"]")).is_err());
+    }
+
+    #[test]
+    fn abi_0_1_forbids_kv_permission() {
+        assert!(check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", "[\"kv\"]")).is_err());
+        assert_eq!(
+            check_manifest(&manifest(
+                "0.1.0",
+                "[\"playback.resolve\"]",
+                "[\"pot-provider\",\"network:x.test\"]"
+            )),
+            Ok(())
+        );
+    }
 }

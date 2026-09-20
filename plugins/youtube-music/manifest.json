@@ -1,17 +1,19 @@
 {
-  "abi": "0.1.0",
+  "abi": "0.2.0",
   "artifact": {
-    "digest": "sha256:1326de5d2f3efc33935737f3ace2567840e2e20ae0c099342b2dfbba3b6b5ae3",
+    "digest": "sha256:e39e58efbfc61c06c81a564cdd6d94085f921a8641a939391a3689f8728a7eda",
     "path": "dist/youtube-music.wasm"
   },
   "capabilities": [
-    "playback.resolve"
+    "playback.resolve",
+    "playback.candidates"
   ],
   "id": "youtube-music",
   "permissions": [
     "network:music.youtube.com",
     "network:*.googlevideo.com",
-    "pot-provider"
+    "pot-provider",
+    "kv"
   ],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

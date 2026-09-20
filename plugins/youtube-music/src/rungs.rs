@@ -2,7 +2,7 @@
 //! pins. Client versions are load-bearing: newer IOS builds are served
 //! SABR-only. Pin, don't track upstream.
 
-use base64::Engine as _;
+use auqw_guest_sdk::HttpRequest;
 use serde_json::{json, Value};
 
 /// One ladder rung: an InnerTube client identity.
@@ -24,6 +24,12 @@ impl Rung {
     fn innertube_name(&self) -> &str {
         self.name.split('@').next().unwrap_or(self.name)
     }
+
+    /// The rung's KV namespace key (`visitor/<key>`,
+    /// `backoff/<video>/<key>`): stable across guest releases.
+    pub fn kv_key(&self) -> &'static str {
+        self.name
+    }
 }
 
 /// The ladder, in fallback order. `VISIONOS` runs first: it resolves
@@ -34,6 +40,16 @@ impl Rung {
 /// resolves widely, occasionally SABR-only on newer versions (hence the
 /// 20.10.4 pin). `WEB_REMIX` is excluded permanently — it requires
 /// signature deciphering, which is out of scope by contract.
+///
+/// Attestation: on a flagged IP the bare `player` call is answered
+/// `LOGIN_REQUIRED`/bot-check. A video-bound BotGuard poToken carried
+/// in `context.serviceIntegrityDimensions` lifts that wall for the
+/// web-attestable rungs — live-verified 2026-09: VISIONOS and IOS
+/// return full format lists attested where bare requests bot-check;
+/// ANDROID_VR stays walled (VR needs DroidGuard, not BotGuard), and
+/// MWEB fails `UNPLAYABLE` either way. The resolve therefore runs the
+/// ladder bare first, then replays only the bot-checked rungs with
+/// attestation — see `guest.rs`.
 ///
 /// Stream caps: any minted URL may be GVS-capped to a ~1 MiB served
 /// budget; enforcement is stochastic per-mint, not client-deterministic
@@ -130,23 +146,6 @@ pub const LADDER: &[Rung] = &[
 /// host for this provider.
 pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false";
 
-/// Build the `pot_token` host request minting a PO token bound to
-/// `content_binding`. The host performs the provider call — guests never
-/// see the provider URL and stay HTTPS-only by contract. A missing
-/// permission or an unconfigured provider returns `host_error`, which
-/// the caller degrades to the anonymous path.
-pub fn pot_mint_request(content_binding: &str, request_id: u32) -> Vec<u8> {
-    let msg = json!({
-        "type": "host_request",
-        "id": request_id,
-        "kind": "pot_token",
-        "payload": { "content_binding": content_binding },
-    });
-    // `to_vec` cannot fail on this shape; if it somehow did, an empty
-    // output is the honest signal — the host reports invalid-message.
-    serde_json::to_vec(&msg).unwrap_or_default()
-}
-
 /// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
 /// URLs and URLs already carrying `pot=` pass through unchanged. The
 /// token is percent-encoded: providers return URL-safe base64 today,
@@ -217,40 +216,31 @@ fn probe_range(content_length: Option<u64>) -> String {
     }
 }
 
-/// Build the tail-probe `host_request` for a minted stream URL.
-pub fn probe_request(
-    rung: &Rung,
-    url: &str,
-    request_id: u32,
-    content_length: Option<u64>,
-) -> Vec<u8> {
-    let msg = json!({
-        "type": "host_request",
-        "id": request_id,
-        "kind": "http_request",
-        "payload": {
-            "method": "GET",
-            "url": url,
-            "headers": [
-                ["User-Agent", rung.user_agent],
-                ["Range", probe_range(content_length)],
-            ],
-            "body": Value::Null,
-        }
-    });
-    serde_json::to_vec(&msg).unwrap_or_default()
+/// Build the tail-probe request for a minted stream URL.
+pub fn probe_request(rung: &Rung, url: &str, content_length: Option<u64>) -> HttpRequest {
+    HttpRequest {
+        method: "GET".into(),
+        url: url.into(),
+        headers: vec![
+            ("User-Agent".into(), rung.user_agent.into()),
+            ("Range".into(), probe_range(content_length)),
+        ],
+        body: None,
+    }
 }
 
-/// Build the `host_request` step message for one rung's player call.
-/// PO tokens never ride player requests — a web-minted BotGuard token
-/// cannot attest a non-web client; they decorate googlevideo stream
-/// URLs only, via [`append_pot`].
+/// Build one rung's InnerTube `player` call. `pot` is the shared
+/// video-bound BotGuard token: when present it rides
+/// `context.serviceIntegrityDimensions.poToken`, attesting the player
+/// request itself on the rungs that accept web attestation. The same
+/// token decorates googlevideo stream URLs via [`append_pot`] — one
+/// mint serves both contexts.
 pub fn player_request(
     rung: &Rung,
     video_id: &str,
-    request_id: u32,
     visitor_id: Option<&str>,
-) -> Vec<u8> {
+    pot: Option<&str>,
+) -> HttpRequest {
     let mut client = serde_json::Map::new();
     client.insert("clientName".into(), json!(rung.innertube_name()));
     client.insert("clientVersion".into(), json!(rung.client_version));
@@ -258,37 +248,41 @@ pub fn player_request(
     if let Value::Object(extra) = (rung.context)() {
         client.extend(extra);
     }
+    let mut context = serde_json::Map::new();
+    context.insert("client".into(), Value::Object(client));
+    if let Some(token) = pot {
+        context.insert(
+            "serviceIntegrityDimensions".into(),
+            json!({ "poToken": token }),
+        );
+    }
     let body = json!({
-        "context": { "client": Value::Object(client) },
+        "context": Value::Object(context),
         "videoId": video_id,
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
-    let body_bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
     let mut headers = vec![
-        json!(["Content-Type", "application/json"]),
-        json!(["User-Agent", rung.user_agent]),
-        json!(["X-Goog-Api-Format-Version", "1"]),
-        json!(["X-YouTube-Client-Name", rung.client_name_id]),
-        json!(["X-YouTube-Client-Version", rung.client_version]),
-        json!(["X-Origin", "https://music.youtube.com"]),
-        json!(["Referer", "https://music.youtube.com"]),
+        ("Content-Type".into(), "application/json".into()),
+        ("User-Agent".into(), rung.user_agent.into()),
+        ("X-Goog-Api-Format-Version".into(), "1".into()),
+        ("X-YouTube-Client-Name".into(), rung.client_name_id.into()),
+        (
+            "X-YouTube-Client-Version".into(),
+            rung.client_version.into(),
+        ),
+        ("X-Origin".into(), "https://music.youtube.com".into()),
+        ("Referer".into(), "https://music.youtube.com".into()),
     ];
     if let Some(visitor) = visitor_id {
-        headers.push(json!(["X-Goog-Visitor-Id", visitor]));
+        headers.push(("X-Goog-Visitor-Id".into(), visitor.into()));
     }
-    let msg = json!({
-        "type": "host_request",
-        "id": request_id,
-        "kind": "http_request",
-        "payload": {
-            "method": "POST",
-            "url": PLAYER_URL,
-            "headers": headers,
-            "body": base64::engine::general_purpose::STANDARD.encode(body_bytes),
-        }
-    });
-    serde_json::to_vec(&msg).unwrap_or_default()
+    HttpRequest {
+        method: "POST".into(),
+        url: PLAYER_URL.into(),
+        headers,
+        body: Some(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())),
+    }
 }
 
 #[cfg(test)]

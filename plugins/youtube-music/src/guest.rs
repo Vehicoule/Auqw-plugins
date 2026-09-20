@@ -1,19 +1,32 @@
-//! The ABI step machine: `invoke` starts the ladder; each
-//! `http_response`/`host_error` advances it until a rung yields plain
-//! audio or the ladder is exhausted.
+//! `playback.resolve` dispatch: walk the pinned client ladder until a
+//! rung yields plain audio, then decorate + probe the minted stream URL
+//! before reporting it. Guest-side of ABI 0.2.0 over the vendored SDK.
+//!
+//! Per-rung state lives in the host KV namespace: `visitor/<rung-key>`
+//! replays that client's last `responseContext.visitorData`, and
+//! `backoff/<video-id>/<rung-key>` skips a rung that recently failed.
+//! `kv_set` stages writes the host commits only on `done` — a failed
+//! resolve rolls its staged visitors/backoffs back by contract.
 
-use base64::Engine as _;
-use core::cell::RefCell;
-use serde_json::{json, Value};
+use auqw_guest_sdk::{
+    http_request, kv_get, kv_set, log, now_ms, pot_token, GuestError, GuestFuture, HttpResponse,
+    Invocation, LogLevel,
+};
+use serde_json::{json, Map, Value};
 
 use crate::parse::{
-    classify_playability, format_outcome, pick_audio, visitor_data, FormatOutcome, Picked,
-    Playability,
+    classify_playability, format_outcome, pick_audio, visitor_data, visitor_token, FormatOutcome,
+    PickOptions, Playability,
 };
 use crate::rungs::{
-    append_pot, player_request, pot_mint_request, probe_request, LADDER, PROBE_FALLBACK_START,
-    PROBE_TAIL_BYTES,
+    append_pot, player_request, probe_request, LADDER, PROBE_FALLBACK_START, PROBE_TAIL_BYTES,
 };
+
+/// Backoff windows staged for a failed rung, keyed by reason.
+const BOT_BACKOFF_MS: u64 = 45_000;
+const RATE_LIMIT_BACKOFF_MS: u64 = 60_000;
+const TRANSPORT_BACKOFF_MS: u64 = 5_000;
+const CAPPED_BACKOFF_MS: u64 = 5_000;
 
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
@@ -32,275 +45,609 @@ enum RungOutcome {
     Capped,
 }
 
-/// A picked format awaiting its boundary-probe verdict.
-struct PendingProbe {
-    request_id: u32,
-    picked: Picked,
+pub fn dispatch(inv: Invocation) -> GuestFuture {
+    Box::pin(async move {
+        match inv.capability.as_str() {
+            "playback.resolve" => resolve(&inv.payload).await,
+            "playback.candidates" => crate::candidates::candidates(&inv.payload).await,
+            other => Err(failed(
+                "not-applicable",
+                format!("capability {other} not supported"),
+            )),
+        }
+    })
 }
 
-/// A picked format paused while a `pot_token` mint is in flight. The
-/// mint is lazy — issued when the first rung yields a stream URL — so
-/// the token can bind to the visitor the ladder already collected.
-struct PendingMint {
-    request_id: u32,
-    picked: Picked,
+pub(crate) fn failed(kind: &str, message: String) -> GuestError {
+    GuestError::Failed {
+        kind: kind.into(),
+        message,
+    }
 }
 
-struct State {
+pub(crate) fn bad_payload(m: &str) -> GuestError {
+    failed("invalid-response", format!("payload: {m}"))
+}
+
+/// The payload object must contain only `allowed` keys and every key in
+/// `required` — missing required fields or extras are
+/// `invalid-response`.
+pub(crate) fn payload_keys<'a>(
+    payload: &'a Value,
+    allowed: &[&str],
+    required: &[&str],
+) -> Result<&'a Map<String, Value>, GuestError> {
+    let obj = payload
+        .as_object()
+        .ok_or_else(|| bad_payload("must be an object"))?;
+    for k in obj.keys() {
+        if !allowed.contains(&k.as_str()) {
+            return Err(bad_payload("unexpected key"));
+        }
+    }
+    for k in required {
+        if !obj.contains_key(*k) {
+            return Err(bad_payload("missing key"));
+        }
+    }
+    Ok(obj)
+}
+
+/// A YouTube video id is exactly 11 `[A-Za-z0-9_-]` ASCII characters.
+pub(crate) fn is_video_id(s: &str) -> bool {
+    s.len() == 11
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// A validated `playback.resolve` payload.
+struct ResolvePayload {
     video_id: String,
-    rung: usize,
-    next_id: u32,
-    /// `responseContext.visitorData` from the most recent rung response;
-    /// invocation-scoped, never persisted.
-    visitor_id: Option<String>,
-    /// Minted PO token for this resolve, once the mint step answered.
-    pot_token: Option<String>,
-    /// A mint was already attempted this resolve — at most one.
-    mint_attempted: bool,
-    /// `pot_token` mint in flight, holding the picked URL it decorates.
-    pending_mint: Option<PendingMint>,
-    outcomes: Vec<RungOutcome>,
-    /// Probe in flight for a candidate URL, if any.
-    pending_probe: Option<PendingProbe>,
+    target_bitrate_kbps: u32,
+    prefer: Vec<String>,
+    pin_itag: Option<u32>,
+    resume_offset: Option<u64>,
 }
 
-thread_local! {
-    static STATE: RefCell<Option<State>> = const { RefCell::new(None) };
-}
-
-/// One ABI step: consume the step message bytes, produce the response
-/// message bytes.
-///
-/// The `fail` kinds emitted here stay inside the guest-visible taxonomy —
-/// off-contract host bytes (unparseable input, foreign response ids) are
-/// `invalid-response`; the host-only kinds are the host's to produce.
-pub fn step(input: &[u8]) -> Vec<u8> {
-    let msg: Value = match serde_json::from_slice(input) {
-        Ok(v) => v,
-        Err(_) => return fail("invalid-response", "step input is not JSON"),
-    };
-    match msg.get("type").and_then(Value::as_str) {
-        Some("invoke") => on_invoke(&msg),
-        Some("http_response") | Some("host_error") => STATE.with(|s| {
-            let mut s = s.borrow_mut();
-            match s.as_mut() {
-                Some(state) => on_http_step(&msg, state),
-                None => fail("invalid-response", "http step before invoke"),
+fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> {
+    let obj = payload_keys(
+        payload,
+        &[
+            "source_ref",
+            "target_bitrate_kbps",
+            "prefer",
+            "pin_itag",
+            "resume_offset",
+        ],
+        &["source_ref"],
+    )?;
+    let video_id = match &obj["source_ref"] {
+        Value::String(s) => {
+            if s.is_empty() {
+                return Err(bad_payload("source_ref must be nonempty"));
             }
-        }),
-        _ => fail("invalid-response", "unknown step message type"),
+            s.clone()
+        }
+        Value::Object(_) => {
+            let o = payload_keys(
+                &obj["source_ref"],
+                &["provider", "kind", "id"],
+                &["provider", "kind", "id"],
+            )?;
+            let provider = o["provider"]
+                .as_str()
+                .ok_or_else(|| bad_payload("ref.provider must be a string"))?;
+            let kind = o["kind"]
+                .as_str()
+                .ok_or_else(|| bad_payload("ref.kind must be a string"))?;
+            let id = o["id"]
+                .as_str()
+                .ok_or_else(|| bad_payload("ref.id must be a string"))?;
+            if provider != "youtube-music" || kind != "track" {
+                return Err(failed(
+                    "not-applicable",
+                    "ref is not a youtube-music track ref".into(),
+                ));
+            }
+            id.to_string()
+        }
+        _ => return Err(bad_payload("source_ref must be a string or a sourceRef")),
+    };
+    if !is_video_id(&video_id) {
+        return Err(bad_payload(
+            "source_ref id must be an 11-character video id",
+        ));
     }
-}
-
-fn on_invoke(msg: &Value) -> Vec<u8> {
-    let capability = msg.get("capability").and_then(Value::as_str).unwrap_or("");
-    if capability != "playback.resolve" {
-        return fail("not-applicable", "unsupported capability");
-    }
-    let video_id = msg
-        .get("payload")
-        .and_then(|p| p.get("source_ref"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    if video_id.is_empty() {
-        return fail("invalid-response", "missing source_ref");
-    }
-    let mut state = State {
+    let target_bitrate_kbps = match obj.get("target_bitrate_kbps") {
+        None => 128,
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| (1..=512).contains(n))
+            .ok_or_else(|| bad_payload("target_bitrate_kbps must be an integer 1..512"))?,
+    };
+    let prefer = match obj.get("prefer") {
+        None => vec!["audio/mp4".to_string(), "audio/webm".to_string()],
+        Some(Value::Array(list)) => {
+            if list.len() > 2 {
+                return Err(bad_payload("prefer accepts at most 2 entries"));
+            }
+            let mut seen = Vec::with_capacity(list.len());
+            for v in list {
+                let Some(s) = v.as_str() else {
+                    return Err(bad_payload("prefer entries must be strings"));
+                };
+                if s != "audio/mp4" && s != "audio/webm" {
+                    return Err(bad_payload(
+                        "prefer entries must be audio/mp4 or audio/webm",
+                    ));
+                }
+                if seen.iter().any(|p| p == s) {
+                    return Err(bad_payload("prefer entries must be unique"));
+                }
+                seen.push(s.to_string());
+            }
+            seen
+        }
+        Some(_) => return Err(bad_payload("prefer must be an array")),
+    };
+    let pin_itag = match obj.get("pin_itag") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| bad_payload("pin_itag must be a u32 or null"))?,
+        ),
+    };
+    let resume_offset = match obj.get("resume_offset") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_u64()
+                .ok_or_else(|| bad_payload("resume_offset must be a u64 or null"))?,
+        ),
+    };
+    Ok(ResolvePayload {
         video_id,
-        rung: 0,
-        next_id: 1,
-        visitor_id: None,
-        pot_token: None,
-        mint_attempted: false,
-        pending_mint: None,
-        outcomes: Vec::new(),
-        pending_probe: None,
-    };
-    let req = issue_request(&mut state);
-    STATE.with(|s| *s.borrow_mut() = Some(state));
-    req
+        target_bitrate_kbps,
+        prefer,
+        pin_itag,
+        resume_offset,
+    })
 }
 
-/// Emit the current rung's player request, or the terminal `fail` when
-/// the ladder is exhausted.
-fn issue_request(state: &mut State) -> Vec<u8> {
-    let Some(rung) = LADDER.get(state.rung) else {
-        return ladder_failed(&state.outcomes);
-    };
-    let id = state.next_id;
-    state.next_id += 1;
-    player_request(rung, &state.video_id, id, state.visitor_id.as_deref())
+/// Propagate terminal host errors; fold retryable ones into a transport
+/// outcome. `cancelled`, `permission-denied`, and `invalid-response`
+/// are terminal; anything else is weather.
+fn terminal_or_transport(e: GuestError) -> Result<RungOutcome, GuestError> {
+    match e {
+        GuestError::Host { kind, message } => match kind.as_str() {
+            "cancelled" | "permission-denied" | "invalid-response" => {
+                Err(GuestError::Host { kind, message })
+            }
+            _ => Ok(RungOutcome::Transport),
+        },
+        other => Err(other),
+    }
 }
 
-/// The mint verdict: a 200 body carrying `poToken` arms stream-URL
-/// decoration; `host_error` or a non-200 degrades to the bare URL, and
-/// a mismatched response id is a protocol violation. Otherwise the
-/// paused pick goes to its tail probe.
-fn on_mint_step(msg: &Value, mint: PendingMint, state: &mut State) -> Vec<u8> {
-    if msg.get("id").and_then(Value::as_u64) != Some(u64::from(mint.request_id)) {
-        return fail("invalid-response", "mint response id mismatch");
+/// A sanitized warning — never carries bodies, URLs, query text, or
+/// video ids.
+pub(crate) async fn warn(message: &str) -> Result<(), GuestError> {
+    log(LogLevel::Warn, message).await
+}
+
+/// Load a persisted visitor: nonempty visible-ASCII values only;
+/// anything else is ignored with a sanitized warning and never reaches
+/// a header.
+async fn load_visitor(key: &str) -> Result<Option<String>, GuestError> {
+    match kv_get(key).await? {
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(s) if visitor_token(&s).is_some() => Ok(Some(s)),
+            _ => {
+                warn("ignoring malformed visitor KV value").await?;
+                Ok(None)
+            }
+        },
+        None => Ok(None),
     }
-    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
-        return issue_probe(state, mint.picked);
+}
+
+/// Stored backoff reasons — the only values a `{until_ms,reason}`
+/// record may carry.
+const BACKOFF_REASONS: &[&str] = &["bot-check", "rate-limit", "transport", "capped"];
+
+/// Load a stored backoff: the bytes must be exactly
+/// `{until_ms: u64, reason: <known reason>}` — anything else is
+/// ignored with a sanitized warning.
+async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
+    match kv_get(key).await? {
+        Some(bytes) => {
+            let parsed = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
+                let o = v.as_object()?;
+                if o.len() != 2 {
+                    return None;
+                }
+                let until = o.get("until_ms")?.as_u64()?;
+                let reason = o
+                    .get("reason")?
+                    .as_str()
+                    .filter(|r| BACKOFF_REASONS.contains(r))?;
+                Some((until, reason.to_string()))
+            });
+            match parsed {
+                Some(b) => Ok(Some(b)),
+                None => {
+                    warn("ignoring malformed backoff KV value").await?;
+                    Ok(None)
+                }
+            }
+        }
+        None => Ok(None),
     }
-    if msg.get("status").and_then(Value::as_u64) == Some(200) {
-        state.pot_token = msg
-            .get("body")
-            .and_then(Value::as_str)
-            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|json| {
+}
+
+async fn stage_backoff(key: &str, until_ms: u64, reason: &str) -> Result<(), GuestError> {
+    let v =
+        serde_json::to_vec(&json!({ "until_ms": until_ms, "reason": reason })).unwrap_or_default();
+    kv_set(key, Some(&v)).await
+}
+
+/// Map a stored backoff reason back onto the rung-outcome taxonomy —
+/// a skipped rung still participates in the final failure kind.
+fn outcome_for_reason(reason: &str) -> RungOutcome {
+    match reason {
+        "rate-limit" => RungOutcome::RateLimited,
+        "bot-check" => RungOutcome::Bot,
+        "capped" => RungOutcome::Capped,
+        _ => RungOutcome::Transport,
+    }
+}
+
+/// The backoff reason + window staged for a rung outcome; `None` for
+/// deterministic content answers that are not weather.
+fn backoff_for(outcome: RungOutcome) -> Option<(&'static str, u64)> {
+    match outcome {
+        RungOutcome::Bot => Some(("bot-check", BOT_BACKOFF_MS)),
+        RungOutcome::RateLimited => Some(("rate-limit", RATE_LIMIT_BACKOFF_MS)),
+        RungOutcome::Capped => Some(("capped", CAPPED_BACKOFF_MS)),
+        RungOutcome::Transport => Some(("transport", TRANSPORT_BACKOFF_MS)),
+        _ => None,
+    }
+}
+
+/// The end of a pick: `Done` resolves, `Advance` records the outcome
+/// and the rung continues.
+enum PickOutcome {
+    Done(Value),
+    Advance(RungOutcome),
+}
+
+async fn resolve(payload: &Value) -> Result<Value, GuestError> {
+    let p = parse_resolve_payload(payload)?;
+    // Validated for the Slice 1.5 seam re-mint calls; byte pumping
+    // itself is Slice 1.5-owned.
+    let _ = p.resume_offset;
+    let now = now_ms().await?;
+    let mut outcomes: Vec<RungOutcome> = Vec::new();
+    let mut bot_checks = 0u32;
+    // Ladder indices that produced `Bot` — the rungs the attested
+    // pass replays. Includes backoff-derived entries: a staged
+    // bot-backoff is exactly what attestation is for.
+    let mut bot_rungs: Vec<usize> = Vec::new();
+    let mut pin_seen = false;
+    let mut pin_missing = false;
+    let mut mint_attempted = false;
+    let mut pot: Option<String> = None;
+    // The freshest visitorData seen this invocation — replayed on later
+    // rungs ahead of their persisted KV value, matching the Slice 0
+    // cross-rung propagation.
+    let mut fresh_visitor: Option<String> = None;
+
+    // Two passes over the ladder. Pass 1 runs bare — free on a clean
+    // IP. Pass 2 replays only the bot-checked rungs with the shared
+    // video-bound poToken in `serviceIntegrityDimensions`, the wall's
+    // documented remedy; it fires only when a provider minted, so a
+    // guest with no POT provider pays one locally-denied `pot_token`
+    // call and keeps today's terminal behavior.
+    for pass in 0..2u8 {
+        let attested = pass == 1;
+        for (i, rung) in LADDER.iter().enumerate() {
+            if attested && !bot_rungs.contains(&i) {
+                continue;
+            }
+            let visitor_key = format!("visitor/{}", rung.kv_key());
+            let kv_visitor = load_visitor(&visitor_key).await?;
+            let mut rung_visitor = fresh_visitor.clone().or(kv_visitor);
+
+            let backoff_key = format!("backoff/{}/{}", p.video_id, rung.kv_key());
+            // The attested pass deliberately ignores backoffs — a staged
+            // bot-backoff is the thing attestation exists to break.
+            if !attested {
+                if let Some((until, reason)) = load_backoff(&backoff_key).await? {
+                    if until > now {
+                        let outcome = outcome_for_reason(&reason);
+                        if outcome == RungOutcome::Bot {
+                            bot_rungs.push(i);
+                        }
+                        outcomes.push(outcome);
+                        continue;
+                    }
+                }
+            }
+
+            let resp = match http_request(player_request(
+                rung,
+                &p.video_id,
+                rung_visitor.as_deref(),
+                if attested { pot.as_deref() } else { None },
+            ))
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let outcome = terminal_or_transport(e)?;
+                    if let Some((reason, ms)) = backoff_for(outcome) {
+                        stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                    }
+                    outcomes.push(outcome);
+                    continue;
+                }
+            };
+            if !(200..300).contains(&resp.status) {
+                let outcome = if resp.status == 429 {
+                    RungOutcome::RateLimited
+                } else {
+                    RungOutcome::Transport
+                };
+                if let Some((reason, ms)) = backoff_for(outcome) {
+                    stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                }
+                outcomes.push(outcome);
+                continue;
+            }
+            // A 2xx player response must be a JSON envelope carrying
+            // `playabilityStatus.status` — anything else (an HTML
+            // interstitial, an empty body, a shape the parser predates) is
+            // upstream breakage, not a rung outcome.
+            let body: Value = serde_json::from_slice(&resp.body).map_err(|_| {
+                failed(
+                    "invalid-response",
+                    "player response body is not JSON".into(),
+                )
+            })?;
+            if body
+                .pointer("/playabilityStatus/status")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return Err(failed(
+                    "invalid-response",
+                    "player response lacks playabilityStatus".into(),
+                ));
+            }
+            if let Some(raw) = visitor_data(&body) {
+                if let Some(visitor) = visitor_token(&raw) {
+                    let visitor = visitor.to_string();
+                    kv_set(&visitor_key, Some(visitor.as_bytes())).await?;
+                    rung_visitor = Some(visitor.clone());
+                    fresh_visitor = Some(visitor);
+                } else {
+                    // A malformed visitorData is dropped before it can reach
+                    // a header, a KV value, or the PO-token binding.
+                    warn("ignoring malformed visitor value").await?;
+                }
+            }
+            // A player response naming a different video is not this
+            // resolve's resource — the rung answered, just not what was
+            // asked. Its stream URL must never reach the picker; the rung
+            // counts as unavailable.
+            if body
+                .pointer("/videoDetails/videoId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id != p.video_id)
+            {
+                outcomes.push(RungOutcome::Unavailable);
+                continue;
+            }
+            match classify_playability(&body).0 {
+                Playability::Ok => {}
+                Playability::BotCheck => {
+                    bot_checks += 1;
+                    stage_backoff(
+                        &backoff_key,
+                        now.saturating_add(BOT_BACKOFF_MS),
+                        "bot-check",
+                    )
+                    .await?;
+                    outcomes.push(RungOutcome::Bot);
+                    bot_rungs.push(i);
+                    // Shared invocation budget: the second unattested
+                    // bot-check ends the bare pass — attestation is the
+                    // remedy, not more bare requests.
+                    if bot_checks >= 2 && !attested {
+                        break;
+                    }
+                    continue;
+                }
+                Playability::AgeRestricted => {
+                    outcomes.push(RungOutcome::Age);
+                    continue;
+                }
+                Playability::SignInRequired => {
+                    outcomes.push(RungOutcome::SignIn);
+                    continue;
+                }
+                Playability::Unavailable => {
+                    outcomes.push(RungOutcome::Unavailable);
+                    continue;
+                }
+            }
+            match format_outcome(&body) {
+                FormatOutcome::PlainAudio => {
+                    let prefer: Vec<&str> = p.prefer.iter().map(String::as_str).collect();
+                    match pick_audio(
+                        &body,
+                        PickOptions {
+                            target_bitrate_kbps: p.target_bitrate_kbps,
+                            prefer: &prefer,
+                            pin_itag: p.pin_itag,
+                        },
+                    ) {
+                        Some(picked) => {
+                            // The pinned itag exists on this rung — serving
+                            // trouble from here on is capped/transport
+                            // weather, not a missing resource.
+                            if p.pin_itag.is_some() {
+                                pin_seen = true;
+                            }
+                            match finish_pick(
+                                rung,
+                                picked,
+                                &mut mint_attempted,
+                                &mut pot,
+                                &p.video_id,
+                            )
+                            .await?
+                            {
+                                PickOutcome::Done(result) => {
+                                    kv_set(&backoff_key, None).await?;
+                                    return Ok(result);
+                                }
+                                PickOutcome::Advance(outcome) => {
+                                    if let Some((reason, ms)) = backoff_for(outcome) {
+                                        stage_backoff(&backoff_key, now.saturating_add(ms), reason)
+                                            .await?;
+                                    }
+                                    outcomes.push(outcome);
+                                }
+                            }
+                        }
+                        None => {
+                            // A failed player request cannot establish that
+                            // the pin disappeared. Require a usable format
+                            // from this response when the pin is removed.
+                            if p.pin_itag.is_some()
+                                && pick_audio(
+                                    &body,
+                                    PickOptions {
+                                        target_bitrate_kbps: p.target_bitrate_kbps,
+                                        prefer: &prefer,
+                                        pin_itag: None,
+                                    },
+                                )
+                                .is_some()
+                            {
+                                pin_missing = true;
+                            }
+                            outcomes.push(RungOutcome::NoAudio);
+                        }
+                    }
+                }
+                FormatOutcome::SabrOnly => outcomes.push(RungOutcome::SabrOnly),
+                FormatOutcome::CipheredOnly => outcomes.push(RungOutcome::CipheredOnly),
+                FormatOutcome::NoAudio => outcomes.push(RungOutcome::NoAudio),
+            }
+        }
+        // Escalation: bot-checks accumulate a remedy pass. One shared
+        // mint — the same video-bound token also decorates picked URLs
+        // via `finish_pick`. A denied/failed mint keeps today's
+        // terminal outcome.
+        if attested || bot_rungs.is_empty() {
+            break;
+        }
+        if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
+            break;
+        }
+    }
+    Err(ladder_error(&outcomes, pin_missing, pin_seen))
+}
+
+/// The shared PO token: one video-bound mint per resolve serves both
+/// consumers — `serviceIntegrityDimensions` attestation on the
+/// player-replay pass and `pot=` decoration on googlevideo URLs.
+/// Video-bound matches the current upstream binding for both contexts
+/// (live-verified: a video-bound `pot=` serves the full span). A
+/// denied/failed mint degrades to `None`; `cancelled` propagates.
+async fn mint_once(
+    mint_attempted: &mut bool,
+    pot: &mut Option<String>,
+    video_id: &str,
+) -> Result<bool, GuestError> {
+    if *mint_attempted {
+        return Ok(pot.is_some());
+    }
+    *mint_attempted = true;
+    match pot_token(video_id).await {
+        Ok(r) if r.status == 200 => {
+            *pot = serde_json::from_slice::<Value>(&r.body).ok().and_then(|j| {
                 ["poToken", "po_token", "token"]
                     .iter()
-                    .find_map(|key| json.get(key).and_then(Value::as_str))
+                    .find_map(|key| j.get(key).and_then(Value::as_str))
                     .filter(|token| !token.is_empty())
                     .map(str::to_string)
             });
-    }
-    issue_probe(state, mint.picked)
-}
-
-/// Advance to the next rung, or fail if the ladder is done.
-fn advance(state: &mut State, outcome: RungOutcome) -> Vec<u8> {
-    state.outcomes.push(outcome);
-    state.rung += 1;
-    issue_request(state)
-}
-
-fn on_http_step(msg: &Value, state: &mut State) -> Vec<u8> {
-    // Mint and probe are lock-step: while either is pending, this step
-    // is that request's verdict, not a player response.
-    if let Some(mint) = state.pending_mint.take() {
-        return on_mint_step(msg, mint, state);
-    }
-    if let Some(probe) = state.pending_probe.take() {
-        return on_probe_step(msg, probe, state);
-    }
-    // Otherwise the outstanding request is the rung's player call —
-    // `next_id - 1`, since mint/probe ids are consumed only while
-    // pending. A foreign id is a host protocol violation here too.
-    if msg.get("id").and_then(Value::as_u64) != Some(u64::from(state.next_id - 1)) {
-        return fail("invalid-response", "player response id mismatch");
-    }
-    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
-        return advance(state, RungOutcome::Transport);
-    }
-    let status = msg.get("status").and_then(Value::as_u64).unwrap_or(0);
-    if !(200..300).contains(&status) {
-        return advance(
-            state,
-            if status == 429 {
-                RungOutcome::RateLimited
+            Ok(pot.is_some())
+        }
+        Ok(_) => Ok(false),
+        Err(GuestError::Host { kind, message }) => {
+            if kind == "cancelled" {
+                Err(GuestError::Host { kind, message })
             } else {
-                RungOutcome::Transport
-            },
-        );
-    }
-    let body: Value = msg
-        .get("body")
-        .and_then(Value::as_str)
-        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or(Value::Null);
-    // A 2xx player response must be a JSON envelope carrying
-    // `playabilityStatus.status` — anything else (an HTML interstitial,
-    // an empty body, a response shape the parser predates) is upstream
-    // breakage, not a rung outcome. Reporting it `invalid-response`
-    // keeps parser drift from masquerading as content unavailability.
-    if body.is_null() {
-        return fail("invalid-response", "player response body is not JSON");
-    }
-    if body
-        .pointer("/playabilityStatus/status")
-        .and_then(Value::as_str)
-        .is_none_or(str::is_empty)
-    {
-        return fail(
-            "invalid-response",
-            "player response lacks playabilityStatus",
-        );
-    }
-    if let Some(visitor) = visitor_data(&body) {
-        state.visitor_id = Some(visitor);
-    }
-    // A player response naming a different video is not this resolve's
-    // resource — the rung answered, just not what was asked. Its stream
-    // URL must never reach the picker; the rung counts as unavailable.
-    if body
-        .pointer("/videoDetails/videoId")
-        .and_then(Value::as_str)
-        .is_some_and(|id| id != state.video_id)
-    {
-        return advance(state, RungOutcome::Unavailable);
-    }
-    match classify_playability(&body) {
-        (Playability::Ok, _) => on_ok_rung(&body, state),
-        (Playability::BotCheck, _) => advance(state, RungOutcome::Bot),
-        (Playability::AgeRestricted, _) => advance(state, RungOutcome::Age),
-        (Playability::SignInRequired, _) => advance(state, RungOutcome::SignIn),
-        (Playability::Unavailable, _) => advance(state, RungOutcome::Unavailable),
-    }
-}
-
-fn on_ok_rung(body: &Value, state: &mut State) -> Vec<u8> {
-    match format_outcome(body) {
-        FormatOutcome::PlainAudio => match pick_audio(body) {
-            Some(picked) => issue_probe_or_mint(state, picked),
-            None => advance(state, RungOutcome::NoAudio),
-        },
-        FormatOutcome::SabrOnly => advance(state, RungOutcome::SabrOnly),
-        FormatOutcome::CipheredOnly => advance(state, RungOutcome::CipheredOnly),
-        FormatOutcome::NoAudio => advance(state, RungOutcome::NoAudio),
+                // unsupported / permission-denied / transient mint
+                // failures degrade to no token.
+                Ok(false)
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 
 /// A candidate URL is decorated with `pot=` before it is probed. The
-/// mint is lazy — it fires once, on the first pick of the resolve, bound
-/// to the visitor the ladder collected (the video id stands in when no
-/// rung yielded one). No provider configured -> `host_error` -> the URL
-/// is probed bare.
-fn issue_probe_or_mint(state: &mut State, picked: Picked) -> Vec<u8> {
-    if state.mint_attempted {
-        return issue_probe(state, picked);
-    }
-    state.mint_attempted = true;
-    let binding = state
-        .visitor_id
-        .clone()
-        .unwrap_or_else(|| state.video_id.clone());
-    let id = state.next_id;
-    state.next_id += 1;
-    state.pending_mint = Some(PendingMint {
-        request_id: id,
-        picked,
-    });
-    pot_mint_request(&binding, id)
-}
-
-/// A candidate URL is verified before it is returned: probe the file's
-/// tail so a capped mint advances the ladder instead of handing the app
-/// a URL that cannot serve the track.
-fn issue_probe(state: &mut State, picked: Picked) -> Vec<u8> {
-    let Some(rung) = LADDER.get(state.rung) else {
-        // Unreachable: pending_probe is only set by a live rung's pick.
-        return fail("invalid-response", "probe without rung");
-    };
-    let id = state.next_id;
-    state.next_id += 1;
-    // The probe must hit the URL the downloader will fetch: decorated
-    // with `pot=` when the mint succeeded. The decorated URL is also
-    // what `done` reports.
-    let mut picked = picked;
-    if let Some(token) = &state.pot_token {
+/// mint is lazy — it fires once per resolve, shared with the
+/// attestation pass. Then the strict tail probe runs over the final
+/// decorated URL.
+async fn finish_pick(
+    rung: &crate::rungs::Rung,
+    mut picked: crate::parse::Picked,
+    mint_attempted: &mut bool,
+    pot: &mut Option<String>,
+    video_id: &str,
+) -> Result<PickOutcome, GuestError> {
+    let _ = mint_once(mint_attempted, pot, video_id).await?;
+    if let Some(token) = pot.as_deref() {
         picked.url = append_pot(&picked.url, token);
     }
-    let req = probe_request(rung, &picked.url, id, picked.content_length);
-    state.pending_probe = Some(PendingProbe {
-        request_id: id,
-        picked,
-    });
-    req
+    let mut resp = match http_request(probe_request(rung, &picked.url, picked.content_length)).await
+    {
+        Ok(r) => r,
+        Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
+    };
+    // The host never follows redirects — destination policy is enforced
+    // on each request — so a 3xx is re-requested through the normal
+    // authorized path. googlevideo edge-balances minted URLs this way;
+    // the verdict runs on wherever the chain lands. One hop: a second
+    // redirect is serving weather, not a chain to chase.
+    if resp.status / 100 == 3 {
+        let target = header_value(&resp.headers, "location").map(str::to_owned);
+        if let Some(target) = target.filter(|t| t.starts_with("https://")) {
+            match http_request(probe_request(rung, &target, picked.content_length)).await {
+                Ok(r) => resp = r,
+                Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
+            }
+        }
+    }
+    match probe_verdict(&resp, picked.content_length) {
+        None => Ok(PickOutcome::Done(json!({
+            "url": picked.url,
+            "mime": picked.mime,
+            "bitrate_kbps": picked.bitrate_kbps,
+            "expires_at_ms": picked.expires_at_ms,
+            "content_length": picked.content_length,
+            "client": rung.name,
+            "itag": picked.itag,
+        }))),
+        Some(outcome) => Ok(PickOutcome::Advance(outcome)),
+    }
 }
 
 /// A parsed `Content-Range` value: `bytes <start>-<end>/<total>` on a
@@ -317,19 +664,15 @@ enum ContentRange {
     },
 }
 
-/// Case-insensitive header lookup over the `http_response` headers
-/// array-of-pairs.
-fn header_value<'a>(msg: &'a Value, name: &str) -> Option<&'a str> {
-    msg.get("headers")?.as_array()?.iter().find_map(|h| {
-        let pair = h.as_array()?;
-        let key = pair.first()?.as_str()?;
-        key.eq_ignore_ascii_case(name)
-            .then(|| pair.get(1)?.as_str())?
-    })
+/// Case-insensitive header lookup over response header pairs.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find_map(|(k, v)| k.eq_ignore_ascii_case(name).then_some(v.as_str()))
 }
 
-fn parse_content_range(msg: &Value) -> Option<ContentRange> {
-    let value = header_value(msg, "content-range")?
+fn parse_content_range(resp: &HttpResponse) -> Option<ContentRange> {
+    let value = header_value(&resp.headers, "content-range")?
         .trim()
         .strip_prefix("bytes ")?;
     if let Some(total) = value.strip_prefix("*/") {
@@ -346,12 +689,10 @@ fn parse_content_range(msg: &Value) -> Option<ContentRange> {
     })
 }
 
-/// The byte offset this probe asked for: the tail of a known-length
+/// The byte offset the probe asked for: the tail of a known-length
 /// file, or the fixed fallback window start.
-fn probe_start(probe: &PendingProbe) -> u64 {
-    probe
-        .picked
-        .content_length
+fn probe_start(content_length: Option<u64>) -> u64 {
+    content_length
         .map(|len| len.saturating_sub(PROBE_TAIL_BYTES))
         .unwrap_or(PROBE_FALLBACK_START)
 }
@@ -367,38 +708,29 @@ fn probe_start(probe: &PendingProbe) -> u64 {
 /// rate-limiting is not evidence of a truncated mint. A 5xx is
 /// `Transport`, not `Capped` — server weather teaches nothing about
 /// serving. Anything else marks the mint capped and advances the
-/// ladder; a transport failure is `Transport` for the same reason.
-fn probe_verdict(msg: &Value, status: u64, probe: &PendingProbe) -> Option<RungOutcome> {
-    match status {
+/// ladder.
+fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<RungOutcome> {
+    let start_asked = probe_start(content_length);
+    match resp.status {
         206 => {
-            let Some(ContentRange::Range { start, end, total }) = parse_content_range(msg) else {
+            let Some(ContentRange::Range { start, end, total }) = parse_content_range(resp) else {
                 return Some(RungOutcome::Capped);
             };
             let reached_eof = match total {
                 Some(t) => end.checked_add(1) == Some(t),
-                None => probe
-                    .picked
-                    .content_length
-                    .is_some_and(|l| end.checked_add(1) == Some(l)),
+                None => content_length.is_some_and(|l| end.checked_add(1) == Some(l)),
             };
-            let body_len = msg
-                .get("body")
-                .and_then(Value::as_str)
-                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-                .map_or(0, |b| b.len() as u64);
             let span_carried = end
                 .checked_sub(start)
-                .is_some_and(|span| span + 1 == body_len);
-            if start == probe_start(probe) && reached_eof && span_carried {
+                .is_some_and(|span| span + 1 == resp.body.len() as u64);
+            if start == start_asked && reached_eof && span_carried {
                 None
             } else {
                 Some(RungOutcome::Capped)
             }
         }
-        416 if probe.picked.content_length.is_none() => match parse_content_range(msg) {
-            Some(ContentRange::Unsatisfiable { total: Some(total) })
-                if total <= probe_start(probe) =>
-            {
+        416 if content_length.is_none() => match parse_content_range(resp) {
+            Some(ContentRange::Unsatisfiable { total: Some(total) }) if total <= start_asked => {
                 None
             }
             _ => Some(RungOutcome::Capped),
@@ -409,35 +741,17 @@ fn probe_verdict(msg: &Value, status: u64, probe: &PendingProbe) -> Option<RungO
     }
 }
 
-fn on_probe_step(msg: &Value, probe: PendingProbe, state: &mut State) -> Vec<u8> {
-    if msg.get("id").and_then(Value::as_u64) != Some(u64::from(probe.request_id)) {
-        return fail("invalid-response", "probe response id mismatch");
-    }
-    if msg.get("type").and_then(Value::as_str) == Some("host_error") {
-        return advance(state, RungOutcome::Transport);
-    }
-    let status = msg.get("status").and_then(Value::as_u64).unwrap_or(0);
-    match probe_verdict(msg, status, &probe) {
-        None => {
-            let rung = LADDER.get(state.rung);
-            let picked = probe.picked;
-            done(&json!({
-                "url": picked.url,
-                "mime": picked.mime,
-                "bitrate_kbps": picked.bitrate_kbps,
-                "expires_at_ms": picked.expires_at_ms,
-                "content_length": picked.content_length,
-                "client": rung.map_or("unknown", |r| r.name),
-            }))
-        }
-        Some(outcome) => advance(state, outcome),
-    }
-}
-
-/// Map the accumulated outcomes to a taxonomy `fail`.
-fn ladder_failed(outcomes: &[RungOutcome]) -> Vec<u8> {
+/// Map the accumulated outcomes to the terminal taxonomy. Precedence:
+/// rate-limit, a demonstrably missing pinned itag (absent from a usable
+/// response and never seen — seen-but-capped is capped/transport weather), the
+/// all-unsupported SABR/cipher analysis, all-capped, then the last
+/// bucket (bot/auth/no-result/transport).
+fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> GuestError {
     if outcomes.contains(&RungOutcome::RateLimited) {
-        return fail("rate-limit", "rate-limit");
+        return failed("rate-limit", "rate-limit".into());
+    }
+    if pin_missing && !pin_seen {
+        return failed("expired-resource", "pinned-itag-unavailable".into());
     }
     let ok_outcomes: Vec<RungOutcome> = outcomes
         .iter()
@@ -454,146 +768,254 @@ fn ladder_failed(outcomes: &[RungOutcome]) -> Vec<u8> {
             .iter()
             .all(|o| matches!(o, RungOutcome::SabrOnly | RungOutcome::CipheredOnly))
     {
-        return fail(
+        return failed(
             "unsupported",
             if ok_outcomes[0] == RungOutcome::SabrOnly {
-                "sabr-only"
+                "sabr-only".into()
             } else {
-                "ciphered-only"
+                "ciphered-only".into()
             },
         );
     }
     // Every rung resolved but every mint refused the boundary probe:
     // provider serving is restricted right now — retryable weather.
     if !outcomes.is_empty() && outcomes.iter().all(|o| *o == RungOutcome::Capped) {
-        return fail("transient", "streams-capped");
+        return failed("transient", "streams-capped".into());
     }
     match outcomes.last().copied().unwrap_or(RungOutcome::Transport) {
-        RungOutcome::Bot => fail("transient", "bot-check"),
-        RungOutcome::SignIn | RungOutcome::Age => fail("auth-required", "sign-in-required"),
-        RungOutcome::Unavailable | RungOutcome::NoAudio => fail("no-result", "unavailable"),
-        RungOutcome::SabrOnly => fail("unsupported", "sabr-only"),
-        RungOutcome::CipheredOnly => fail("unsupported", "ciphered-only"),
-        RungOutcome::Capped => fail("transient", "streams-capped"),
-        RungOutcome::RateLimited | RungOutcome::Transport => fail("transient", "transport"),
+        RungOutcome::Bot => failed("transient", "bot-check".into()),
+        RungOutcome::SignIn | RungOutcome::Age => {
+            failed("auth-required", "sign-in-required".into())
+        }
+        RungOutcome::Unavailable | RungOutcome::NoAudio => {
+            failed("no-result", "unavailable".into())
+        }
+        RungOutcome::SabrOnly => failed("unsupported", "sabr-only".into()),
+        RungOutcome::CipheredOnly => failed("unsupported", "ciphered-only".into()),
+        RungOutcome::Capped => failed("transient", "streams-capped".into()),
+        RungOutcome::RateLimited | RungOutcome::Transport => {
+            failed("transient", "transport".into())
+        }
     }
-}
-
-fn done(result: &Value) -> Vec<u8> {
-    serde_json::to_vec(&json!({ "type": "done", "result": result })).unwrap_or_default()
-}
-
-fn fail(kind: &str, message: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "type": "fail",
-        "error": { "kind": kind, "message": message },
-    }))
-    .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auqw_guest_sdk::{dispatch_step, reset_for_testing};
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    use std::collections::BTreeMap;
 
     const OK: &str = include_str!("../fixtures/player-ok-plain-urls.json");
     const SABR: &str = include_str!("../fixtures/player-sabr-only.json");
     const BOT: &str = include_str!("../fixtures/player-bot-check.json");
     const CIPHERED: &str = include_str!("../fixtures/player-ciphered-only.json");
     const UNPLAYABLE: &str = include_str!("../fixtures/player-unplayable.json");
+    const VID: &str = "vid12345678";
+    const NOW: u64 = 1_800_000_000_000;
 
-    fn invoke_msg(video_id: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!({
-            "type": "invoke",
-            "request_id": "t1",
-            "capability": "playback.resolve",
-            "payload": { "source_ref": video_id },
-        }))
-        .unwrap_or_default()
+    fn step(input: &Value) -> Value {
+        let out = dispatch_step(&serde_json::to_vec(input).unwrap_or_default(), dispatch);
+        serde_json::from_slice(&out).unwrap_or_else(|e| panic!("guest output is not JSON: {e}"))
     }
 
-    fn http_response(id: u32, status: u16, body: &str) -> Vec<u8> {
-        serde_json::to_vec(&json!({
+    /// How the harness answers a `pot_token` mint request.
+    enum Pot {
+        /// `host_error` permission-denied, like a host with no provider.
+        Deny,
+        /// A 200 carrying `{"poToken": ...}`.
+        Token(&'static str),
+        /// `host_error` cancelled — must propagate.
+        Cancelled,
+    }
+
+    /// A fake host: answers now/kv/log/pot itself and stops at every
+    /// `http_request` so the test can reply. `kv_set` lands in `staged`;
+    /// `done` merges it into `committed`, `fail` discards it — the
+    /// host's commit-on-done semantics.
+    struct Harness {
+        committed: BTreeMap<String, Vec<u8>>,
+        staged: BTreeMap<String, Option<Vec<u8>>>,
+        pot: Pot,
+        pot_calls: u32,
+        logs: Vec<String>,
+        /// Value `now_ms` replies with; `NOW` unless a test overrides.
+        now: u64,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                committed: BTreeMap::new(),
+                staged: BTreeMap::new(),
+                pot: Pot::Deny,
+                pot_calls: 0,
+                logs: Vec::new(),
+                now: NOW,
+            }
+        }
+
+        fn invoke(&mut self, payload: Value) -> Value {
+            // Tests share worker threads; clear any state a previous
+            // test left parked before starting a fresh invocation.
+            reset_for_testing();
+            self.staged.clear();
+            let out = step(&json!({
+                "type": "invoke",
+                "request_id": "t1",
+                "capability": "playback.resolve",
+                "payload": payload,
+            }));
+            self.drive(out)
+        }
+
+        /// Answer non-HTTP host calls until the guest emits an
+        /// `http_request` or a terminal message.
+        fn drive(&mut self, mut out: Value) -> Value {
+            loop {
+                match out["type"].as_str().unwrap_or("") {
+                    "done" => {
+                        for (k, v) in core::mem::take(&mut self.staged) {
+                            match v {
+                                Some(v) => {
+                                    self.committed.insert(k, v);
+                                }
+                                None => {
+                                    self.committed.remove(&k);
+                                }
+                            }
+                        }
+                        return out;
+                    }
+                    "fail" => {
+                        self.staged.clear();
+                        return out;
+                    }
+                    "host_request" => {
+                        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+                        match out["kind"].as_str().unwrap_or("") {
+                            "now_ms" => {
+                                out = step(&json!({
+                                    "type": "now_response", "id": id, "now_ms": self.now,
+                                }));
+                            }
+                            "kv_get" => {
+                                let key = out["payload"]["key"].as_str().unwrap_or("").to_string();
+                                let value = self
+                                    .committed
+                                    .get(&key)
+                                    .map(|v| Value::String(B64.encode(v)))
+                                    .unwrap_or(Value::Null);
+                                out = step(&json!({
+                                    "type": "kv_response", "id": id, "value": value,
+                                }));
+                            }
+                            "kv_set" => {
+                                let key = out["payload"]["key"].as_str().unwrap_or("").to_string();
+                                let value = out["payload"]["value"]
+                                    .as_str()
+                                    .and_then(|s| B64.decode(s).ok());
+                                self.staged.insert(key, value);
+                                out = step(&json!({ "type": "host_ok", "id": id }));
+                            }
+                            "log" => {
+                                self.logs.push(
+                                    out["payload"]["message"].as_str().unwrap_or("").to_string(),
+                                );
+                                out = step(&json!({ "type": "host_ok", "id": id }));
+                            }
+                            "pot_token" => {
+                                self.pot_calls += 1;
+                                out = match self.pot {
+                                    Pot::Deny => step(&host_error(id, "permission-denied")),
+                                    Pot::Cancelled => step(&host_error(id, "cancelled")),
+                                    Pot::Token(t) => step(&http_response(
+                                        id,
+                                        200,
+                                        &json!({ "poToken": t }).to_string(),
+                                    )),
+                                };
+                            }
+                            "http_request" => return out,
+                            other => panic!("unexpected host request kind {other}"),
+                        }
+                    }
+                    _ => return out,
+                }
+            }
+        }
+
+        /// Reply to the pending `http_request` and keep driving.
+        fn answer(&mut self, out: &Value, status: u16, body: &str) -> Value {
+            let id = out["id"].as_u64().unwrap_or(u64::MAX);
+            let next = step(&http_response(id, status, body));
+            self.drive(next)
+        }
+
+        fn answer_headers(
+            &mut self,
+            out: &Value,
+            status: u16,
+            headers: &[(&str, &str)],
+            body_len: usize,
+        ) -> Value {
+            let id = out["id"].as_u64().unwrap_or(u64::MAX);
+            let next = step(&json!({
+                "type": "http_response",
+                "id": id,
+                "status": status,
+                "headers": headers,
+                "body": B64.encode(vec![b'x'; body_len]),
+            }));
+            self.drive(next)
+        }
+
+        fn answer_host_error(&mut self, out: &Value, kind: &str) -> Value {
+            let id = out["id"].as_u64().unwrap_or(u64::MAX);
+            self.drive(step(&host_error(id, kind)))
+        }
+    }
+
+    fn host_error(id: u64, kind: &str) -> Value {
+        json!({
+            "type": "host_error",
+            "id": id,
+            "error": { "kind": kind, "message": "host said no" },
+        })
+    }
+
+    fn http_response(id: u64, status: u16, body: &str) -> Value {
+        json!({
             "type": "http_response",
             "id": id,
             "status": status,
             "headers": [],
-            "body": base64::engine::general_purpose::STANDARD.encode(body),
-        }))
-        .unwrap_or_default()
+            "body": B64.encode(body),
+        })
     }
 
-    fn host_error(id: u32) -> Vec<u8> {
-        serde_json::to_vec(&json!({
-            "type": "host_error",
-            "id": id,
-            "error": { "kind": "permission-denied", "message": "no provider" },
-        }))
-        .unwrap_or_default()
-    }
-
-    /// A probe answer carrying a `Content-Range` header and a body of
-    /// `body_len` bytes — the evidence a 206 or fallback-416 verdict
-    /// inspects.
-    fn probe_response(id: u32, status: u16, range: &str, body_len: usize) -> Vec<u8> {
-        serde_json::to_vec(&json!({
-            "type": "http_response",
-            "id": id,
-            "status": status,
-            "headers": [["Content-Range", range]],
-            "body": base64::engine::general_purpose::STANDARD.encode(vec![b'x'; body_len]),
-        }))
-        .unwrap_or_default()
-    }
-
-    /// The honest 206 for the OK fixture's pick (`contentLength`
-    /// 4,557,665 → tail `4492129-4557664`, span 64 KiB).
-    fn probe_206(id: u32) -> Vec<u8> {
-        probe_response(id, 206, "bytes 4492129-4557664/4557665", 65536)
-    }
-
-    fn parse(out: &[u8]) -> Value {
-        match serde_json::from_slice(out) {
-            Ok(v) => v,
-            Err(e) => panic!("guest output is not JSON: {e}"),
-        }
-    }
-
-    /// Invoke and return the rung-0 player request.
-    fn begin(video_id: &str) -> Vec<u8> {
-        let out = step(&invoke_msg(video_id));
+    /// Invoke the default resolve and return rung 0's player request.
+    fn begin(h: &mut Harness) -> Value {
+        let out = h.invoke(json!({ "source_ref": VID }));
         assert_eq!(rung_of(&out), 0);
         out
     }
 
-    fn req_id_of(out: &[u8]) -> u32 {
-        u32::try_from(parse(out)["id"].as_u64().unwrap_or(0)).unwrap_or(0)
+    fn header_of(out: &Value, name: &str) -> Option<String> {
+        out["payload"]["headers"]
+            .as_array()?
+            .iter()
+            .find(|h| h[0].as_str() == Some(name))
+            .and_then(|h| h[1].as_str().map(str::to_string))
     }
 
-    /// `Some(id)` when `out` is a `pot_token` mint request.
-    fn mint_id_of(out: &[u8]) -> Option<u32> {
-        let msg = parse(out);
-        (msg["type"] == "host_request" && msg["kind"] == "pot_token").then(|| req_id_of(out))
-    }
-
-    /// Feed `body` (status 200) to the pending request in `out`; if a
-    /// mint follows, deny it as the host would without a provider, and
-    /// return the next emitted request.
-    fn feed(out: &[u8], body: &str) -> Vec<u8> {
-        let mut next = step(&http_response(req_id_of(out), 200, body));
-        if let Some(mint_id) = mint_id_of(&next) {
-            next = step(&host_error(mint_id));
-        }
-        next
-    }
-
-    /// The rung index a `host_request` is for, read off its
-    /// `X-YouTube-Client-Name` + version headers. Only meaningful for
-    /// POST (player) requests — probes are GET and carry no client
-    /// headers.
-    fn rung_of(out: &[u8]) -> usize {
-        let msg = parse(out);
-        assert_eq!(msg["type"], "host_request");
-        assert_eq!(msg["payload"]["method"], "POST");
+    /// The rung index a player `http_request` is for, read off its
+    /// client headers. Only meaningful for POSTs — probes are GET and
+    /// carry no client headers.
+    fn rung_of(out: &Value) -> usize {
+        assert_eq!(out["type"], "host_request");
+        assert_eq!(out["payload"]["method"], "POST");
         match (
             header_of(out, "X-YouTube-Client-Name").as_deref(),
             header_of(out, "X-YouTube-Client-Version").as_deref(),
@@ -603,73 +1025,78 @@ mod tests {
             (Some("28"), Some("1.61.48")) => 2,
             (Some("28"), Some("1.60.19")) => 3,
             (Some("28"), Some("1.43.32")) => 4,
-            other => panic!("unexpected rung headers {other:?} in {msg}"),
+            other => panic!("unexpected rung headers {other:?} in {out}"),
         }
     }
 
-    /// Assert `out` is a GET tail probe and return its id. The fixture's
-    /// picked format reports contentLength 4557665, so the probe asks
-    /// for its last 64 KiB.
-    fn probe_of(out: &[u8]) -> u32 {
-        let msg = parse(out);
-        assert_eq!(msg["type"], "host_request");
-        assert_eq!(msg["payload"]["method"], "GET");
+    /// Assert `out` is a GET tail probe for the OK fixture's pick
+    /// (`contentLength` 4,557,665 → last 64 KiB) and return `out`.
+    fn probe_of(out: &Value) {
+        assert_eq!(out["type"], "host_request");
+        assert_eq!(out["payload"]["method"], "GET");
         assert_eq!(
             header_of(out, "Range").as_deref(),
             Some("bytes=4492129-4557664")
         );
-        req_id_of(out)
     }
 
-    fn header_of(out: &[u8], name: &str) -> Option<String> {
-        let msg = parse(out);
-        msg["payload"]["headers"]
-            .as_array()?
-            .iter()
-            .find(|h| h[0].as_str() == Some(name))
-            .and_then(|h| h[1].as_str().map(str::to_string))
+    /// The honest 206 for the OK fixture's pick: tail
+    /// `4492129-4557664`, span 64 KiB.
+    fn answer_probe_206(h: &mut Harness, out: &Value) -> Value {
+        h.answer_headers(
+            out,
+            206,
+            &[("Content-Range", "bytes 4492129-4557664/4557665")],
+            65536,
+        )
     }
 
-    /// The `url` a `host_request` targets.
-    fn url_of(out: &[u8]) -> String {
-        parse(out)["payload"]["url"]
+    fn url_of(out: &Value) -> String {
+        out["payload"]["url"].as_str().unwrap_or("").to_string()
+    }
+
+    /// `(kind, message)` with the SDK's `"<kind>: "` Display prefix
+    /// stripped back off the message.
+    fn fail_kind(out: &Value) -> (String, String) {
+        assert_eq!(out["type"], "fail");
+        let kind = out["error"]["kind"].as_str().unwrap_or("").to_string();
+        let message = out["error"]["message"]
             .as_str()
             .unwrap_or("")
-            .to_string()
+            .strip_prefix(&format!("{kind}: "))
+            .unwrap_or(out["error"]["message"].as_str().unwrap_or(""))
+            .to_string();
+        (kind, message)
     }
 
-    fn fail_kind(out: &[u8]) -> (String, String) {
-        let msg = parse(out);
-        assert_eq!(msg["type"], "fail");
-        (
-            msg["error"]["kind"].as_str().unwrap_or("").to_string(),
-            msg["error"]["message"].as_str().unwrap_or("").to_string(),
-        )
+    /// `feed` the pending player request a 200 `body` and keep driving
+    /// — mint (denied by default), probe, and the next rung's player.
+    fn feed(h: &mut Harness, out: &Value, body: &str) -> Value {
+        h.answer(out, 200, body)
     }
 
     #[test]
     fn sabr_then_plain_succeeds_on_rung_two() {
-        let out = begin("vid12345678");
+        let mut h = Harness::new();
+        let out = begin(&mut h);
         assert_eq!(
             url_of(&out),
             "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
         );
-        // rungs 0+1 serve SABR-only -> advance to the first VR rung.
-        let out = feed(&out, SABR);
+        let out = feed(&mut h, &out, SABR);
         assert_eq!(rung_of(&out), 1);
-        let out = feed(&out, SABR);
+        let out = feed(&mut h, &out, SABR);
         assert_eq!(rung_of(&out), 2);
-        // rung 2 (first ANDROID_VR pin) yields plain URLs -> mint+probe.
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        let out = step(&probe_206(probe_id));
-        let msg = parse(&out);
-        assert_eq!(msg["type"], "done");
-        assert_eq!(msg["result"]["client"], "ANDROID_VR@1.61.48");
-        assert_eq!(msg["result"]["mime"], "audio/mp4");
-        assert_eq!(msg["result"]["bitrate_kbps"], 130);
-        assert_eq!(msg["result"]["expires_at_ms"], 1_893_456_000_000u64);
-        assert!(msg["result"]["url"]
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["mime"], "audio/mp4");
+        assert_eq!(out["result"]["bitrate_kbps"], 130);
+        assert_eq!(out["result"]["itag"], 140);
+        assert_eq!(out["result"]["expires_at_ms"], 1_893_456_000_000u64);
+        assert!(out["result"]["url"]
             .as_str()
             .unwrap_or("")
             .starts_with("https://"));
@@ -677,190 +1104,217 @@ mod tests {
 
     #[test]
     fn last_rung_success_reports_client() {
-        let mut out = begin("vid12345678");
-        // The first four rungs serve SABR; the last VR pin yields plain
-        // URLs and reports its own client name.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for rung in 1..=4usize {
-            out = feed(&out, SABR);
+            out = feed(&mut h, &out, SABR);
             assert_eq!(rung_of(&out), rung);
         }
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        let out = step(&probe_206(probe_id));
-        let msg = parse(&out);
-        assert_eq!(msg["type"], "done");
-        assert_eq!(msg["result"]["client"], "ANDROID_VR@1.43.32");
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.43.32");
     }
 
     #[test]
     fn probe_403_advances_to_next_rung() {
-        let out = begin("vid12345678");
-        // rung 0 yields plain URLs but its mint refuses the tail.
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        let out = step(&http_response(probe_id, 403, ""));
-        // The capped rung is skipped: next request is rung 1's player.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer(&out, 403, "");
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_redirect_follows_location_to_done() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // Edge-balance 302: the verdict runs on the Location target,
+        // re-requested through the authorized path.
+        let out = h.answer_headers(
+            &out,
+            302,
+            &[(
+                "Location",
+                "https://rr1---sn-edge.googlevideo.com/videoplayback?rn=1",
+            )],
+            0,
+        );
+        probe_of(&out);
+        assert_eq!(
+            url_of(&out),
+            "https://rr1---sn-edge.googlevideo.com/videoplayback?rn=1"
+        );
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn probe_second_redirect_is_capped() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer_headers(
+            &out,
+            302,
+            &[(
+                "Location",
+                "https://rr1---sn-edge.googlevideo.com/videoplayback?rn=1",
+            )],
+            0,
+        );
+        probe_of(&out);
+        let out = h.answer_headers(
+            &out,
+            302,
+            &[(
+                "Location",
+                "https://rr2---sn-edge.googlevideo.com/videoplayback?rn=2",
+            )],
+            0,
+        );
+        // One hop is the bound: the second 3xx caps the mint and the
+        // ladder moves on.
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_416_with_known_length_is_capped() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        // The probe window was inside the advertised contentLength, so a
-        // 416 is a serving refusal — the rung is capped, not done.
-        let out = step(&http_response(probe_id, 416, ""));
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer(&out, 416, "");
         assert_eq!(rung_of(&out), 1);
+    }
+
+    /// Strip `contentLength` so the probe falls back to a fixed window.
+    fn ok_without_length() -> String {
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body
+            .pointer_mut("/streamingData/adaptiveFormats")
+            .and_then(Value::as_array_mut)
+        else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        for f in fmts {
+            if let Some(o) = f.as_object_mut() {
+                o.remove("contentLength");
+            }
+        }
+        body.to_string()
     }
 
     #[test]
     fn probe_416_without_length_means_short_file_done() {
-        let out = begin("vid12345678");
-        // Strip contentLength so the probe falls back to a fixed window
-        // past the ~1 MiB horizon; a 416 there just means a short file.
-        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
-        let Some(fmts) = body
-            .pointer_mut("/streamingData/adaptiveFormats")
-            .and_then(Value::as_array_mut)
-        else {
-            panic!("fixture has no adaptiveFormats");
-        };
-        for f in fmts {
-            if let Some(o) = f.as_object_mut() {
-                o.remove("contentLength");
-            }
-        }
-        let out = feed(&out, &body.to_string());
-        let msg = parse(&out);
-        assert_eq!(msg["payload"]["method"], "GET");
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &ok_without_length());
+        assert_eq!(out["payload"]["method"], "GET");
         assert_eq!(
             header_of(&out, "Range").as_deref(),
             Some("bytes=1048576-1114111")
         );
-        let probe_id = req_id_of(&out);
         // `bytes */900000` is the range evidence: the file ends before
-        // the probe start (1,048,576), so the mint serves the whole file.
-        let out = step(&probe_response(probe_id, 416, "bytes */900000", 0));
-        let msg = parse(&out);
-        assert_eq!(msg["type"], "done");
-        assert_eq!(msg["result"]["client"], "VISIONOS");
+        // the probe start (1,048,576), so the mint serves the file.
+        let out = h.answer_headers(&out, 416, &[("Content-Range", "bytes */900000")], 0);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
     }
 
     #[test]
     fn probe_416_fallback_with_large_total_is_capped() {
-        let out = begin("vid12345678");
-        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
-        let Some(fmts) = body
-            .pointer_mut("/streamingData/adaptiveFormats")
-            .and_then(Value::as_array_mut)
-        else {
-            panic!("fixture has no adaptiveFormats");
-        };
-        for f in fmts {
-            if let Some(o) = f.as_object_mut() {
-                o.remove("contentLength");
-            }
-        }
-        let out = feed(&out, &body.to_string());
-        let probe_id = req_id_of(&out);
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &ok_without_length());
         // `bytes */2000000` claims the file reaches past the probe start
         // yet refused the in-range window — a cap wearing a 416.
-        let out = step(&probe_response(probe_id, 416, "bytes */2000000", 0));
+        let out = h.answer_headers(&out, 416, &[("Content-Range", "bytes */2000000")], 0);
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_416_fallback_without_range_is_capped() {
-        let out = begin("vid12345678");
-        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
-        let Some(fmts) = body
-            .pointer_mut("/streamingData/adaptiveFormats")
-            .and_then(Value::as_array_mut)
-        else {
-            panic!("fixture has no adaptiveFormats");
-        };
-        for f in fmts {
-            if let Some(o) = f.as_object_mut() {
-                o.remove("contentLength");
-            }
-        }
-        let out = feed(&out, &body.to_string());
-        let probe_id = req_id_of(&out);
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &ok_without_length());
         // A bare 416 carries no evidence the file is short — the cap
         // horizon sits in the same window, so it cannot pass.
-        let out = step(&http_response(probe_id, 416, ""));
+        let out = h.answer(&out, 416, "");
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_206_without_content_range_is_capped() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
         // A 206 with no echoed range — even with a full body — verifies
         // nothing about the tail.
-        let out = step(&http_response(probe_id, 206, "x".repeat(65536).as_str()));
+        let out = h.answer_headers(&out, 206, &[], 65536);
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_206_wrong_start_is_capped() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        // The server answered a different window than the tail asked.
-        let out = step(&probe_response(
-            probe_id,
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer_headers(
+            &out,
             206,
-            "bytes 0-65535/4557665",
+            &[("Content-Range", "bytes 0-65535/4557665")],
             65536,
-        ));
+        );
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_206_stopping_before_eof_is_capped() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        // Served a window but not through the file's last byte — the
-        // bytes above `end` are unverified (a cap horizon could sit
-        // there).
-        let out = step(&probe_response(
-            probe_id,
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer_headers(
+            &out,
             206,
-            "bytes 4492129-4557663/4557665",
+            &[("Content-Range", "bytes 4492129-4557663/4557665")],
             65535,
-        ));
+        );
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_206_truncated_body_is_capped() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let probe_id = probe_of(&out);
-        // Header claims the full tail; the body arrived short.
-        let out = step(&probe_response(
-            probe_id,
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer_headers(
+            &out,
             206,
-            "bytes 4492129-4557664/4557665",
+            &[("Content-Range", "bytes 4492129-4557664/4557665")],
             1024,
-        ));
+        );
         assert_eq!(rung_of(&out), 1);
     }
 
     #[test]
     fn probe_429_reports_rate_limit() {
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, OK);
-            let probe_id = probe_of(&out);
-            out = step(&http_response(probe_id, 429, ""));
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer(&out, 429, "");
         }
-        // Stream-side rate limits keep their taxonomy instead of
-        // masquerading as capped mints.
         assert_eq!(
             fail_kind(&out),
             ("rate-limit".to_string(), "rate-limit".to_string())
@@ -869,13 +1323,13 @@ mod tests {
 
     #[test]
     fn probe_5xx_is_transport() {
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, OK);
-            let probe_id = probe_of(&out);
-            out = step(&http_response(probe_id, 503, ""));
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer(&out, 503, "");
         }
-        // Server weather on every probe -> transport, not capped.
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "transport".to_string())
@@ -884,45 +1338,28 @@ mod tests {
 
     #[test]
     fn player_body_not_json_is_invalid_response() {
-        let out = begin("vid12345678");
-        // A 200 carrying an HTML interstitial is upstream breakage —
-        // `invalid-response`, not transport weather.
-        let out = step(&http_response(req_id_of(&out), 200, "<html>oops</html>"));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "player response body is not JSON".to_string()
-            )
-        );
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer(&out, 200, "<html>oops</html>");
+        assert_eq!(fail_kind(&out).0, "invalid-response");
     }
 
     #[test]
     fn player_missing_playability_status_is_invalid_response() {
-        let out = begin("vid12345678");
-        // A JSON envelope without `playabilityStatus.status` is not a
-        // player response — the parser must not read it as unplayable.
-        let out = step(&http_response(
-            req_id_of(&out),
-            200,
-            &json!({ "videoDetails": {} }).to_string(),
-        ));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "player response lacks playabilityStatus".to_string()
-            )
-        );
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer(&out, 200, &json!({ "videoDetails": {} }).to_string());
+        assert_eq!(fail_kind(&out).0, "invalid-response");
     }
 
     #[test]
     fn all_capped_fails_streams_capped() {
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, OK);
-            let probe_id = probe_of(&out);
-            out = step(&http_response(probe_id, 403, ""));
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer(&out, 403, "");
         }
         assert_eq!(
             fail_kind(&out),
@@ -931,110 +1368,32 @@ mod tests {
     }
 
     #[test]
-    fn probe_id_mismatch_fails() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let _ = probe_of(&out);
-        // A response with an id that is not the probe's is a host
-        // protocol violation.
-        let out = step(&http_response(99, 206, ""));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "probe response id mismatch".to_string()
-            )
-        );
+    fn response_id_mismatch_is_invalid_response() {
+        let mut h = Harness::new();
+        let _player = begin(&mut h);
+        // A response whose id is not the outstanding request's is a
+        // host protocol violation — the SDK rejects it before dispatch.
+        let out = step(&http_response(9_999, 200, OK));
+        assert_eq!(fail_kind(&out).0, "invalid-response");
     }
 
     #[test]
-    fn player_response_id_mismatch_fails() {
-        let player_id = req_id_of(&begin("vid12345678"));
-        // A response whose id is not the outstanding player request's is
-        // a host protocol violation, same as on the mint/probe legs.
-        let out = step(&http_response(player_id + 98, 200, OK));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "player response id mismatch".to_string()
-            )
-        );
+    fn host_error_id_mismatch_is_invalid_response() {
+        let mut h = Harness::new();
+        let _out = begin(&mut h);
+        let out = step(&host_error(9_999, "transient"));
+        assert_eq!(fail_kind(&out).0, "invalid-response");
     }
 
     #[test]
-    fn player_host_error_id_mismatch_fails() {
-        let player_id = req_id_of(&begin("vid12345678"));
-        let out = step(&host_error(player_id + 98));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "player response id mismatch".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn mint_id_mismatch_fails() {
-        let out = begin("vid12345678");
-        // rung 0 yields plain URLs -> the lazy mint request follows.
-        let out = step(&http_response(req_id_of(&out), 200, OK));
-        assert!(mint_id_of(&out).is_some());
-        // A response with an id that is not the mint's is a host
-        // protocol violation.
-        let out = step(&http_response(
-            99,
-            200,
-            &json!({"poToken": "tok"}).to_string(),
-        ));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "mint response id mismatch".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn mint_host_error_id_mismatch_fails() {
-        let out = begin("vid12345678");
-        let out = step(&http_response(req_id_of(&out), 200, OK));
-        assert!(mint_id_of(&out).is_some());
-        // A host_error carrying a foreign id is still a protocol
-        // violation — the denial path gets the same check.
-        let out = step(&host_error(99));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "mint response id mismatch".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn probe_host_error_id_mismatch_fails() {
-        let out = begin("vid12345678");
-        let out = feed(&out, OK);
-        let _ = probe_of(&out);
-        let out = step(&host_error(99));
-        assert_eq!(
-            fail_kind(&out),
-            (
-                "invalid-response".to_string(),
-                "probe response id mismatch".to_string()
-            )
-        );
-    }
-
-    #[test]
-    fn all_bot_checks_fail_transient() {
-        let mut out = begin("vid12345678");
-        for _ in 0..5 {
-            out = feed(&out, BOT);
-        }
+    fn second_bot_check_aborts_terminal() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, BOT);
+        assert_eq!(rung_of(&out), 1);
+        // The shared invocation budget allows one retry, not a loop:
+        // the second bot-check ends the resolve.
+        let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "bot-check".to_string())
@@ -1043,10 +1402,11 @@ mod tests {
 
     #[test]
     fn visitor_id_propagates_to_next_rung() {
-        let out = begin("vid12345678");
+        let mut h = Harness::new();
+        let out = begin(&mut h);
         assert!(header_of(&out, "X-Goog-Visitor-Id").is_none());
         // rung 0 response carries visitorData -> rung 1 request headers.
-        let out = feed(&out, SABR);
+        let out = feed(&mut h, &out, SABR);
         assert_eq!(
             header_of(&out, "X-Goog-Visitor-Id").as_deref(),
             Some("Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D")
@@ -1055,8 +1415,9 @@ mod tests {
 
     #[test]
     fn request_shape_and_headers() {
-        let out = begin("vid12345678");
-        assert_eq!(parse(&out)["payload"]["method"], "POST");
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        assert_eq!(out["payload"]["method"], "POST");
         assert_eq!(
             header_of(&out, "X-Origin").as_deref(),
             Some("https://music.youtube.com")
@@ -1071,91 +1432,239 @@ mod tests {
         );
         assert!(header_of(&out, "Origin").is_none());
         let body = String::from_utf8(
-            base64::engine::general_purpose::STANDARD
-                .decode(parse(&out)["payload"]["body"].as_str().unwrap_or(""))
+            B64.decode(out["payload"]["body"].as_str().unwrap_or(""))
                 .unwrap_or_default(),
         )
         .unwrap_or_default();
         assert!(body.contains("\"videoId\":\"vid12345678\""));
         assert!(body.contains("\"contentCheckOk\":true"));
         assert!(body.contains("\"clientName\":\"VISIONOS\""));
-        // PO tokens never ride player bodies — web BotGuard tokens
-        // cannot attest non-web clients.
+        // The bare pass carries no attestation — the shared token only
+        // enters `serviceIntegrityDimensions` on the bot-replay pass.
         assert!(!body.contains("serviceIntegrityDimensions"));
     }
 
     #[test]
     fn mint_binds_video_id_without_visitor() {
-        let out = begin("vid12345678");
-        let out = step(&http_response(req_id_of(&out), 200, OK));
-        let msg = parse(&out);
-        assert_eq!(msg["kind"], "pot_token");
-        assert_eq!(msg["payload"]["content_binding"], "vid12345678");
+        // Drive manually so the pot_token request is visible.
+        reset_for_testing();
+        let mut out = step(&json!({
+            "type": "invoke", "request_id": "t1", "capability": "playback.resolve",
+            "payload": { "source_ref": VID },
+        }));
+        // now → kv(visitor) → kv(backoff) → player.
+        for _ in 0..3 {
+            let id = out["id"].as_u64().unwrap_or(u64::MAX);
+            out = match out["kind"].as_str().unwrap_or("") {
+                "now_ms" => step(&json!({"type":"now_response","id":id,"now_ms":NOW})),
+                "kv_get" => step(&json!({"type":"kv_response","id":id,"value":null})),
+                other => panic!("unexpected kind {other}"),
+            };
+        }
+        assert_eq!(out["kind"], "http_request");
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let out = step(&http_response(id, 200, OK));
+        assert_eq!(out["kind"], "pot_token");
+        assert_eq!(out["payload"]["content_binding"], VID);
     }
 
     #[test]
-    fn mint_binds_visitor_when_response_carries_one() {
-        let out = begin("vid12345678");
+    fn mint_binds_video_id_even_when_response_carries_visitor() {
+        // The shared token is video-bound: it attests player requests
+        // (player-context tokens bind to the video id) and decorates
+        // GVS URLs, where upstream now expects video binding too —
+        // never the visitor.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
         let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
         body["responseContext"] = json!({ "visitorData": "visitor-xyz" });
-        let out = step(&http_response(req_id_of(&out), 200, &body.to_string()));
-        let msg = parse(&out);
-        assert_eq!(msg["kind"], "pot_token");
-        assert_eq!(msg["payload"]["content_binding"], "visitor-xyz");
+        // Answer manually to see the mint request.
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let mut out = step(&http_response(id, 200, &body.to_string()));
+        // The staged visitor kv_set comes first.
+        assert_eq!(out["kind"], "kv_set");
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        out = step(&json!({ "type": "host_ok", "id": id }));
+        assert_eq!(out["kind"], "pot_token");
+        assert_eq!(out["payload"]["content_binding"], VID);
     }
 
     #[test]
     fn mint_denied_probes_bare_url() {
-        let out = begin("vid12345678");
-        let out = step(&http_response(req_id_of(&out), 200, OK));
-        let mint_id = mint_id_of(&out).unwrap_or_else(|| panic!("mint expected"));
-        let out = step(&host_error(mint_id));
-        let _ = probe_of(&out);
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
         assert!(!url_of(&out).contains("pot="));
     }
 
     #[test]
     fn mint_ok_decorates_probe_and_result() {
-        let out = begin("vid12345678");
-        let out = step(&http_response(req_id_of(&out), 200, OK));
-        let mint_id = mint_id_of(&out).unwrap_or_else(|| panic!("mint expected"));
-        let out = step(&http_response(
-            mint_id,
-            200,
-            &json!({ "poToken": "tok-abc" }).to_string(),
-        ));
-        let probe_id = probe_of(&out);
+        let mut h = Harness {
+            pot: Pot::Token("tok-abc"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
         assert!(url_of(&out).contains("pot=tok-abc"));
-        let out = step(&probe_206(probe_id));
-        let msg = parse(&out);
-        assert_eq!(msg["type"], "done");
-        assert!(msg["result"]["url"]
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert!(out["result"]["url"]
             .as_str()
             .unwrap_or("")
             .contains("pot=tok-abc"));
     }
 
     #[test]
+    fn mint_cancelled_propagates() {
+        let mut h = Harness {
+            pot: Pot::Cancelled,
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        assert_eq!(fail_kind(&out).0, "cancelled");
+    }
+
+    #[test]
     fn mint_fires_once_per_resolve() {
-        let mut out = begin("vid12345678");
-        // rung 0 pick -> mint (denied) -> probe 403 -> rung 1.
-        out = step(&http_response(req_id_of(&out), 200, OK));
-        let mint_id = mint_id_of(&out).unwrap_or_else(|| panic!("mint expected"));
-        out = step(&host_error(mint_id));
-        let probe_id = probe_of(&out);
-        out = step(&http_response(probe_id, 403, ""));
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        // rung 0 pick -> denied mint -> probe 403 -> rung 1.
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        out = h.answer(&out, 403, "");
         assert_eq!(rung_of(&out), 1);
         // rung 1 pick -> straight to probe; no second mint.
-        out = step(&http_response(req_id_of(&out), 200, OK));
-        assert!(mint_id_of(&out).is_none());
-        let _ = probe_of(&out);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    /// The decoded JSON body of the pending player request.
+    fn body_of(out: &Value) -> Value {
+        serde_json::from_slice(
+            &B64.decode(out["payload"]["body"].as_str().unwrap_or(""))
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn attested_replay_lifts_the_bot_wall() {
+        // Live-verified shape: bare VISIONOS+IOS bot-check on a flagged
+        // IP; the same rungs return full formats once the request
+        // carries a video-bound poToken in serviceIntegrityDimensions.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        // Pass 1 runs bare: no attestation on the wire.
+        assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
+        let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, BOT);
+        // The second bare bot-check ends the pass; the mint fires and
+        // pass 2 replays rung 0 attested.
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        // The attested rung resolves: pick -> probe -> done.
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        assert!(url_of(&out).contains("pot=tok-xyz"));
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        // One mint served both attestation and the URL decoration.
+        assert_eq!(h.pot_calls, 1);
+        // The recovered rung's staged bot-backoff was cleared; the
+        // still-walled rung's persists.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+    }
+
+    #[test]
+    fn attested_replay_also_walled_is_terminal() {
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, BOT);
+        // Attested replay of rung 0 then rung 1 — still walled.
+        assert_eq!(rung_of(&out), 0);
+        let out = feed(&mut h, &out, BOT);
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, BOT);
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn bot_wall_without_provider_keeps_terminal_shape() {
+        // No POT provider: the second bare bot-check still ends the
+        // resolve with the same typed failure — one locally-denied
+        // `pot_token` call is the only added cost.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, BOT);
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn stored_bot_backoff_gets_an_attested_replay() {
+        // A persisted bot-backoff skips the bare request — but it is
+        // exactly what attestation exists to break, so the rung still
+        // gets an attested retry in pass 2.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        h.committed.insert(
+            format!("backoff/{VID}/VISIONOS"),
+            json!({ "until_ms": NOW + 60_000, "reason": "bot-check" })
+                .to_string()
+                .into_bytes(),
+        );
+        // Pass 1: rung 0 is backoff-skipped, rungs 1-2 bot-check live.
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, BOT);
+        // Pass 2 replays rung 0 first despite its stored backoff.
+        assert_eq!(rung_of(&out), 0);
+        assert_eq!(
+            body_of(&out)["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // Recovery erased the stale backoff.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
     }
 
     #[test]
     fn all_sabr_fails_unsupported_sabr() {
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, SABR);
+            out = feed(&mut h, &out, SABR);
         }
         assert_eq!(
             fail_kind(&out),
@@ -1165,9 +1674,10 @@ mod tests {
 
     #[test]
     fn all_ciphered_fails_unsupported_ciphered() {
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, CIPHERED);
+            out = feed(&mut h, &out, CIPHERED);
         }
         assert_eq!(
             fail_kind(&out),
@@ -1177,12 +1687,12 @@ mod tests {
 
     #[test]
     fn rate_limit_wins_over_last_bucket() {
-        let mut out = begin("vid12345678");
-        out = feed(&out, UNPLAYABLE);
-        let id = req_id_of(&out);
-        out = step(&http_response(id, 429, "{}"));
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, UNPLAYABLE);
+        out = h.answer(&out, 429, "{}");
         for _ in 0..3 {
-            out = feed(&out, BOT);
+            out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
             fail_kind(&out),
@@ -1192,9 +1702,10 @@ mod tests {
 
     #[test]
     fn unavailable_ladder_fails_no_result() {
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, UNPLAYABLE);
+            out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
             fail_kind(&out),
@@ -1204,9 +1715,26 @@ mod tests {
 
     #[test]
     fn host_error_advances_rung() {
-        let out = begin("vid12345678");
-        let out = step(&host_error(req_id_of(&out)));
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer_host_error(&out, "transient");
         assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn cancelled_host_error_propagates() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer_host_error(&out, "cancelled");
+        assert_eq!(fail_kind(&out).0, "cancelled");
+    }
+
+    #[test]
+    fn permission_denied_is_terminal() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer_host_error(&out, "permission-denied");
+        assert_eq!(fail_kind(&out).0, "permission-denied");
     }
 
     /// A player response whose `videoDetails.videoId` is not the
@@ -1219,17 +1747,464 @@ mod tests {
         let mut wrong: Value = serde_json::from_str(OK).unwrap_or_default();
         wrong["videoDetails"] = json!({ "videoId": "a-different-video" });
         let wrong = wrong.to_string();
-        let out = begin("vid12345678");
-        let out = feed(&out, &wrong);
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &wrong);
         assert_eq!(rung_of(&out), 1);
         // Every rung answering the wrong video -> honest no-result.
-        let mut out = begin("vid12345678");
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
         for _ in 0..5 {
-            out = feed(&out, &wrong);
+            out = feed(&mut h, &out, &wrong);
         }
         assert_eq!(
             fail_kind(&out),
             ("no-result".to_string(), "unavailable".to_string())
         );
+    }
+
+    // ---- KV visitors, backoff, pinning ------------------------------
+
+    #[test]
+    fn persisted_visitor_is_replayed_on_first_player_call() {
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/VISIONOS".into(), b"persisted-visitor".to_vec());
+        let out = begin(&mut h);
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some("persisted-visitor")
+        );
+    }
+
+    #[test]
+    fn malformed_visitor_kv_is_ignored_with_warn() {
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/VISIONOS".into(), vec![0xff, 0xfe]);
+        let out = begin(&mut h);
+        assert!(header_of(&out, "X-Goog-Visitor-Id").is_none());
+        assert!(h.logs.iter().any(|m| m.contains("malformed visitor")));
+    }
+
+    #[test]
+    fn response_visitor_commits_for_next_invocation() {
+        let mut h = Harness::new();
+        // rung 0 serves SABR + visitorData (staged), rung 1 resolves.
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, SABR);
+        assert_eq!(rung_of(&out), 1);
+        // rung 1 already replays the fresh visitor in-invocation.
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some("Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D")
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // The staged write committed under rung 0's key.
+        assert_eq!(
+            h.committed.get("visitor/VISIONOS").map(Vec::as_slice),
+            Some(b"Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D".as_slice())
+        );
+        // A fresh invocation reads it back through KV.
+        let out = begin(&mut h);
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some("Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D")
+        );
+    }
+
+    #[test]
+    fn stored_backoff_skips_rung_without_player_call() {
+        let mut h = Harness::new();
+        h.committed.insert(
+            format!("backoff/{VID}/VISIONOS"),
+            json!({ "until_ms": NOW + 60_000, "reason": "rate-limit" })
+                .to_string()
+                .into_bytes(),
+        );
+        // rung 0 is skipped: the first player request is rung 1's.
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn stored_rate_limit_backoff_participates_in_taxonomy() {
+        let mut h = Harness::new();
+        for rung in [
+            "VISIONOS",
+            "IOS",
+            "ANDROID_VR@1.61.48",
+            "ANDROID_VR@1.60.19",
+            "ANDROID_VR@1.43.32",
+        ] {
+            h.committed.insert(
+                format!("backoff/{VID}/{rung}"),
+                json!({ "until_ms": NOW + 60_000, "reason": "rate-limit" })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        // Every rung skipped -> fail without a single HTTP call.
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(
+            fail_kind(&out),
+            ("rate-limit".to_string(), "rate-limit".to_string())
+        );
+    }
+
+    #[test]
+    fn expired_backoff_does_not_skip() {
+        let mut h = Harness::new();
+        h.committed.insert(
+            format!("backoff/{VID}/VISIONOS"),
+            json!({ "until_ms": NOW - 1, "reason": "rate-limit" })
+                .to_string()
+                .into_bytes(),
+        );
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 0);
+    }
+
+    #[test]
+    fn failed_rung_backoff_persists_after_later_success() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        // rung 0: 429 -> stage 60s rate-limit backoff; rung 1 resolves.
+        let out = h.answer(&out, 429, "{}");
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        let Some(stored) = h.committed.get(&format!("backoff/{VID}/VISIONOS")) else {
+            panic!("rung-0 backoff must commit on done");
+        };
+        let stored: Value = serde_json::from_slice(stored).unwrap_or_default();
+        assert_eq!(stored["reason"], "rate-limit");
+        assert_eq!(stored["until_ms"], NOW + 60_000);
+        // The successful rung's own backoff key was cleared.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+    }
+
+    #[test]
+    fn all_failed_rolls_back_staged_backoff() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        // rung 0: 429 stages a backoff; the rest of the ladder serves
+        // unplayable -> `fail` discards the staged write by contract.
+        let mut out = h.answer(&out, 429, "{}");
+        for _ in 0..4 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        assert_eq!(fail_kind(&out).0, "rate-limit");
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(h.staged.is_empty());
+    }
+
+    #[test]
+    fn pin_itag_resolves_pinned_format() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["itag"], 251);
+        assert_eq!(out["result"]["mime"], "audio/webm");
+    }
+
+    #[test]
+    fn pinned_resolve_preserves_transport_failures() {
+        let mut h = Harness::new();
+        let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
+        for _ in 0..5 {
+            out = h.answer_host_error(&out, "transient");
+        }
+        assert_eq!(fail_kind(&out).0, "transient");
+    }
+
+    #[test]
+    fn pinned_resolve_preserves_uninspectable_player_outcomes() {
+        for (body, attempts, expected) in [
+            (BOT, 2, "transient"),
+            (
+                r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
+                5,
+                "auth-required",
+            ),
+            (SABR, 5, "unsupported"),
+            (CIPHERED, 5, "unsupported"),
+            (UNPLAYABLE, 5, "no-result"),
+            (
+                r#"{"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"itag":140,"mimeType":"audio/mp4","url":"http://example.test/audio"}]}}"#,
+                5,
+                "no-result",
+            ),
+        ] {
+            let mut h = Harness::new();
+            let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
+            for _ in 0..attempts {
+                out = feed(&mut h, &out, body);
+            }
+            assert_eq!(fail_kind(&out).0, expected, "{body}");
+        }
+    }
+
+    #[test]
+    fn pin_itag_missing_everywhere_is_expired_resource() {
+        let mut h = Harness::new();
+        let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 774 }));
+        for _ in 0..5 {
+            out = feed(&mut h, &out, OK);
+            if out["type"] == "host_request" && out["payload"]["method"] == "GET" {
+                panic!("a missing pin must never reach the probe");
+            }
+        }
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "expired-resource".to_string(),
+                "pinned-itag-unavailable".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn prefer_webm_picks_webm() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "prefer": ["audio/webm"] }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["mime"], "audio/webm");
+        assert_eq!(out["result"]["itag"], 251);
+    }
+
+    #[test]
+    fn resume_offset_is_accepted() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "resume_offset": 1_048_576 }));
+        assert_eq!(rung_of(&out), 0);
+    }
+
+    #[test]
+    fn object_source_ref_resolves() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({
+            "source_ref": { "provider": "youtube-music", "kind": "track", "id": VID },
+        }));
+        assert_eq!(rung_of(&out), 0);
+        let body = String::from_utf8(
+            B64.decode(out["payload"]["body"].as_str().unwrap_or(""))
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert!(body.contains("\"videoId\":\"vid12345678\""));
+    }
+
+    #[test]
+    fn foreign_source_ref_is_not_applicable() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({
+            "source_ref": { "provider": "itunes", "kind": "track", "id": "12345" },
+        }));
+        assert_eq!(fail_kind(&out).0, "not-applicable");
+    }
+
+    #[test]
+    fn malformed_payloads_are_invalid_response() {
+        let cases = [
+            json!({}),                                // missing source_ref
+            json!({ "source_ref": "" }),              // empty legacy ref
+            json!({ "source_ref": "short" }),         // bad video id
+            json!({ "source_ref": VID, "extra": 1 }), // unknown key
+            json!({ "source_ref": VID, "target_bitrate_kbps": 0 }),
+            json!({ "source_ref": VID, "target_bitrate_kbps": 513 }),
+            json!({ "source_ref": VID, "target_bitrate_kbps": "128" }),
+            json!({ "source_ref": VID, "prefer": ["audio/mp4", "audio/mp4"] }),
+            json!({ "source_ref": VID, "prefer": ["video/mp4"] }),
+            json!({ "source_ref": VID, "prefer": "audio/mp4" }),
+            json!({ "source_ref": VID, "prefer": ["audio/mp4", "audio/webm", "audio/mp4"] }),
+            json!({ "source_ref": VID, "pin_itag": -1 }),
+            json!({ "source_ref": VID, "pin_itag": "140" }),
+            json!({ "source_ref": VID, "resume_offset": "12" }),
+            json!({ "source_ref": { "provider": "youtube-music", "kind": "track" } }),
+            json!({ "source_ref": { "provider": "youtube-music", "kind": "track", "id": VID, "x": 1 } }),
+            json!({ "source_ref": { "provider": "youtube-music", "kind": "track", "id": "bad" } }),
+        ];
+        for payload in cases {
+            let mut h = Harness::new();
+            let out = h.invoke(payload.clone());
+            assert_eq!(fail_kind(&out).0, "invalid-response", "{payload}");
+        }
+    }
+
+    #[test]
+    fn unsupported_capability_is_not_applicable() {
+        reset_for_testing();
+        let out = step(&json!({
+            "type": "invoke", "request_id": "t1", "capability": "radio.start",
+            "payload": {},
+        }));
+        assert_eq!(fail_kind(&out).0, "not-applicable");
+    }
+
+    /// An OK body whose itag-251 row is removed — a rung that does not
+    /// carry the pinned format.
+    fn ok_without_itag(itag: u64) -> String {
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body
+            .pointer_mut("/streamingData/adaptiveFormats")
+            .and_then(Value::as_array_mut)
+        else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        fmts.retain(|f| f.get("itag").and_then(Value::as_u64).unwrap_or(u64::MAX) != itag);
+        body.to_string()
+    }
+
+    #[test]
+    fn pin_seen_then_capped_is_not_pinned_unavailable() {
+        let mut h = Harness::new();
+        let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
+        // rung 0 lacks itag 251 -> advances; rungs 1-4 provide it but
+        // every probe refuses -> capped weather, not a missing resource.
+        out = feed(&mut h, &out, &ok_without_itag(251));
+        assert_eq!(rung_of(&out), 1);
+        for rung in 1..5usize {
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer(&out, 403, "");
+            if rung < 4 {
+                assert_eq!(rung_of(&out), rung + 1);
+            }
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "streams-capped".to_string())
+        );
+    }
+
+    #[test]
+    fn pin_unseen_everywhere_is_pinned_unavailable() {
+        let mut h = Harness::new();
+        let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
+        // No rung carries itag 251 -> the requested pin is unavailable.
+        for _ in 0..5 {
+            out = feed(&mut h, &out, &ok_without_itag(251));
+        }
+        assert_eq!(
+            fail_kind(&out),
+            (
+                "expired-resource".to_string(),
+                "pinned-itag-unavailable".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_persisted_visitors_never_reach_headers() {
+        for (name, value) in [
+            ("crlf", b"vis\r\nX-Inject: 1".as_slice()),
+            ("space", b"vis itor".as_slice()),
+            ("control", b"vis\x07itor".as_slice()),
+            ("del", b"vis\x7fitor".as_slice()),
+            ("oversized", vec![b'v'; 1025].as_slice()),
+            ("non-utf8", vec![0xff, 0xfe].as_slice()),
+        ] {
+            let mut h = Harness::new();
+            h.committed
+                .insert("visitor/VISIONOS".into(), value.to_vec());
+            let out = begin(&mut h);
+            assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None, "{name}");
+            assert!(
+                h.logs.iter().any(|m| m.contains("malformed visitor")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_length_visitor_replays() {
+        let mut h = Harness::new();
+        let visitor = "v".repeat(1024);
+        h.committed
+            .insert("visitor/VISIONOS".into(), visitor.clone().into_bytes());
+        let out = begin(&mut h);
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some(visitor.as_str())
+        );
+    }
+
+    #[test]
+    fn malformed_response_visitor_is_dropped() {
+        let mut h = Harness::new();
+        let mut body: Value = serde_json::from_str(SABR).unwrap_or_default();
+        body["responseContext"] = json!({ "visitorData": "bad\r\nvisitor" });
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &body.to_string());
+        // Not replayed on rung 1, not staged for commit.
+        assert_eq!(rung_of(&out), 1);
+        assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None);
+        assert!(h.logs.iter().any(|m| m.contains("malformed visitor")));
+        assert!(!h.staged.contains_key("visitor/VISIONOS"));
+    }
+
+    #[test]
+    fn malformed_backoff_values_are_ignored() {
+        for (name, value) in [
+            (
+                "extra-key",
+                json!({"until_ms": NOW + 60_000, "reason": "rate-limit", "x": 1}).to_string(),
+            ),
+            (
+                "unknown-reason",
+                json!({"until_ms": NOW + 60_000, "reason": "weird"}).to_string(),
+            ),
+            (
+                "wrong-type",
+                json!({"until_ms": "soon", "reason": "transport"}).to_string(),
+            ),
+            ("missing-key", json!({"until_ms": NOW + 60_000}).to_string()),
+            ("not-json", "garbage".to_string()),
+            ("not-object", "[1,2]".to_string()),
+        ] {
+            let mut h = Harness::new();
+            h.committed
+                .insert(format!("backoff/{VID}/VISIONOS"), value.into_bytes());
+            // Ignored backoff -> rung 0 still gets its player call.
+            let out = begin(&mut h);
+            assert_eq!(rung_of(&out), 0, "{name}");
+            assert!(
+                h.logs.iter().any(|m| m.contains("malformed backoff")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn backoff_staging_saturates_at_u64_max() {
+        let mut h = Harness {
+            now: u64::MAX,
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        // 429 -> stage until_ms = u64::MAX (saturating, never wrapped).
+        let out = h.answer(&out, 429, "{}");
+        assert_eq!(rung_of(&out), 1);
+        let staged: Value = serde_json::from_slice(
+            h.staged
+                .get(&format!("backoff/{VID}/VISIONOS"))
+                .and_then(|v| v.as_deref())
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_eq!(staged["until_ms"], u64::MAX);
+        assert_eq!(staged["reason"], "rate-limit");
     }
 }

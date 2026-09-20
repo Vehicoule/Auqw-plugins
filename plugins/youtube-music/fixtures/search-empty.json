@@ -1,0 +1,20 @@
+{
+  "responseContext": {
+    "visitorData": "visitor-wr-002"
+  },
+  "contents": {
+    "tabbedSearchResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": []
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

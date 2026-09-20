@@ -1,0 +1,292 @@
+{
+  "contents": {
+    "sectionListRenderer": {
+      "contents": [
+        {
+          "musicCardShelfRenderer": {
+            "title": {
+              "runs": [
+                {
+                  "text": "Top result"
+                }
+              ]
+            },
+            "contents": [
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Card Song"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Card Artist",
+                              "navigationEndpoint": {
+                                "browseEndpoint": {
+                                  "browseId": "UCcard0003"
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "overlay": {
+                    "musicItemThumbnailOverlayRenderer": {
+                      "content": {
+                        "musicPlayButtonRenderer": {
+                          "playNavigationEndpoint": {
+                            "watchEndpoint": {
+                              "videoId": "cardVideoId"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        },
+        {
+          "musicShelfRenderer": {
+            "contents": [
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Dup One"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "watchEndpoint": {
+                      "videoId": "dupVideoId1"
+                    }
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Dup Two"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "watchEndpoint": {
+                      "videoId": "dupVideoId1"
+                    }
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "No Video Id Row"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "browseEndpoint": {
+                      "browseId": "UCnotavideo"
+                    }
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "夜に駆ける"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "YOASOBI",
+                              "navigationEndpoint": {
+                                "browseEndpoint": {
+                                  "browseId": "UCyoasobi01"
+                                }
+                              }
+                            },
+                            {
+                              "text": " • "
+                            },
+                            {
+                              "text": "4:23"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "watchEndpoint": {
+                      "videoId": "cjkVideoId1"
+                    }
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Barebones"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "playlistItemData": {
+                    "videoId": "bareVideoId"
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Fallback Title"
+                            }
+                          ]
+                        }
+                      }
+                    },
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "Song"
+                            },
+                            {
+                              "text": " • "
+                            },
+                            {
+                              "text": "Artist Name"
+                            },
+                            {
+                              "text": " • "
+                            },
+                            {
+                              "text": "3:33"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "watchEndpoint": {
+                      "videoId": "fallbackId1"
+                    }
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "watchEndpoint": {
+                      "videoId": "longTitleId"
+                    }
+                  }
+                }
+              },
+              {
+                "musicResponsiveListItemRenderer": {
+                  "flexColumns": [
+                    {
+                      "musicResponsiveListItemFlexColumnRenderer": {
+                        "text": {
+                          "runs": [
+                            {
+                              "text": ""
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  ],
+                  "navigationEndpoint": {
+                    "watchEndpoint": {
+                      "videoId": "noTitleId11"
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,160 @@
+{
+  "responseContext": {
+    "visitorData": "visitor-wr-001"
+  },
+  "contents": {
+    "tabbedSearchResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "musicShelfRenderer": {
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "thumbnail": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                  "thumbnails": [
+                                    { "url": "https://lh3.googleusercontent.com/a=w60-h60", "width": 60, "height": 60 },
+                                    { "url": "https://lh3.googleusercontent.com/a=w544-h544", "width": 544, "height": 544 },
+                                    { "url": "http://insecure.example/w1200", "width": 1200, "height": 1200 }
+                                  ]
+                                }
+                              }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Never Gonna Give You Up" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      {
+                                        "text": "Rick Astley",
+                                        "navigationEndpoint": {
+                                          "browseEndpoint": {
+                                            "browseId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+                                            "browseEndpointContextSupportedConfigs": {
+                                              "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" }
+                                            }
+                                          }
+                                        }
+                                      },
+                                      { "text": " • " },
+                                      {
+                                        "text": "Whenever You Need Somebody",
+                                        "navigationEndpoint": {
+                                          "browseEndpoint": {
+                                            "browseId": "MPREb_album001",
+                                            "browseEndpointContextSupportedConfigs": {
+                                              "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" }
+                                            }
+                                          }
+                                        }
+                                      },
+                                      { "text": " • " },
+                                      { "text": "3:33" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ],
+                            "navigationEndpoint": { "watchEndpoint": { "videoId": "dQw4w9WgXcQ" } },
+                            "playlistItemData": { "videoId": "dQw4w9WgXcQ" }
+                          }
+                        },
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "thumbnail": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                  "thumbnails": [
+                                    { "url": "https://lh3.googleusercontent.com/b=w226-h226", "width": 226, "height": 226 }
+                                  ]
+                                }
+                              }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Long Mix" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      {
+                                        "text": "Mix Channel",
+                                        "navigationEndpoint": {
+                                          "browseEndpoint": { "browseId": "UCchannel0001" }
+                                        }
+                                      },
+                                      { "text": " • " },
+                                      { "text": "1:20:20" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ],
+                            "fixedColumns": [
+                              {
+                                "musicResponsiveListItemFixedColumnRenderer": {
+                                  "text": { "runs": [{ "text": "12M plays" }] }
+                                }
+                              }
+                            ],
+                            "navigationEndpoint": { "watchEndpoint": { "videoId": "oHg5SJYRHA0" } }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "itemSectionRenderer": {
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "simpleText": "Section Song" }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      {
+                                        "text": "Section Artist",
+                                        "navigationEndpoint": { "browseEndpoint": { "browseId": "UCartist0002" } }
+                                      },
+                                      { "text": " • " },
+                                      { "text": "4:01" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ],
+                            "navigationEndpoint": { "watchEndpoint": { "videoId": "abcDEF123_-" } }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

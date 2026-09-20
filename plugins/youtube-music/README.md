@@ -1,12 +1,28 @@
 # youtube-music
 
-Minimal `playback.resolve` provider for Auqw (ABI v0).
+`playback.resolve` + `playback.candidates` provider for Auqw (ABI
+0.2.0), built on the vendored `auqw-guest-sdk` async dispatch.
 
-## What it does
+## playback.resolve
 
 Resolves a video ID to a direct, fetchable audio URL using anonymous
-InnerTube `player` calls against `music.youtube.com`. It walks a
-five-rung, version-pinned client ladder, in order:
+InnerTube `player` calls against `music.youtube.com`. `source_ref`
+accepts the legacy 11-character video-id string or a
+`{provider:"youtube-music",kind:"track",id}` ref; foreign refs are
+`not-applicable` before any host call. Optional payload inputs:
+
+- `target_bitrate_kbps` (default 128, range 1..512): pick the audio
+  format closest to the target.
+- `prefer` (default `["audio/mp4","audio/webm"]`): container
+  preference order — a listed base outranks bitrate distance, then
+  bitrate distance decides inside the preferred container.
+- `pin_itag` (null/absent or u32): constrain selection to exactly that
+  itag — never a silent container switch. If no rung serves it, the
+  resolve fails `expired-resource`/`pinned-itag-unavailable`.
+- `resume_offset` (null/absent or u64): validated seam input for the
+  Slice 1.5 re-mint path; byte pumping itself is Slice 1.5-owned.
+
+It walks a five-rung, version-pinned client ladder, in order:
 
 1. `VISIONOS` 1.02
 2. `IOS` 20.10.4
@@ -20,13 +36,46 @@ rung's client identity (`User-Agent`, `X-YouTube-Client-Name`/`Version`,
 `streamingData.adaptiveFormats` for `audio/*` entries with a **plain
 `url` field**. Entries carrying `signatureCipher`/`cipher` are dropped,
 never deciphered; non-https URLs are skipped — the host only serves
-https destinations. The best format is chosen by distance from 128 kbps
-with `audio/mp4` preferred over `audio/webm` on ties.
+https destinations.
 
-`responseContext.visitorData` from each response is replayed as
-`X-Goog-Visitor-Id` on later rungs within the same invocation. Visitor
-IDs are invocation-scoped — persistence is deferred until the KV host
-call lands in Slice 1.
+## KV visitors and backoff
+
+Each rung has a stable KV key (`VISIONOS`, `IOS`,
+`ANDROID_VR@<version>`):
+
+- `visitor/<rung-key>` — the last `responseContext.visitorData` that
+  rung returned, replayed as `X-Goog-Visitor-Id`. A fresher visitor
+  minted earlier in the same invocation is replayed ahead of the
+  persisted one; non-UTF-8/empty values are ignored with a sanitized
+  warning.
+- `backoff/<video-id>/<rung-key>` — `{until_ms, reason}` JSON. A rung
+  whose backoff is still in force is skipped (no player call) but its
+  reason still participates in the final failure taxonomy — a stored
+  `rate-limit` answers `rate-limit`. Failed rungs stage backoffs:
+  bot-check 45 s, rate-limit 60 s, transport 5 s, capped probe 5 s; a
+  successful rung clears its own key.
+
+`kv_set` writes are **staged**: the host commits them only when the
+invocation ends `done`. Failed-rung backoffs and early visitors persist
+when a later rung succeeds; an all-failed invocation rolls every staged
+write back by contract — there is no partial-commit escape hatch.
+
+## playback.candidates
+
+Recording search over the WEB_REMIX metadata client (name id `67`,
+version `1.20260114.01.00`, desktop UA) — metadata-only: WEB_REMIX is
+never added to the playback ladder because signature deciphering is
+out of scope. Payload is `{query:{title,artist,album,duration_ms,
+version_labels,isrc},limit}` with strict key sets; `limit` clamps
+1..50. Search text is artist + title + version labels + album joined
+with single spaces — nulls and the ISRC are never serialized into it.
+
+The guest POSTs `youtubei/v1/search` with the songs filter, walks the
+response for `musicResponsiveListItemRenderer` rows (bounded: depth 64,
+10 k nodes), keeps upstream order, dedups first-video-id-wins, and maps
+each row to `trackMetadata` with honest nulls where upstream is silent.
+Artwork is the largest HTTPS thumbnail only. The WEB_REMIX visitor is
+persisted under `visitor/web-remix` with the same staging semantics.
 
 ## Minted URLs are verified, not trusted
 
@@ -36,22 +85,33 @@ the ~1 MiB horizon when the length is unknown). A 206 proves this mint
 serves the whole file; a refusal marks the rung **capped** and advances
 the ladder. The probe rides the exact URL the downloader will fetch.
 
-Once per resolve, on the first pick, the guest emits a `pot_token` host
-request — lazy, bound to the `visitorData` the ladder collected (video
-id fallback). The host refuses it unless the manifest declares the
-`pot-provider` permission and a provider endpoint is configured, in
-which case the refusal arrives as `host_error` and the URL is probed
-bare. A minted token decorates the googlevideo URL as `pot=`
-(percent-encoded). Measured 2026-09-19: `pot=` did not lift a capped
-IOS mint — web BotGuard tokens cannot attest non-web clients — but the
-path stays wired for future web-context rungs.
+Once per resolve the guest may emit a `pot_token` host request — lazy,
+bound to the video id (the current upstream binding for both player
+and GVS token contexts). A denied or failed mint degrades to the bare
+URL; `cancelled` propagates. The one token serves two consumers:
+
+- `pot=` on the googlevideo stream URL (percent-encoded) before the
+  tail probe.
+- `context.serviceIntegrityDimensions.poToken` on the **attested
+  replay**: when bare `player` calls bot-check, the second pass
+  replays only those rungs with the token in the request body.
+  Live-verified 2026-09: VISIONOS and IOS return full format lists
+  attested where bare requests answer `LOGIN_REQUIRED`; ANDROID_VR
+  stays walled (VR needs DroidGuard, not BotGuard). With no POT
+  provider configured the replay never runs and a second bot-check is
+  terminal as before — one locally-denied `pot_token` call is the only
+  added cost.
+
+Measured 2026-09-19: `pot=` did not lift a capped IOS mint — serving
+caps are enforced independently of attestation — but the same token
+lifts the player-level `LOGIN_REQUIRED` wall on web-attestable rungs.
 
 Caps are stochastic per-mint, not per-client: GVS enforcement refused
 windows past a ~1 MiB served horizon on some mints and served the whole
 file on others, on VISIONOS and ANDROID_VR alike. Mid-stream recovery
 is the downloader's job — re-resolve for a fresh mint and resume at the
-written offset — so no rung carries a cap flag and there is no
-`prefix_limited` result field.
+written offset (`resume_offset` is the seam for it) — so no rung
+carries a cap flag and there is no `prefix_limited` result field.
 
 ## Why these versions
 
@@ -82,22 +142,26 @@ distinction is preserved for the host.
 Per rung: non-2xx advances the ladder (429 is remembered), bot-check /
 sign-in / age / unavailable playability advances, SABR / ciphered /
 no-audio advances, and a refused tail probe advances as `capped`. A
-response whose `id` is not the outstanding request's fails
-`invalid-response` — a host protocol violation, on every leg. When the
-ladder is exhausted: any 429 → `rate-limit`; every playable rung
-SABR/ciphered → `unsupported` (`sabr-only` or `ciphered-only`, first
-playable rung decides); every rung capped → `transient`
-(`streams-capped`); otherwise the last rung's bucket decides —
-bot-check → `transient` (`bot-check`), sign-in/age → `auth-required`,
-unavailable → `no-result`.
+3xx probe is re-requested once against its `Location` — the host
+enforces the destination allowlist on every request — before the
+verdict lands. A
+second bot-check inside one invocation ends the bare pass — the
+rungs then get one attested replay each when a POT provider minted,
+and `transient` (`bot-check`) only when the wall holds anyway.
+`cancelled`
+propagates immediately; `permission-denied`/`invalid-response` host
+errors are terminal; other host errors are transport weather. When the
+ladder is exhausted: any 429 or stored rate-limit → `rate-limit`; a
+requested pin no rung served → `expired-resource`
+(`pinned-itag-unavailable`); every playable rung SABR/ciphered →
+`unsupported` (`sabr-only` or `ciphered-only`, first playable rung
+decides); every rung capped → `transient` (`streams-capped`); otherwise
+the last rung's bucket decides — bot-check → `transient` (`bot-check`),
+sign-in/age → `auth-required`, unavailable → `no-result`.
 
-## Slice 0 exception
-
-This guest implements the ABI by hand (raw `alloc`/`handle` exports and
-JSON step messages). The SDK inversion shim — which will let guests be
-written as ordinary capability functions — arrives in Slice 1. Explicitly
-out of scope for Slice 0: cookies, auth, KV persistence, backoff,
-signature deciphering, WEB_REMIX, search, radio, candidates.
+For `playback.candidates`: 429 → `rate-limit`, other non-2xx and
+transport host errors → `transient`, `cancelled`/`permission-denied`/
+`invalid-response` propagate, a non-object 2xx body → `invalid-response`.
 
 ## Build
 
@@ -114,6 +178,8 @@ via the validator.
 cargo test -p auqw-youtube-music
 ```
 
-Runs natively: playability/format classification, scoring, expiry, and
-ladder-walk tests over the fixtures in `fixtures/` (hand-authored
-minimal shapes).
+Runs natively through the SDK harness (`dispatch_step` +
+`reset_for_testing`): playability/format classification, pick ranking
+and pinning, probe verdicts, the full ladder walk with simulated
+KV/backoff/PO-token host, and candidate parsing over the fixtures in
+`fixtures/` (hand-authored minimal shapes).

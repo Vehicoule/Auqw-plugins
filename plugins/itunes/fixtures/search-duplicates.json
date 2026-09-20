@@ -1,0 +1,82 @@
+{
+  "resultCount": 7,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 100,
+      "trackName": "Song",
+      "artistName": "Artist",
+      "collectionName": "Studio Album",
+      "releaseDate": "2000-01-01T08:00:00Z",
+      "trackTimeMillis": 240000,
+      "trackExplicitness": "notExplicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 200,
+      "trackName": "Song",
+      "artistName": "Artist",
+      "collectionName": "Greatest Hits Compilation",
+      "releaseDate": "2005-06-06T07:00:00Z",
+      "trackTimeMillis": 241500,
+      "trackExplicitness": "notExplicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 600,
+      "trackName": "Song",
+      "artistName": "Artist",
+      "collectionName": "Studio Album",
+      "releaseDate": "2000-01-01T08:00:00Z",
+      "trackTimeMillis": 270000,
+      "trackExplicitness": "cleaned"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 700,
+      "trackName": "Song",
+      "artistName": "Artist",
+      "collectionName": "Studio Album (Explicit)",
+      "releaseDate": "2000-01-01T08:00:00Z",
+      "trackTimeMillis": 270500,
+      "trackExplicitness": "explicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 300,
+      "trackName": "Song (Live)",
+      "artistName": "Artist",
+      "collectionName": "Live at the Hall",
+      "releaseDate": "2002-02-02T08:00:00Z",
+      "trackTimeMillis": 251000,
+      "trackExplicitness": "notExplicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 400,
+      "trackName": "Song (Remix)",
+      "artistName": "Artist",
+      "collectionName": "Remixes",
+      "releaseDate": "2003-03-03T08:00:00Z",
+      "trackTimeMillis": 238000,
+      "trackExplicitness": "notExplicit"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 500,
+      "trackName": "Song (Remastered)",
+      "artistName": "Artist",
+      "collectionName": "Studio Album (Remastered)",
+      "releaseDate": "2010-10-10T07:00:00Z",
+      "trackTimeMillis": 240500,
+      "trackExplicitness": "notExplicit"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "abi": "0.2.0",
+  "artifact": {
+    "digest": "sha256:971c9ca5579f67a59b50520e42acc8d81fb8922c38506600f074265e1a66a737",
+    "path": "dist/itunes.wasm"
+  },
+  "capabilities": [
+    "catalog.search",
+    "catalog.metadata",
+    "catalog.artwork"
+  ],
+  "id": "itunes",
+  "permissions": [
+    "network:itunes.apple.com"
+  ],
+  "version": "0.1.0"
+}

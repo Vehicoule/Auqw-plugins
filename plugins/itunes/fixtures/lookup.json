@@ -1,0 +1,60 @@
+{
+  "resultCount": 5,
+  "results": [
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 1440761789,
+      "trackName": "Roads",
+      "artistName": "Portishead",
+      "collectionName": "Dummy",
+      "releaseDate": "1994-08-22T07:00:00Z",
+      "trackTimeMillis": 307013,
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/100x100bb.jpg",
+      "primaryGenreName": "Alternative",
+      "trackExplicitness": "notExplicit",
+      "previewUrl": "https://audio-ssl.itunes.apple.com/itunes-assets/preview.m4a"
+    },
+    {
+      "wrapperType": "collection",
+      "collectionId": 777,
+      "collectionName": "Dummy"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 900001,
+      "trackName": "No Art Song",
+      "artistName": "Test Artist",
+      "releaseDate": "2001-01-01T08:00:00Z",
+      "trackTimeMillis": 180000,
+      "trackExplicitness": "cleaned"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 900004,
+      "trackName": "Glory Box",
+      "artistName": "Portishead",
+      "collectionName": "Dummy",
+      "releaseDate": "1994-08-22T07:00:00Z",
+      "trackTimeMillis": 305000,
+      "artworkUrl100": "https://is3-ssl.mzstatic.com/image/thumb/Music122/v4/44/55/66/source/100x100bb.jpg",
+      "primaryGenreName": "Alternative",
+      "trackExplicitness": "notExplicit",
+      "previewUrl": "https://audio-ssl.itunes.apple.com/itunes-assets/preview4.m4a"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "trackId": 900005,
+      "trackName": "Blank Fields",
+      "artistName": "   ",
+      "collectionName": "",
+      "releaseDate": "2001-01-01T08:00:00Z",
+      "trackTimeMillis": 120000,
+      "primaryGenreName": "",
+      "trackExplicitness": "notExplicit"
+    }
+  ]
+}

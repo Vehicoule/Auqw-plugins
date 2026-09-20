@@ -1,9 +1,9 @@
 [package]
-name = "auqw-youtube-music"
-version = "0.2.0"
+name = "auqw-itunes"
+version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "YouTube Music playback.resolve + playback.candidates guest (ABI 0.2.0)"
+description = "iTunes catalog guest: catalog.search/metadata/artwork (ABI 0.2.0)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -14,4 +14,6 @@ workspace = true
 [dependencies]
 auqw-guest-sdk = { path = "../../vendor/auqw-guest-sdk-0.2.0" }
 serde_json = "1.0.149"
+
+[dev-dependencies]
 base64 = "0.22.1"
