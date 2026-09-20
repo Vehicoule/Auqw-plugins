@@ -284,7 +284,9 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     if !version_ok {
         return Err("manifest.version must be semver x.y.z".into());
     }
-    // abi: "0.1.0" or "0.2.0"; the capability set is version-specific.
+    // abi: "0.1.0", "0.2.0", or "0.3.0"; the capability set is
+    // version-specific and revisions are immutable — a newer ABI's
+    // capabilities never become valid on an older ABI.
     let abi = field_str("abi")?;
     let allowed_caps: &[&str] = match abi {
         "0.1.0" => &["playback.resolve"],
@@ -295,7 +297,20 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             "playback.resolve",
             "playback.candidates",
         ],
-        _ => return Err("manifest.abi must be \"0.1.0\" or \"0.2.0\"".into()),
+        "0.3.0" => &[
+            "catalog.artwork",
+            "catalog.entity",
+            "catalog.metadata",
+            "catalog.search",
+            "lyrics.plain",
+            "lyrics.synced",
+            "playback.candidates",
+            "playback.resolve",
+            "radio.seed",
+        ],
+        _ => {
+            return Err("manifest.abi must be \"0.1.0\", \"0.2.0\", or \"0.3.0\"".into());
+        }
     };
     // capabilities: non-empty subset of the ABI's set
     let caps = manifest["capabilities"]
@@ -461,7 +476,32 @@ mod tests {
             Ok(())
         );
         assert!(check_manifest(&manifest("0.2.0", "[\"bogus.cap\"]", "[]")).is_err());
-        assert!(check_manifest(&manifest("0.3.0", "[\"playback.resolve\"]", "[]")).is_err());
+        // 0.3.0 adds catalog.entity, lyrics.*, radio.seed on top of 0.2.0.
+        assert_eq!(
+            check_manifest(&manifest(
+                "0.3.0",
+                "[\"catalog.entity\",\"lyrics.plain\",\"lyrics.synced\",\"radio.seed\"]",
+                "[]"
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            check_manifest(&manifest("0.3.0", "[\"playback.resolve\"]", "[]")),
+            Ok(())
+        );
+        // Immutable revisions: 0.3.0 capabilities are invalid on 0.1.0/0.2.0.
+        for cap in [
+            "catalog.entity",
+            "lyrics.plain",
+            "lyrics.synced",
+            "radio.seed",
+        ] {
+            let caps = format!("[\"{cap}\"]");
+            assert!(check_manifest(&manifest("0.1.0", &caps, "[]")).is_err());
+            assert!(check_manifest(&manifest("0.2.0", &caps, "[]")).is_err());
+        }
+        assert!(check_manifest(&manifest("0.3.0", "[\"bogus.cap\"]", "[]")).is_err());
+        assert!(check_manifest(&manifest("0.4.0", "[\"playback.resolve\"]", "[]")).is_err());
     }
 
     #[test]
@@ -479,6 +519,10 @@ mod tests {
             Ok(())
         );
         assert!(check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", "[\"fs\"]")).is_err());
+        assert_eq!(
+            check_manifest(&manifest("0.3.0", "[\"lyrics.plain\"]", "[\"kv\"]")),
+            Ok(())
+        );
     }
 
     #[test]
