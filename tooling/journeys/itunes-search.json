@@ -1,0 +1,17 @@
+{
+  "name": "itunes catalog.search — mixed results",
+  "plugin": "itunes",
+  "capability": "catalog.search",
+  "request": { "query": "portishead", "limit": 10, "storefront": null },
+  "upstreams": [
+    {
+      "url_contains": "itunes.apple.com/search",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/search-mixed.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "max_http_calls": 1
+  }
+}
