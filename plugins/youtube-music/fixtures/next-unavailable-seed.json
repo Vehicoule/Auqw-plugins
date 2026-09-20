@@ -1,0 +1,36 @@
+{
+  "responseContext": {},
+  "playabilityStatus": {
+    "status": "ERROR",
+    "reason": "Video unavailable",
+    "errorScreen": {
+      "playerErrorMessageRenderer": {
+        "reason": { "simpleText": "Video unavailable" }
+      }
+    }
+  },
+  "contents": {
+    "singleColumnMusicWatchNextResultsRenderer": {
+      "tabbedRenderer": {
+        "watchNextTabbedResultsRenderer": {
+          "tabs": [
+            {
+              "tabRenderer": {
+                "title": "Up next",
+                "content": {
+                  "musicQueueRenderer": {
+                    "content": {
+                      "playlistPanelRenderer": {
+                        "contents": []
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

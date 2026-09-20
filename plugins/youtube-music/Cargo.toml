@@ -1,9 +1,9 @@
 [package]
 name = "auqw-youtube-music"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "YouTube Music playback.resolve + playback.candidates guest (ABI 0.2.0)"
+description = "YouTube Music playback.resolve + playback.candidates + radio.seed guest (ABI 0.3.0)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

@@ -43,11 +43,12 @@ repo — layout, payload format, and key custody are documented in
 
 ## Vendored guest SDK
 
-Guest crates depend on `auqw-guest-sdk` by path under
-`vendor/auqw-guest-sdk-0.2.0/` — the `cargo package`d source of the
-authoritative SDK in `../auqw/sdk/rust` (version 0.2.0), including its
-GPL-3.0-only license text. Normal builds never reach into a sibling
-checkout; this repo builds standalone.
+Guest crates depend on `auqw-guest-sdk` by path under a versioned
+`vendor/auqw-guest-sdk-<version>/` directory — the `cargo package`d
+source of the authoritative SDK in `../auqw/sdk/rust`, including its
+GPL-3.0-only license text. Guests currently build on 0.3.0; ABI
+revisions coexist as sibling vendor dirs. Normal builds never reach
+into a sibling checkout; this repo builds standalone.
 
 To refresh the vendor copy after an authoritative SDK change, a
 maintainer with both checkouts runs:
@@ -57,15 +58,17 @@ maintainer with both checkouts runs:
 ```
 
 The script packages `../auqw/sdk/rust`, verifies the package is exactly
-`auqw-guest-sdk` 0.2.0, and replaces the versioned vendor directory.
+`auqw-guest-sdk` at the SDK's own version, and replaces that version's
+vendor directory.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `plugins/youtube-music` | `playback.resolve` + `playback.candidates` guest (ABI 0.2.0) |
+| `plugins/youtube-music` | `playback.resolve` + `playback.candidates` + `radio.seed` guest (ABI 0.3.0) |
 | `plugins/itunes` | iTunes catalog guest (`catalog.search`/`metadata`/`artwork`) |
 | `vendor/auqw-guest-sdk-0.2.0` | Packaged guest SDK 0.2.0 source |
+| `vendor/auqw-guest-sdk-0.3.0` | Packaged guest SDK 0.3.0 source |
 | `tooling/validate` | Standalone artifact validator |
 | `tooling/build.sh` | Build + stage + validate one plugin |
 | `tooling/sign.mjs` | ed25519 release signing: keygen/sign/verify/pubkey |

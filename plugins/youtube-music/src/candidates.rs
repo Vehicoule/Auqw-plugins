@@ -12,13 +12,13 @@ use crate::guest::{bad_payload, failed, is_video_id, payload_keys, warn};
 use crate::parse::{visitor_data, visitor_token};
 
 const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
-const CLIENT_NAME_ID: &str = "67";
-const CLIENT_VERSION: &str = "1.20260114.01.00";
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+pub(crate) const CLIENT_NAME_ID: &str = "67";
+pub(crate) const CLIENT_VERSION: &str = "1.20260114.01.00";
+pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 /// InnerTube `params` selecting the songs filter.
 const SONGS_PARAMS: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
-const VISITOR_KEY: &str = "visitor/web-remix";
+pub(crate) const VISITOR_KEY: &str = "visitor/web-remix";
 /// Response-walk bounds — upstream trees are deep but a pathological
 /// response must not spin the guest.
 const MAX_DEPTH: usize = 64;
@@ -137,22 +137,24 @@ fn parse_candidates_payload(payload: &Value) -> Result<CandidatesPayload, GuestE
     })
 }
 
-/// The WEB_REMIX InnerTube `search` call. Visitor replay comes from
+/// The WEB_REMIX `context` identity — identical on every metadata
+/// surface (`search`, `next`).
+pub(crate) fn web_remix_context() -> Value {
+    json!({
+        "client": {
+            "clientName": "WEB_REMIX",
+            "clientVersion": CLIENT_VERSION,
+            "hl": "en",
+            "gl": "US",
+            "userAgent": USER_AGENT,
+        }
+    })
+}
+
+/// A WEB_REMIX InnerTube POST: one client identity and header set for
+/// every metadata surface. Visitor replay comes from
 /// `visitor/web-remix`, the same per-client KV pattern as the ladder.
-fn search_request(query: &str, visitor: Option<&str>) -> HttpRequest {
-    let body = json!({
-        "context": {
-            "client": {
-                "clientName": "WEB_REMIX",
-                "clientVersion": CLIENT_VERSION,
-                "hl": "en",
-                "gl": "US",
-                "userAgent": USER_AGENT,
-            }
-        },
-        "query": query,
-        "params": SONGS_PARAMS,
-    });
+pub(crate) fn web_remix_request(url: &str, body: Value, visitor: Option<&str>) -> HttpRequest {
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
         ("User-Agent".into(), USER_AGENT.into()),
@@ -168,10 +170,20 @@ fn search_request(query: &str, visitor: Option<&str>) -> HttpRequest {
     }
     HttpRequest {
         method: "POST".into(),
-        url: SEARCH_URL.into(),
+        url: url.into(),
         headers,
         body: Some(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())),
     }
+}
+
+/// The WEB_REMIX InnerTube `search` call.
+fn search_request(query: &str, visitor: Option<&str>) -> HttpRequest {
+    let body = json!({
+        "context": web_remix_context(),
+        "query": query,
+        "params": SONGS_PARAMS,
+    });
+    web_remix_request(SEARCH_URL, body, visitor)
 }
 
 pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
@@ -292,7 +304,7 @@ fn video_id_of(r: &Map<String, Value>) -> Option<String> {
 
 /// A `{runs:[{text}..]}`-or-`{simpleText:..}` text node → its trimmed
 /// text, `None` when empty.
-fn runs_text(text: &Value) -> Option<String> {
+pub(crate) fn runs_text(text: &Value) -> Option<String> {
     if let Some(runs) = text.get("runs").and_then(Value::as_array) {
         let joined: String = runs
             .iter()
@@ -341,17 +353,17 @@ fn column_runs(col: &Value) -> Vec<&Map<String, Value>> {
     runs
 }
 
-fn run_text(run: &Map<String, Value>) -> Option<&str> {
+pub(crate) fn run_text(run: &Map<String, Value>) -> Option<&str> {
     run.get("text").and_then(Value::as_str)
 }
 
-fn browse(run: &Map<String, Value>) -> Option<&Map<String, Value>> {
+pub(crate) fn browse(run: &Map<String, Value>) -> Option<&Map<String, Value>> {
     run.get("navigationEndpoint")?
         .get("browseEndpoint")?
         .as_object()
 }
 
-fn page_type(run: &Map<String, Value>) -> Option<&str> {
+pub(crate) fn page_type(run: &Map<String, Value>) -> Option<&str> {
     browse(run)?
         .get("browseEndpointContextSupportedConfigs")?
         .get("browseEndpointContextMusicConfig")?
@@ -362,7 +374,7 @@ fn page_type(run: &Map<String, Value>) -> Option<&str> {
 /// `M:SS` / `H:MM:SS` run text → milliseconds. Seconds (and minutes in
 /// the hours form) must be under 60; all arithmetic is checked so a
 /// pathological timestamp is `None`, not a wrap.
-fn duration_ms_of(s: &str) -> Option<u64> {
+pub(crate) fn duration_ms_of(s: &str) -> Option<u64> {
     let parts: Vec<&str> = s.split(':').collect();
     if !parts
         .iter()
@@ -395,7 +407,7 @@ fn duration_ms_of(s: &str) -> Option<u64> {
 
 /// Row furniture that must never surface as an artist fallback: type
 /// labels, separators, durations, and play-count text.
-fn is_furniture(text: &str) -> bool {
+pub(crate) fn is_furniture(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() || t == "•" {
         return true;
@@ -418,7 +430,7 @@ fn is_furniture(text: &str) -> bool {
 /// Largest HTTPS thumbnail in the renderer by width×height: contract-
 /// legal URLs only (≤2048 chars), and dimensions serialize as null
 /// rather than schema-invalid zeros.
-fn best_artwork(v: &Value) -> Option<Value> {
+pub(crate) fn best_artwork(v: &Value) -> Option<Value> {
     let mut best: Option<(u64, Value)> = None;
     let mut nodes = 0usize;
     fn walk(v: &Value, depth: usize, nodes: &mut usize, best: &mut Option<(u64, Value)>) {
