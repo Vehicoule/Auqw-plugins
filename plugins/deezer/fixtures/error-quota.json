@@ -1,0 +1,7 @@
+{
+  "error": {
+    "type": "QuotaException",
+    "message": "Quota exceeded",
+    "code": 4
+  }
+}

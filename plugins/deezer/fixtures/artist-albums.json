@@ -1,0 +1,33 @@
+{
+  "data": [
+    {
+      "id": 455045,
+      "title": "Third",
+      "link": "https://www.deezer.com/album/455045",
+      "cover": "https://api.deezer.com/album/455045/image",
+      "cover_xl": "https://cdn-images.dzcdn.net/images/cover/5cca6e3c2dd802a4500dbfca8a220f66/1000x1000-000000-80-0-0.jpg",
+      "md5_image": "5cca6e3c2dd802a4500dbfca8a220f66",
+      "genre_id": 132,
+      "fans": 10748,
+      "release_date": "2008-04-28",
+      "record_type": "album",
+      "tracklist": "https://api.deezer.com/album/455045/tracks",
+      "explicit_lyrics": false,
+      "type": "album"
+    },
+    {
+      "id": 109301,
+      "title": "Dummy",
+      "link": "https://www.deezer.com/album/109301",
+      "cover_xl": "https://cdn-images.dzcdn.net/images/cover/5942b88996f33c82790023d5d99395d3/1000x1000-000000-80-0-0.jpg",
+      "genre_id": 152,
+      "fans": 178241,
+      "release_date": "1994-08-22",
+      "record_type": "album",
+      "tracklist": "https://api.deezer.com/album/109301/tracks",
+      "explicit_lyrics": false,
+      "type": "album"
+    }
+  ],
+  "total": 2
+}

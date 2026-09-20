@@ -1,6 +1,7 @@
-//! `playback.resolve` dispatch: walk the pinned client ladder until a
-//! rung yields plain audio, then decorate + probe the minted stream URL
-//! before reporting it. Guest-side of ABI 0.2.0 over the vendored SDK.
+//! Capability dispatch plus `playback.resolve`: walk the pinned client
+//! ladder until a rung yields plain audio, then decorate + probe the
+//! minted stream URL before reporting it. Guest-side of ABI 0.3.0 over
+//! the vendored SDK.
 //!
 //! Per-rung state lives in the host KV namespace: `visitor/<rung-key>`
 //! replays that client's last `responseContext.visitorData`, and
@@ -50,6 +51,7 @@ pub fn dispatch(inv: Invocation) -> GuestFuture {
         match inv.capability.as_str() {
             "playback.resolve" => resolve(&inv.payload).await,
             "playback.candidates" => crate::candidates::candidates(&inv.payload).await,
+            "radio.seed" => crate::radio::radio_seed(&inv.payload).await,
             other => Err(failed(
                 "not-applicable",
                 format!("capability {other} not supported"),
@@ -239,7 +241,7 @@ pub(crate) async fn warn(message: &str) -> Result<(), GuestError> {
 /// Load a persisted visitor: nonempty visible-ASCII values only;
 /// anything else is ignored with a sanitized warning and never reaches
 /// a header.
-async fn load_visitor(key: &str) -> Result<Option<String>, GuestError> {
+pub(crate) async fn load_visitor(key: &str) -> Result<Option<String>, GuestError> {
     match kv_get(key).await? {
         Some(bytes) => match String::from_utf8(bytes) {
             Ok(s) if visitor_token(&s).is_some() => Ok(Some(s)),

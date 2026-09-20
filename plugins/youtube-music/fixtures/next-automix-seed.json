@@ -1,0 +1,174 @@
+{
+  "responseContext": {
+    "visitorData": "visitor-wr-002"
+  },
+  "playabilityStatus": {
+    "status": "OK",
+    "playableInEmbed": true
+  },
+  "contents": {
+    "singleColumnMusicWatchNextResultsRenderer": {
+      "tabbedRenderer": {
+        "watchNextTabbedResultsRenderer": {
+          "tabs": [
+            {
+              "tabRenderer": {
+                "title": "Up next",
+                "selected": true,
+                "content": {
+                  "musicQueueRenderer": {
+                    "content": {
+                      "playlistPanelRenderer": {
+                        "playlistId": "RDAMVMdQw4w9WgXcQ",
+                        "isInfinite": true,
+                        "contents": [
+                          {
+                            "playlistPanelVideoRenderer": {
+                              "videoId": "dQw4w9WgXcQ",
+                              "selected": true,
+                              "title": { "runs": [{ "text": "Never Gonna Give You Up" }] },
+                              "longBylineText": {
+                                "runs": [
+                                  {
+                                    "text": "Rick Astley",
+                                    "navigationEndpoint": {
+                                      "browseEndpoint": {
+                                        "browseId": "UCuAXFkgsw1L7xaCfnd5JJOw",
+                                        "browseEndpointContextSupportedConfigs": {
+                                          "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" }
+                                        }
+                                      }
+                                    }
+                                  },
+                                  { "text": " • " },
+                                  {
+                                    "text": "Whenever You Need Somebody",
+                                    "navigationEndpoint": {
+                                      "browseEndpoint": {
+                                        "browseId": "MPREb_album001",
+                                        "browseEndpointContextSupportedConfigs": {
+                                          "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" }
+                                        }
+                                      }
+                                    }
+                                  }
+                                ]
+                              },
+                              "shortBylineText": {
+                                "runs": [
+                                  {
+                                    "text": "Rick Astley",
+                                    "navigationEndpoint": {
+                                      "browseEndpoint": { "browseId": "UCuAXFkgsw1L7xaCfnd5JJOw" }
+                                    }
+                                  }
+                                ]
+                              },
+                              "lengthText": { "runs": [{ "text": "3:33" }] },
+                              "thumbnail": {
+                                "thumbnails": [
+                                  { "url": "https://lh3.googleusercontent.com/a=w60-h60", "width": 60, "height": 60 },
+                                  { "url": "https://lh3.googleusercontent.com/a=w544-h544", "width": 544, "height": 544 },
+                                  { "url": "http://insecure.example/w1200", "width": 1200, "height": 1200 }
+                                ]
+                              },
+                              "navigationEndpoint": {
+                                "watchEndpoint": { "videoId": "dQw4w9WgXcQ", "playlistId": "RDAMVMdQw4w9WgXcQ" }
+                              }
+                            }
+                          },
+                          {
+                            "playlistPanelVideoWrapperRenderer": {
+                              "primaryRenderer": {
+                                "playlistPanelVideoRenderer": {
+                                  "videoId": "oHg5SJYRHA0",
+                                  "title": { "runs": [{ "text": "Wrapped Together" }] },
+                                  "longBylineText": {
+                                    "runs": [
+                                      {
+                                        "text": "Wrapper Artist",
+                                        "navigationEndpoint": {
+                                          "browseEndpoint": { "browseId": "UCwrapper001" }
+                                        }
+                                      },
+                                      { "text": " • " },
+                                      { "text": "4:01" }
+                                    ]
+                                  },
+                                  "thumbnail": {
+                                    "thumbnails": [
+                                      { "url": "https://lh3.googleusercontent.com/b=w226-h226", "width": 226, "height": 226 }
+                                    ]
+                                  }
+                                }
+                              },
+                              "secondaryRenderer": {
+                                "playlistPanelVideoRenderer": {
+                                  "videoId": "secondaryV1",
+                                  "title": { "runs": [{ "text": "Secondary Song" }] }
+                                }
+                              }
+                            }
+                          },
+                          {
+                            "playlistPanelVideoRenderer": {
+                              "videoId": "dupVideoId1",
+                              "title": { "runs": [{ "text": "Dup Song" }] },
+                              "shortBylineText": {
+                                "runs": [
+                                  { "text": "Dup Artist", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCdup0000001" } } }
+                                ]
+                              }
+                            }
+                          },
+                          {
+                            "playlistPanelVideoRenderer": {
+                              "videoId": "dupVideoId1",
+                              "title": { "runs": [{ "text": "Dup Song Repeated" }] }
+                            }
+                          },
+                          {
+                            "playlistPanelVideoRenderer": {
+                              "title": { "runs": [{ "text": "Idless Row" }] }
+                            }
+                          },
+                          {
+                            "playlistPanelVideoRenderer": {
+                              "videoId": "noTitleId01",
+                              "title": { "runs": [] }
+                            }
+                          },
+                          {
+                            "automixPreviewVideoRenderer": {
+                              "automixPreviewVideoRenderer": { "content": {} }
+                            }
+                          }
+                        ],
+                        "continuations": [
+                          {
+                            "nextRadioContinuationData": {
+                              "continuation": "radio-cont-001",
+                              "clickTrackingParams": "CAQQnrIBGgA%3D"
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "tabRenderer": {
+                "title": "Lyrics",
+                "content": {
+                  "sectionListRenderer": {}
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

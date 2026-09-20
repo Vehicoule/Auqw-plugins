@@ -1,0 +1,21 @@
+{
+  "responseContext": {},
+  "continuationContents": {
+    "playlistPanelContinuation": {
+      "contents": [
+        {
+          "playlistPanelVideoRenderer": {
+            "videoId": "finalTrack1",
+            "title": { "runs": [{ "text": "Last Page Song" }] },
+            "shortBylineText": {
+              "runs": [
+                { "text": "Terminal Artist", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCterminal001" } } }
+              ]
+            },
+            "lengthText": { "runs": [{ "text": "2:59" }] }
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,7 +1,8 @@
 # youtube-music
 
-`playback.resolve` + `playback.candidates` provider for Auqw (ABI
-0.2.0), built on the vendored `auqw-guest-sdk` async dispatch.
+`playback.resolve` + `playback.candidates` + `radio.seed` provider for
+Auqw (ABI 0.3.0), built on the vendored `auqw-guest-sdk` async
+dispatch.
 
 ## playback.resolve
 
@@ -77,7 +78,39 @@ each row to `trackMetadata` with honest nulls where upstream is silent.
 Artwork is the largest HTTPS thumbnail only. The WEB_REMIX visitor is
 persisted under `visitor/web-remix` with the same staging semantics.
 
-## Minted URLs are verified, not trusted
+## radio.seed
+
+Track-seeded automix over the WEB_REMIX `next` endpoint (same client
+identity, headers, and `visitor/web-remix` KV as search). The payload
+is the ABI 0.3.0 dual envelope: `{source_ref}` seeds a new mix,
+`{continuation}` fetches the next page — exactly one of the two keys.
+
+A seed must be a `youtube-music`/`track` ref with a video id (foreign
+and non-track refs are `not-applicable` before any host call). The
+request POSTs `youtubei/v1/next` with `videoId` +
+`playlistId: RDAMVM<videoId>` and the automix queue fields
+(`isAudioOnly`, `enablePersistentPlaylistPanel`,
+`tunerSettingValue: AUTOMIX_SETTING_NORMAL`); a continuation request
+carries only `context` + the opaque token. The guest never loops — one
+`next` call per invocation.
+
+The seed response's `playabilityStatus` is classified by the same
+taxonomy as `player`: bot-check → `transient` (`bot-check`), sign-in /
+age → `auth-required`, unavailable → `no-result`, so an unavailable
+seed fails rather than serving a substituted queue — and a panel whose
+`playlistId` names a different queue is `no-result` for the same
+reason. Items come from the queue panel's `playlistPanelVideoRenderer`
+rows (unwrapping `playlistPanelVideoWrapperRenderer` primaries),
+mapped to the same `trackMetadata` shape as search results; upstream
+order is kept, first video id wins. `continuation` is the panel's
+`nextRadioContinuationData`/`nextContinuationData` token verbatim;
+when upstream yields none the result is `continuation: null` — the
+honest end of the mix.
+
+Error mapping mirrors `playback.candidates`: 429 → `rate-limit`, other
+non-2xx and transport host errors → `transient`,
+`cancelled`/`permission-denied`/`invalid-response` propagate, a
+non-object 2xx body or a missing queue panel → `invalid-response`.
 
 A picked URL is probed before it is returned: a `Range` request on the
 file's last 64 KiB (derived from `contentLength`; a fixed window past

@@ -1,0 +1,71 @@
+{
+  "responseContext": {},
+  "continuationContents": {
+    "playlistPanelContinuation": {
+      "contents": [
+        {
+          "playlistPanelVideoRenderer": {
+            "videoId": "abcDEF123_-",
+            "title": { "runs": [{ "text": "Page Two Song" }] },
+            "longBylineText": {
+              "runs": [
+                {
+                  "text": "Page Artist",
+                  "navigationEndpoint": {
+                    "browseEndpoint": {
+                      "browseId": "UCpageartist01",
+                      "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ARTIST" }
+                      }
+                    }
+                  }
+                },
+                { "text": " • " },
+                {
+                  "text": "Page Album",
+                  "navigationEndpoint": {
+                    "browseEndpoint": {
+                      "browseId": "MPREb_pagealbum",
+                      "browseEndpointContextSupportedConfigs": {
+                        "browseEndpointContextMusicConfig": { "pageType": "MUSIC_PAGE_TYPE_ALBUM" }
+                      }
+                    }
+                  }
+                },
+                { "text": " • " },
+                { "text": "12M plays" }
+              ]
+            },
+            "lengthText": { "runs": [{ "text": "1:20:20" }] },
+            "thumbnail": {
+              "thumbnails": [
+                { "url": "https://lh3.googleusercontent.com/c=w544-h544", "width": 544, "height": 544 }
+              ]
+            }
+          }
+        },
+        {
+          "playlistPanelVideoRenderer": {
+            "navigationEndpoint": { "watchEndpoint": { "videoId": "bareVideoId" } },
+            "title": { "simpleText": "Endpoint Id Song" },
+            "shortBylineText": { "runs": [{ "text": "Endpoint Artist" }] }
+          }
+        },
+        {
+          "playlistPanelVideoRenderer": {
+            "videoId": "abcDEF123_-",
+            "title": { "runs": [{ "text": "Dup Of Page Two" }] }
+          }
+        }
+      ],
+      "continuations": [
+        {
+          "nextContinuationData": {
+            "continuation": "radio-cont-002",
+            "clickTrackingParams": "CAAQnrIBGgA%3D"
+          }
+        }
+      ]
+    }
+  }
+}
