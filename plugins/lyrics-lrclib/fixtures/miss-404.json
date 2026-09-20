@@ -1,0 +1,5 @@
+{
+  "statusCode": 404,
+  "error": "Not Found",
+  "message": "Cannot find lyrics for the specified track"
+}

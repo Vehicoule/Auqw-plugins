@@ -1,0 +1,30 @@
+[
+  {
+    "id": 4001,
+    "name": "Roadrunner",
+    "trackName": "Roadrunner",
+    "artistName": "Modern Lovers",
+    "albumName": "Roadrunner",
+    "duration": 245,
+    "instrumental": false,
+    "plainLyrics": "Radio on\n",
+    "syncedLyrics": null
+  },
+  {
+    "id": 4002,
+    "artistName": "Portishead",
+    "duration": 300,
+    "instrumental": false
+  },
+  {
+    "id": 4003,
+    "name": "Roads",
+    "trackName": "Roads",
+    "artistName": "Portishead",
+    "albumName": "Dummy",
+    "duration": 307,
+    "instrumental": false,
+    "plainLyrics": "Oh, can't anybody see\nWe've got a war to fight\n",
+    "syncedLyrics": "[00:17.12] Oh, can't anybody see\n[00:30.50] We've got a war to fight\n"
+  }
+]

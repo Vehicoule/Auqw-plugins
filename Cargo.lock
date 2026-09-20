@@ -20,6 +20,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "auqw-lyrics-lrclib"
+version = "0.1.0"
+dependencies = [
+ "auqw-guest-sdk",
+ "base64",
+ "serde_json",
+]
+
+[[package]]
 name = "auqw-validate"
 version = "0.1.0"
 dependencies = [
