@@ -19,11 +19,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      # Remap local cargo paths so artifact digests match manifest pins on
-      # any machine — the same export lives in tooling/build.sh.
+      - run: node --test tooling/sign.test.mjs
+      # Remap local cargo and toolchain/sysroot paths so artifact digests
+      # match manifest pins on any machine — the same export lives in
+      # tooling/build.sh.
       - run: |
-          export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
-          cargo build --target wasm32-unknown-unknown --release -p auqw-youtube-music -p auqw-itunes -p auqw-deezer
+          export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot"
+          cargo build --target wasm32-unknown-unknown --release -p auqw-youtube-music -p auqw-itunes -p auqw-deezer -p auqw-lyrics-lrclib
       - name: validate artifact
         run: |
           mkdir -p plugins/youtube-music/dist
@@ -44,3 +46,9 @@ jobs:
           cargo run -q -p auqw-validate -- \
             plugins/deezer/dist/deezer.wasm \
             plugins/deezer/manifest.json
+          mkdir -p plugins/lyrics-lrclib/dist
+          cp target/wasm32-unknown-unknown/release/auqw_lyrics_lrclib.wasm \
+             plugins/lyrics-lrclib/dist/lyrics-lrclib.wasm
+          cargo run -q -p auqw-validate -- \
+            plugins/lyrics-lrclib/dist/lyrics-lrclib.wasm \
+            plugins/lyrics-lrclib/manifest.json

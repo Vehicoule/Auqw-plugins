@@ -44,6 +44,12 @@ const fail = (msg) => {
 
 const sha256 = (buf) => `sha256:${createHash('sha256').update(buf).digest('hex')}`;
 
+// Manifest id/version grammar, mirroring tooling/validate. Both become
+// path components (release dir name, wasm filename), so anything outside
+// the grammar is rejected before it can reach join().
+const ID_RE = /^[a-z0-9][a-z0-9-]*$/;
+const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+$/;
+
 const keyIdOf = (publicPem) =>
   createHash('sha256')
     .update(createPublicKey(publicPem).export({ format: 'der', type: 'spki' }))
@@ -147,6 +153,12 @@ const cmdSign = (opts) => {
   }
   const { id, version, abi } = manifest;
   if (!id || !version || !abi) fail(`${manifestPath}: manifest needs id, version, abi`);
+  if (typeof id !== 'string' || !ID_RE.test(id)) {
+    fail(`${manifestPath}: manifest.id must match ^[a-z0-9][a-z0-9-]*$`);
+  }
+  if (typeof version !== 'string' || !VERSION_RE.test(version)) {
+    fail(`${manifestPath}: manifest.version must be semver x.y.z`);
+  }
 
   const wasmPath = join(pluginDir, 'dist', `${id}.wasm`);
   if (!existsSync(wasmPath)) {
@@ -217,6 +229,9 @@ const cmdVerify = (opts) => {
   const { plugin, version, abi_version: abi, wasm_sha256, manifest_sha256, key_id } = provenance;
   if (!plugin || !version || !abi || !wasm_sha256 || !manifest_sha256 || !key_id) {
     bad('provenance.json is missing required fields');
+  }
+  if (!ID_RE.test(plugin) || !VERSION_RE.test(version)) {
+    bad('provenance.json plugin/version do not match manifest grammar');
   }
 
   const wasmBuf = need(`${plugin}-${version}.wasm`);

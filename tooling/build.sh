@@ -7,9 +7,10 @@ plugin="${1:?usage: tooling/build.sh <plugin-id>}"
 crate="auqw-${plugin}"
 wasm_name="auqw_$(printf '%s' "$plugin" | tr '-' '_').wasm"
 
-# Normalize embedded cargo paths so the artifact digest is identical on
-# every machine — the same export lives in .github/workflows/ci.yml.
-export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo ${RUSTFLAGS:-}"
+# Normalize embedded cargo and toolchain/sysroot paths so the artifact
+# digest is identical on every machine — the same export lives in
+# .github/workflows/ci.yml.
+export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot ${RUSTFLAGS:-}"
 
 cargo build --release --target wasm32-unknown-unknown -p "$crate"
 
