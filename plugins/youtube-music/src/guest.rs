@@ -394,7 +394,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 }
             }
 
-            let resp = match http_request(player_request(
+            let mut resp = match http_request(player_request(
                 rung,
                 &p.video_id,
                 rung_visitor.as_deref(),
@@ -413,22 +413,44 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     continue;
                 }
             };
+            // A 401 against a request that carried the token proves the
+            // token dead, not the rung: drop it for the rest of the
+            // ladder and re-ask this rung bare once before recording an
+            // outcome — `take` makes the re-ask single-shot, and the
+            // retried response flows through the same status handling
+            // below, so a bare 401 is then the rung's own refusal.
+            if resp.status == 401 && access_token.take().is_some() {
+                resp = match http_request(player_request(
+                    rung,
+                    &p.video_id,
+                    rung_visitor.as_deref(),
+                    if attested { pot.as_deref() } else { None },
+                    None,
+                ))
+                .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let outcome = terminal_or_transport(e)?;
+                        if let Some((reason, ms)) = backoff_for(outcome) {
+                            stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                        }
+                        outcomes.push(outcome);
+                        continue;
+                    }
+                };
+            }
             if !(200..300).contains(&resp.status) {
                 let outcome = if resp.status == 429 {
                     RungOutcome::RateLimited
                 } else {
                     RungOutcome::Transport
                 };
-                // A 401 marks the access token dead — subsequent rungs
-                // retry bare so a stale token can't wall the ladder.
-                // When the refused request carried the token, the 401
-                // blames it rather than the rung, so it stages no
-                // backoff; a bare 401 still does.
-                let token_died = resp.status == 401 && access_token.take().is_some();
-                if !token_died {
-                    if let Some((reason, ms)) = backoff_for(outcome) {
-                        stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
-                    }
+                // A 401 that carried the token was already re-asked
+                // bare above — every refusal reaching here is the
+                // rung's own and stages its backoff.
+                if let Some((reason, ms)) = backoff_for(outcome) {
+                    stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
                 outcomes.push(outcome);
                 continue;
@@ -795,24 +817,18 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
     if pin_missing && !pin_seen {
         return failed("expired-resource", "pinned-itag-unavailable".into());
     }
-    let ok_outcomes: Vec<RungOutcome> = outcomes
-        .iter()
-        .copied()
-        .filter(|o| {
-            matches!(
-                o,
-                RungOutcome::SabrOnly | RungOutcome::CipheredOnly | RungOutcome::NoAudio
-            )
-        })
-        .collect();
-    if !ok_outcomes.is_empty()
-        && ok_outcomes
+    // `unsupported` is earned only when EVERY recorded outcome is a
+    // restricted-format verdict: a bot-checked or transport-failed
+    // rung demonstrated nothing about plain audio, so a mixed ladder
+    // falls through to the weather it actually saw.
+    if !outcomes.is_empty()
+        && outcomes
             .iter()
             .all(|o| matches!(o, RungOutcome::SabrOnly | RungOutcome::CipheredOnly))
     {
         return failed(
             "unsupported",
-            if ok_outcomes[0] == RungOutcome::SabrOnly {
+            if outcomes[0] == RungOutcome::SabrOnly {
                 "sabr-only".into()
             } else {
                 "ciphered-only".into()
@@ -824,7 +840,16 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
     if !outcomes.is_empty() && outcomes.iter().all(|o| *o == RungOutcome::Capped) {
         return failed("transient", "streams-capped".into());
     }
-    match outcomes.last().copied().unwrap_or(RungOutcome::Transport) {
+    // Ranking fallback: the last outcome that is not a restricted-
+    // format verdict decides — mixed into weather, a SABR/ciphered
+    // rung proved nothing about the ladder as a whole, so the recorded
+    // weather/auth/no-result outcome carries the failure instead.
+    match outcomes
+        .iter()
+        .copied()
+        .rfind(|o| !matches!(o, RungOutcome::SabrOnly | RungOutcome::CipheredOnly))
+        .unwrap_or(RungOutcome::Transport)
+    {
         RungOutcome::Bot => failed("transient", "bot-check".into()),
         RungOutcome::SignIn | RungOutcome::Age => {
             failed("auth-required", "sign-in-required".into())
@@ -832,12 +857,11 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
         RungOutcome::Unavailable | RungOutcome::NoAudio => {
             failed("no-result", "unavailable".into())
         }
-        RungOutcome::SabrOnly => failed("unsupported", "sabr-only".into()),
-        RungOutcome::CipheredOnly => failed("unsupported", "ciphered-only".into()),
+        RungOutcome::SabrOnly
+        | RungOutcome::CipheredOnly
+        | RungOutcome::RateLimited
+        | RungOutcome::Transport => failed("transient", "transport".into()),
         RungOutcome::Capped => failed("transient", "streams-capped".into()),
-        RungOutcome::RateLimited | RungOutcome::Transport => {
-            failed("transient", "transport".into())
-        }
     }
 }
 
@@ -1797,6 +1821,41 @@ mod tests {
     }
 
     #[test]
+    fn bot_mixed_with_sabr_is_transient_not_unsupported() {
+        // `unsupported` claims every rung proved plain audio absent —
+        // a bot-checked rung demonstrated nothing, so a ladder mixing
+        // bot-checks with sabr-only answers is weather, not a
+        // restriction verdict.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, BOT);
+        for _ in 0..4 {
+            out = feed(&mut h, &out, SABR);
+        }
+        // The single bare bot-check does not end the pass, so the
+        // ladder ran to exhaustion; the denied mint ends attestation.
+        assert_eq!(h.pot_calls, 1);
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
+    }
+
+    #[test]
+    fn transport_mixed_with_sabr_is_transient_not_unsupported() {
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = h.answer(&out, 500, "{}");
+        for _ in 0..4 {
+            out = feed(&mut h, &out, SABR);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "transport".to_string())
+        );
+    }
+
+    #[test]
     fn rate_limit_wins_over_last_bucket() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
@@ -2396,14 +2455,40 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_token_drops_for_remaining_rungs() {
+    fn unauthorized_token_reasks_the_rung_bare() {
         let mut h = Harness::new();
         let out = h.invoke(json!({ "source_ref": VID, "access_token": "dead-tok" }));
         assert_eq!(
             header_of(&out, "Authorization").as_deref(),
             Some("Bearer dead-tok")
         );
-        // rung 0 answers 401: the token is dead — rung 1 retries bare.
+        // rung 0 answers the authed request 401: the token is dead —
+        // the SAME rung is re-asked bare once before any outcome is
+        // recorded, so a stale token can't waste the rung it died on.
+        let out = h.answer(&out, 401, "{}");
+        assert_eq!(rung_of(&out), 0);
+        assert_eq!(header_of(&out, "Authorization"), None);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        // The 401 blamed the token, not the rung — no backoff was
+        // staged against `backoff/<vid>/VISIONOS`.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+    }
+
+    #[test]
+    fn unauthorized_bare_reask_refusal_is_the_rungs() {
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "source_ref": VID, "access_token": "dead-tok" }));
+        // The authed request gets a 401 → bare re-ask of rung 0.
+        let out = h.answer(&out, 401, "{}");
+        assert_eq!(rung_of(&out), 0);
+        assert_eq!(header_of(&out, "Authorization"), None);
+        // The bare re-ask 401s too — that is the rung's own refusal:
+        // it stages the transport backoff and the ladder advances,
+        // still bare for every remaining rung.
         let out = h.answer(&out, 401, "{}");
         assert_eq!(rung_of(&out), 1);
         assert_eq!(header_of(&out, "Authorization"), None);
@@ -2412,9 +2497,14 @@ mod tests {
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "IOS");
-        // The 401 blamed the token, not the rung — no backoff was
-        // staged against `backoff/<vid>/VISIONOS`.
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        let stored: Value = serde_json::from_slice(
+            h.committed
+                .get(&format!("backoff/{VID}/VISIONOS"))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_eq!(stored["reason"], "transport");
     }
 
     #[test]

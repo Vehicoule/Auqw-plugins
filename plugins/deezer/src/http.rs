@@ -29,7 +29,8 @@ fn failed(kind: &str, message: String) -> GuestError {
 ///
 /// # Errors
 /// `rate-limit` on 403/429 or a quota error envelope (a parsed
-/// `Retry-After` goes to the redacted diagnostic log only),
+/// `Retry-After` goes to the redacted diagnostic log and rides the
+/// fail message — the only channel back to the app),
 /// `transient` on every other non-2xx and on unrecognized error
 /// envelopes, `invalid-response` on a non-JSON 2xx body; host and
 /// transport failures propagate with their `host_error` kind.
@@ -111,9 +112,12 @@ async fn rate_limited() -> Result<GuestError, GuestError> {
     Ok(failed("rate-limit", "deezer api quota exceeded".into()))
 }
 
-/// Rate-limit the same way, but mine `Retry-After` for the log first.
+/// Rate-limit the same way, but mine `Retry-After` for the log and
+/// the fail message first — the message is the only channel back to
+/// the app, so a parsed hint rides it.
 async fn rate_limited_with_hint(resp: &HttpResponse) -> Result<GuestError, GuestError> {
-    match retry_after_secs(resp) {
+    let hint = retry_after_secs(resp);
+    match hint {
         Some(r) => {
             log(
                 LogLevel::Warn,
@@ -125,7 +129,10 @@ async fn rate_limited_with_hint(resp: &HttpResponse) -> Result<GuestError, Guest
     }
     Ok(failed(
         "rate-limit",
-        format!("deezer status {}", resp.status),
+        match hint {
+            Some(r) => format!("deezer status {} retry_after={r}", resp.status),
+            None => format!("deezer status {}", resp.status),
+        },
     ))
 }
 

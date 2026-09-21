@@ -27,8 +27,9 @@ use parse::Record;
 const API: &str = "https://lrclib.net";
 
 /// `/api/get` rejects `duration` outside 1..=3600 seconds — a longer
-/// track sends no duration hint rather than tripping a 400 that
-/// would abort the waterfall on tier 1.
+/// track or a sub-second one whose duration rounds to 0 sends no
+/// duration hint rather than tripping a 400 that would abort the
+/// waterfall on tier 1.
 const DURATION_MAX_SECS: u64 = 3600;
 
 fn dispatch(inv: Invocation) -> GuestFuture {
@@ -173,7 +174,7 @@ fn tiers(q: &Query) -> Vec<Tier> {
         .duration_ms
         .filter(|d| *d > 0)
         .map(|d| d.saturating_add(500) / 1000)
-        .filter(|d| *d <= DURATION_MAX_SECS);
+        .filter(|d| (1..=DURATION_MAX_SECS).contains(d));
     if let Some(artist) = &q.artist {
         let mut exact = format!(
             "{API}/api/get?track_name={}&artist_name={}",
@@ -652,6 +653,24 @@ mod tests {
         q["duration_ms"] = json!(3_600_000);
         let url = url_of(&invoke_request("lyrics.plain", &q));
         assert!(url.contains("duration=3600"), "{url}");
+    }
+
+    /// A sub-second track rounds to `duration=0`, which LRCLIB
+    /// rejects the same as an over-max value — the hint is omitted
+    /// rather than aborting the waterfall on a 400.
+    #[test]
+    fn subsecond_duration_is_omitted() {
+        let mut q = query();
+        for ms in [1_u64, 499] {
+            q["duration_ms"] = json!(ms);
+            let url = url_of(&invoke_request("lyrics.plain", &q));
+            assert!(url.contains("/api/get?"), "{url}");
+            assert!(!url.contains("duration="), "{ms}: {url}");
+        }
+        // 500 ms rounds up to 1 — still sent.
+        q["duration_ms"] = json!(500);
+        let url = url_of(&invoke_request("lyrics.plain", &q));
+        assert!(url.contains("duration=1"), "{url}");
     }
 
     /// An instrumental record that does not name the queried track is

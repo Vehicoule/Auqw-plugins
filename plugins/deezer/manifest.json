@@ -1,7 +1,7 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:170285a68cbefa271e3fc46782dbefd9edb2a1f7d60e342d7fcc66612faf740a",
+    "digest": "sha256:0c76171d2c2c2cb72f0c8d7600ee04b73787c0c2bfb3b5c5d97908731f964fa9",
     "path": "dist/deezer.wasm"
   },
   "capabilities": [
@@ -13,5 +13,5 @@
   "permissions": [
     "network:api.deezer.com"
   ],
-  "version": "0.1.1"
+  "version": "0.1.2"
 }
