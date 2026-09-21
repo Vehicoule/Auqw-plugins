@@ -138,7 +138,7 @@ pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Opt
     };
     // An empty fold is never evidence *between folded strings*: a
     // non-Latin query title norms to "" and would collide with any
-    // equally-empty record title. Literal (trimmed, case-folded)
+    // equally-empty record title. Literal (trimmed, case-insensitive)
     // equality still counts — a record titled identically to the
     // query names it even when neither side survives `norm`.
     let title_is = |r: &&'a Record, want: &str, want_raw: &str| {
@@ -165,10 +165,13 @@ pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Opt
         .or_else(|| records.first())
 }
 
-/// Literal title equality — trimmed, Unicode-case-folded. The only
-/// evidence available when `norm` folds a title to nothing.
+/// Literal title equality — trimmed, then compared on the uppercase
+/// fold. Uppercasing, not lowercasing: the lowercase fold preserves
+/// the word-final σ/ς distinction, while uppercase maps both to Σ
+/// (and ß→SS, ligatures→pairs) — the closest the std library gets to
+/// caseless matching without a Unicode-casefold dependency.
 fn raw_title_eq(a: &str, b: &str) -> bool {
-    a.trim().to_lowercase() == b.trim().to_lowercase()
+    a.trim().to_uppercase() == b.trim().to_uppercase()
 }
 
 /// Whether a picked record plausibly *is* the queried track: its
@@ -531,6 +534,16 @@ mod tests {
         // Whitespace/case padding still counts as the same title.
         let padded = rec(" 夜の歌 ", None, true);
         assert!(names_query(&padded, "夜の歌", None));
+        // Case-fold exceptions: uppercase/lowercase sigma variants of
+        // the same word are the same title (both fold to Σ via the
+        // uppercase fold).
+        let sigma_upper = rec("ΟΣ", None, true);
+        assert!(names_query(&sigma_upper, "ος", None));
+        let sigma_final = rec("ος", None, true);
+        assert!(names_query(&sigma_final, "ΟΣ", None));
+        let sigma_records = [rec("Other", None, false), rec("ΟΣ", None, false)];
+        let picked = pick(&sigma_records, "ος", None);
+        assert_eq!(picked.map(|r| r.title.as_str()), Some("ΟΣ"));
     }
 
     /// `names_query` needs a title hit on the raw or cleaned query
