@@ -145,7 +145,11 @@ pub fn format_outcome(body: &Value) -> FormatOutcome {
         if format.get("url").and_then(Value::as_str).is_some() {
             plain += 1;
         }
-        if format.get("signatureCipher").is_some() || format.get("cipher").is_some() {
+        // Only a real cipher string counts — an explicit `null` (or any
+        // other non-string value) under the key is not a ciphered format.
+        if format.get("signatureCipher").is_some_and(Value::is_string)
+            || format.get("cipher").is_some_and(Value::is_string)
+        {
             ciphered += 1;
         }
     }
@@ -239,10 +243,13 @@ pub fn pick_audio(body: &Value, options: PickOptions<'_>) -> Option<Picked> {
         .split(';')
         .next()
         .unwrap_or("");
+    // `bitrate_kbps` is capped at u32::MAX by the capabilities schema
+    // — a pathological upstream bitrate saturates rather than
+    // invalidating an otherwise-good resolve.
     let bitrate_kbps = format
         .get("bitrate")
         .and_then(Value::as_u64)
-        .map(|b| b / 1000);
+        .map(|b| (b / 1000).min(u64::from(u32::MAX)));
     Some(Picked {
         url: url.to_string(),
         mime: mime.to_string(),
@@ -413,6 +420,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn null_cipher_keys_are_not_ciphered() {
+        // Key presence alone is not a cipher: an explicit `null` under
+        // `signatureCipher`/`cipher` leaves the format unciphered —
+        // with no url and audio present, that's SABR, not ciphered.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "signatureCipher": null, "cipher": null}
+            ]}
+        });
+        assert_eq!(format_outcome(&body), FormatOutcome::SabrOnly);
+        // Non-string cipher values don't count either.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "signatureCipher": {"s": "x"}}
+            ]}
+        });
+        assert_eq!(format_outcome(&body), FormatOutcome::SabrOnly);
+        // A real cipher string does.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "signatureCipher": "s=abc&sp=sig"}
+            ]}
+        });
+        assert_eq!(format_outcome(&body), FormatOutcome::CipheredOnly);
+    }
+
     fn default_opts<'a>() -> PickOptions<'a> {
         PickOptions {
             target_bitrate_kbps: 128,
@@ -561,6 +595,22 @@ mod tests {
             panic!("expected a pick");
         };
         assert_eq!(p.itag, None);
+    }
+
+    #[test]
+    fn bitrate_saturates_at_schema_cap() {
+        // `bitrate_kbps` is u32-capped in the capabilities schema: a
+        // pathological upstream `bitrate` saturates the emitted value
+        // instead of dropping the format or invalidating the resolve.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"mimeType": "audio/mp4", "bitrate": u64::MAX, "url": "https://x/v"}
+            ]}
+        });
+        let Some(p) = pick_audio(&body, default_opts()) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.bitrate_kbps, Some(u64::from(u32::MAX)));
     }
 
     #[test]

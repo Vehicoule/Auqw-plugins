@@ -1,7 +1,7 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:e92cb141e6a3f0d37088679e3793fbeb59ee0046d9bf421b46cc86fa5ba85864",
+    "digest": "sha256:2c346b677f5ecefcabe3f15ba8f7796758554518e82754ab5a1fe4a6382216ce",
     "path": "dist/youtube-music.wasm"
   },
   "capabilities": [
@@ -16,5 +16,5 @@
     "pot-provider",
     "kv"
   ],
-  "version": "0.3.2"
+  "version": "0.3.3"
 }

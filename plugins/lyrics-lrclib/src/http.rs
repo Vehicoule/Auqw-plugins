@@ -22,10 +22,10 @@ fn failed(kind: &str, message: String) -> GuestError {
 ///
 /// # Errors
 /// `rate-limit` on 403/429 — a parsed `Retry-After` goes to the
-/// redacted diagnostic log only, and the failure is terminal: the
-/// guest fails closed, never retries. `transient` on every other
-/// non-2xx; host and transport failures propagate with their
-/// `host_error` kind.
+/// redacted diagnostic log and rides the fail message (the only
+/// channel back to the app), and the failure is terminal: the guest
+/// fails closed, never retries. `transient` on every other non-2xx;
+/// host and transport failures propagate with their `host_error` kind.
 pub async fn get_json(url: &str) -> Result<Outcome, GuestError> {
     let resp = http_request(HttpRequest {
         method: "GET".into(),
@@ -41,7 +41,8 @@ pub async fn get_json(url: &str) -> Result<Outcome, GuestError> {
         200..=299 => Ok(Outcome::Body(resp.body)),
         404 => Ok(Outcome::NotFound),
         403 | 429 => {
-            match retry_after_secs(&resp) {
+            let hint = retry_after_secs(&resp);
+            match hint {
                 Some(r) => {
                     log(
                         LogLevel::Warn,
@@ -53,7 +54,10 @@ pub async fn get_json(url: &str) -> Result<Outcome, GuestError> {
             }
             Err(failed(
                 "rate-limit",
-                format!("lrclib status {}", resp.status),
+                match hint {
+                    Some(r) => format!("lrclib status {} retry_after={r}", resp.status),
+                    None => format!("lrclib status {}", resp.status),
+                },
             ))
         }
         s => Err(failed("transient", format!("lrclib status {s}"))),

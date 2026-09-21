@@ -25,6 +25,13 @@ const SEARCH_LIMIT_MAX: u64 = 25;
 /// Page sizes for the artist composite's two sections.
 const ARTIST_TOP_LIMIT: u64 = 50;
 const ARTIST_ALBUMS_LIMIT: u64 = 50;
+/// `catalog.metadata` fetches one page per ref and the host admits
+/// 32 HTTP calls per invocation — cap the batch at 30 so it fits the
+/// call budget with headroom instead of dying `budget-exceeded` with
+/// nothing fetched. A larger batch is rejected outright: returning a
+/// fetched prefix would report truncated data as if the tail were
+/// genuinely absent upstream.
+const METADATA_FETCH_MAX: usize = 30;
 
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
@@ -168,15 +175,22 @@ async fn metadata(payload: &Value) -> Result<Value, GuestError> {
     let refs = obj["refs"]
         .as_array()
         .ok_or_else(|| bad_payload("refs must be an array"))?;
-    if refs.len() > 200 {
-        return Err(bad_payload("refs is limited to 200 entries"));
+    if refs.len() > METADATA_FETCH_MAX {
+        return Err(bad_payload(&format!(
+            "refs is limited to {METADATA_FETCH_MAX} entries per invocation"
+        )));
     }
-    let mut items = Vec::with_capacity(refs.len());
+    // Validate every ref before any request — one malformed ref
+    // rejects the whole batch.
+    let validated = refs
+        .iter()
+        .map(|r| deezer_ref(r, &["track", "album", "artist"]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut items = Vec::with_capacity(validated.len());
     // Deezer has no batch lookup — one request per ref, in input
     // order. A ref whose resource is absent upstream is omitted, the
     // same way itunes drops genuinely-missing ids.
-    for r in refs {
-        let (kind, id) = deezer_ref(r, &["track", "album", "artist"])?;
+    for (kind, id) in validated {
         let url = format!("{API}/{kind}/{id}");
         match http::get_json(&url).await? {
             http::Outcome::NotFound => continue,
@@ -553,13 +567,18 @@ mod tests {
     fn rate_limit_status_logs_then_fails() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
         let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
-        // The retry hint goes to the diagnostic log, not the result.
+        // The retry hint rides both the diagnostic log and the fail
+        // message — the message is the only channel back to the app.
         assert_eq!(out["kind"], "log", "{out}");
         let msg = out["payload"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains("retry_after=30"), "{msg}");
         let out = ack_log(&out);
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "rate-limit");
+        assert_eq!(
+            out["error"]["message"].as_str(),
+            Some("rate-limit: deezer status 429 retry_after=30")
+        );
     }
 
     #[test]
@@ -751,11 +770,28 @@ mod tests {
         );
     }
 
+    /// The host admits 32 HTTP calls per invocation, so a batch
+    /// bigger than `METADATA_FETCH_MAX` cannot complete — it is
+    /// rejected before any request rather than returning a silently
+    /// truncated prefix.
     #[test]
-    fn metadata_over_200_refs_rejected_before_http() {
-        let refs: Vec<Value> = (1..=201_u64)
+    fn metadata_over_fetch_max_rejected_before_http() {
+        let refs: Vec<Value> = (1..=35_u64)
             .map(|i| json!({"provider": "deezer", "kind": "track", "id": i.to_string()}))
             .collect();
+        let out = invoke("catalog.metadata", json!({"refs": refs}));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "invalid-response");
+    }
+
+    /// A malformed ref rejects the batch — validation runs before any
+    /// request is issued.
+    #[test]
+    fn metadata_malformed_ref_fails() {
+        let refs: Vec<Value> = vec![
+            json!({"provider": "deezer", "kind": "track", "id": "1"}),
+            json!({"provider": "deezer", "kind": "track", "id": "abc"}),
+        ];
         let out = invoke("catalog.metadata", json!({"refs": refs}));
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "invalid-response");
@@ -1077,9 +1113,9 @@ mod tests {
         assert_eq!(out["type"], "done");
     }
 
-    /// Only a delta-seconds `Retry-After` reaches the diagnostic log;
-    /// oversized, malformed, and control-containing values are dropped
-    /// while the invocation still fails `rate-limit`.
+    /// Only a delta-seconds `Retry-After` reaches the diagnostic log and
+    /// the fail message; oversized, malformed, and control-containing
+    /// values are dropped while the invocation still fails `rate-limit`.
     #[test]
     fn rate_limit_retry_after_is_sanitized() {
         for (value, want) in [
@@ -1096,6 +1132,16 @@ mod tests {
             assert_eq!(out["payload"]["message"].as_str(), Some(want), "{value}");
             let out = ack_log(&out);
             assert_eq!(out["error"]["kind"], "rate-limit", "{value}");
+            let want_fail = if want.contains("retry_after") {
+                format!("rate-limit: deezer status 429 retry_after={value}")
+            } else {
+                "rate-limit: deezer status 429".to_string()
+            };
+            assert_eq!(
+                out["error"]["message"].as_str(),
+                Some(want_fail.as_str()),
+                "{value}"
+            );
         }
     }
 

@@ -169,9 +169,11 @@ and the googlevideo behaviour both change with the client pin:
 
 The versions are pinned deliberately. Do not bump them to track
 upstream — newer clients are served strictly worse responses. If every
-playable rung serves SABR-only, the guest fails `unsupported` with
-message `sabr-only`; cipher-only formats fail `ciphered-only`; the
-distinction is preserved for the host.
+recorded rung outcome is a restricted-format verdict, the guest fails
+`unsupported` — `sabr-only` or `ciphered-only`, the first such rung
+deciding which; a bot-checked or transport-failed rung demonstrated
+nothing about plain audio and blocks the claim. The distinction is
+preserved for the host.
 
 ## Failure mapping
 
@@ -183,7 +185,9 @@ enforces the destination allowlist on every request — before the
 verdict lands. A
 second bot-check inside one invocation ends the bare pass — the
 rungs then get one attested replay each when a POT provider minted,
-and `transient` (`bot-check`) only when the wall holds anyway.
+and `transient` (`bot-check`) only when the wall holds anyway. A
+replay's verdict overwrites the rung's `Bot` record — a rung attested
+to SABR-only counts toward `unsupported`, not `bot-check`.
 `cancelled`
 propagates immediately; `permission-denied`/`invalid-response` host
 errors are terminal; a `rate-limit` host error stages the rate-limit
@@ -191,11 +195,12 @@ backoff and reports as `rate-limit`; other host errors are transport
 weather. When the
 ladder is exhausted: any 429 or stored rate-limit → `rate-limit`; a
 requested pin no rung served → `expired-resource`
-(`pinned-itag-unavailable`); every playable rung SABR/ciphered →
-`unsupported` (`sabr-only` or `ciphered-only`, first playable rung
+(`pinned-itag-unavailable`); every recorded outcome SABR/ciphered →
+`unsupported` (`sabr-only` or `ciphered-only`, first such rung
 decides); every rung capped → `transient` (`streams-capped`); otherwise
-the last rung's bucket decides — bot-check → `transient` (`bot-check`),
-sign-in/age → `auth-required`, unavailable → `no-result`.
+the last rung's bucket outside the restricted-format set decides —
+bot-check → `transient` (`bot-check`), sign-in/age → `auth-required`,
+unavailable → `no-result`.
 
 For `playback.candidates`: 429 → `rate-limit`, other non-2xx and
 transport host errors → `transient`, `cancelled`/`permission-denied`/
