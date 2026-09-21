@@ -566,13 +566,18 @@ mod tests {
     fn rate_limit_status_logs_then_fails() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
         let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
-        // The retry hint goes to the diagnostic log, not the result.
+        // The retry hint rides both the diagnostic log and the fail
+        // message — the message is the only channel back to the app.
         assert_eq!(out["kind"], "log", "{out}");
         let msg = out["payload"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains("retry_after=30"), "{msg}");
         let out = ack_log(&out);
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "rate-limit");
+        assert_eq!(
+            out["error"]["message"].as_str(),
+            Some("rate-limit: deezer status 429 retry_after=30")
+        );
     }
 
     #[test]
@@ -1128,9 +1133,9 @@ mod tests {
         assert_eq!(out["type"], "done");
     }
 
-    /// Only a delta-seconds `Retry-After` reaches the diagnostic log;
-    /// oversized, malformed, and control-containing values are dropped
-    /// while the invocation still fails `rate-limit`.
+    /// Only a delta-seconds `Retry-After` reaches the diagnostic log and
+    /// the fail message; oversized, malformed, and control-containing
+    /// values are dropped while the invocation still fails `rate-limit`.
     #[test]
     fn rate_limit_retry_after_is_sanitized() {
         for (value, want) in [
@@ -1147,6 +1152,16 @@ mod tests {
             assert_eq!(out["payload"]["message"].as_str(), Some(want), "{value}");
             let out = ack_log(&out);
             assert_eq!(out["error"]["kind"], "rate-limit", "{value}");
+            let want_fail = if want.contains("retry_after") {
+                format!("rate-limit: deezer status 429 retry_after={value}")
+            } else {
+                "rate-limit: deezer status 429".to_string()
+            };
+            assert_eq!(
+                out["error"]["message"].as_str(),
+                Some(want_fail.as_str()),
+                "{value}"
+            );
         }
     }
 

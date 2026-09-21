@@ -169,9 +169,11 @@ and the googlevideo behaviour both change with the client pin:
 
 The versions are pinned deliberately. Do not bump them to track
 upstream — newer clients are served strictly worse responses. If every
-playable rung serves SABR-only, the guest fails `unsupported` with
-message `sabr-only`; cipher-only formats fail `ciphered-only`; the
-distinction is preserved for the host.
+recorded rung outcome is a restricted-format verdict, the guest fails
+`unsupported` — `sabr-only` or `ciphered-only`, the first such rung
+deciding which; a bot-checked or transport-failed rung demonstrated
+nothing about plain audio and blocks the claim. The distinction is
+preserved for the host.
 
 ## Failure mapping
 
@@ -191,11 +193,12 @@ backoff and reports as `rate-limit`; other host errors are transport
 weather. When the
 ladder is exhausted: any 429 or stored rate-limit → `rate-limit`; a
 requested pin no rung served → `expired-resource`
-(`pinned-itag-unavailable`); every playable rung SABR/ciphered →
-`unsupported` (`sabr-only` or `ciphered-only`, first playable rung
+(`pinned-itag-unavailable`); every recorded outcome SABR/ciphered →
+`unsupported` (`sabr-only` or `ciphered-only`, first such rung
 decides); every rung capped → `transient` (`streams-capped`); otherwise
-the last rung's bucket decides — bot-check → `transient` (`bot-check`),
-sign-in/age → `auth-required`, unavailable → `no-result`.
+the last rung's bucket outside the restricted-format set decides —
+bot-check → `transient` (`bot-check`), sign-in/age → `auth-required`,
+unavailable → `no-result`.
 
 For `playback.candidates`: 429 → `rate-limit`, other non-2xx and
 transport host errors → `transient`, `cancelled`/`permission-denied`/

@@ -756,7 +756,8 @@ mod tests {
             "headers": [["Retry-After", "30"]], "body": "",
         }));
         // One sanitized diagnostic, then the terminal fail — never a
-        // retry loop.
+        // retry loop. The hint also rides the fail message, the only
+        // channel back to the app.
         assert_eq!(out["type"], "host_request", "{out}");
         assert_eq!(out["kind"], "log", "{out}");
         let msg = out["payload"]["message"].as_str().unwrap_or_default();
@@ -764,6 +765,10 @@ mod tests {
         let out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "rate-limit");
+        assert_eq!(
+            out["error"]["message"].as_str(),
+            Some("rate-limit: lrclib status 429 retry_after=30")
+        );
     }
 
     #[test]
