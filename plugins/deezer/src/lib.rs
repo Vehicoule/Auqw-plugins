@@ -25,6 +25,13 @@ const SEARCH_LIMIT_MAX: u64 = 25;
 /// Page sizes for the artist composite's two sections.
 const ARTIST_TOP_LIMIT: u64 = 50;
 const ARTIST_ALBUMS_LIMIT: u64 = 50;
+/// `catalog.metadata` fetches one page per ref and the host admits
+/// 32 HTTP calls per invocation — cap the batch at 30 so it fits the
+/// call budget with headroom instead of dying `budget-exceeded` with
+/// nothing fetched. A larger batch is rejected outright: returning a
+/// fetched prefix would report truncated data as if the tail were
+/// genuinely absent upstream.
+const METADATA_FETCH_MAX: usize = 30;
 
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
@@ -168,8 +175,10 @@ async fn metadata(payload: &Value) -> Result<Value, GuestError> {
     let refs = obj["refs"]
         .as_array()
         .ok_or_else(|| bad_payload("refs must be an array"))?;
-    if refs.len() > 200 {
-        return Err(bad_payload("refs is limited to 200 entries"));
+    if refs.len() > METADATA_FETCH_MAX {
+        return Err(bad_payload(&format!(
+            "refs is limited to {METADATA_FETCH_MAX} entries per invocation"
+        )));
     }
     // Validate every ref before any request — one malformed ref
     // rejects the whole batch.
@@ -761,11 +770,13 @@ mod tests {
         );
     }
 
-    /// The shared capability contract permits up to 200 refs; only
-    /// larger batches are rejected before any request.
+    /// The host admits 32 HTTP calls per invocation, so a batch
+    /// bigger than `METADATA_FETCH_MAX` cannot complete — it is
+    /// rejected before any request rather than returning a silently
+    /// truncated prefix.
     #[test]
-    fn metadata_over_200_refs_rejected_before_http() {
-        let refs: Vec<Value> = (1..=201_u64)
+    fn metadata_over_fetch_max_rejected_before_http() {
+        let refs: Vec<Value> = (1..=35_u64)
             .map(|i| json!({"provider": "deezer", "kind": "track", "id": i.to_string()}))
             .collect();
         let out = invoke("catalog.metadata", json!({"refs": refs}));
