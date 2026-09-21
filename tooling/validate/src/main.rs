@@ -352,16 +352,38 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             }
             continue;
         }
-        let body = p
+        let rest = p
             .strip_prefix("network:")
-            .map(|rest| rest.strip_prefix("*.").unwrap_or(rest))
-            .filter(|body| !body.is_empty())
             .ok_or_else(|| format!("manifest.permissions entry {p:?} is malformed"))?;
+        let wildcarded = rest.starts_with("*.");
+        let body = if wildcarded { &rest[2..] } else { rest };
+        if body.is_empty() {
+            return Err(format!("manifest.permissions entry {p:?} is malformed"));
+        }
         if !body
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
         {
             return Err(format!("manifest.permissions entry {p:?} is malformed"));
+        }
+        // Mirrors plugin-host `validate`: a dotted DNS name or a
+        // loopback literal — non-loopback IPs, bare labels, empty
+        // labels, and wildcarded loopback forms (`*.localhost`,
+        // `*.127.0.0.1`) are not grantable destinations.
+        let is_loopback = !wildcarded
+            && (body == "localhost"
+                || body
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback()));
+        if !is_loopback
+            && (body.parse::<std::net::IpAddr>().is_ok()
+                || !body.contains('.')
+                || body.split('.').any(str::is_empty)
+                || body.ends_with(".localhost"))
+        {
+            return Err(format!(
+                "manifest.permissions entry {p:?} is not a public DNS name"
+            ));
         }
     }
     // artifact: exactly {path: non-empty string, digest: sha256:<64 hex>}
@@ -559,6 +581,18 @@ mod tests {
             check_manifest(&manifest("0.3.0", "[\"lyrics.plain\"]", "[\"kv\"]")),
             Ok(())
         );
+        // Loopback literals grant only as bare literals — a wildcarded
+        // form would cover every `*.localhost`/`*.127.x` destination.
+        for (perm, ok) in [
+            ("network:localhost", true),
+            ("network:127.0.0.1", true),
+            ("network:*.localhost", false),
+            ("network:*.127.0.0.1", false),
+        ] {
+            let perms = format!("[\"{perm}\"]");
+            let result = check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", &perms));
+            assert_eq!(result.is_ok(), ok, "{perm}: {result:?}");
+        }
     }
 
     #[test]
