@@ -136,21 +136,39 @@ pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Opt
         (Some(want), Some(got)) => !want.is_empty() && *want == norm(got),
         (Some(_), None) => false,
     };
-    // An empty fold is never evidence: a non-Latin query title norms
-    // to "" and would collide with any equally-empty record title.
-    let title_is = |r: &&'a Record, want: &str| !want.is_empty() && norm(&r.title) == want;
+    // An empty fold is never evidence *between folded strings*: a
+    // non-Latin query title norms to "" and would collide with any
+    // equally-empty record title. Literal (trimmed, case-folded)
+    // equality still counts — a record titled identically to the
+    // query names it even when neither side survives `norm`.
+    let title_is = |r: &&'a Record, want: &str, want_raw: &str| {
+        if want.is_empty() {
+            raw_title_eq(&r.title, want_raw)
+        } else {
+            norm(&r.title) == *want
+        }
+    };
     records
         .iter()
-        .find(|r| title_is(r, &want_title) && artist_ok(r))
-        .or_else(|| records.iter().find(|r| title_is(r, &want_title)))
+        .find(|r| title_is(r, &want_title, title) && artist_ok(r))
+        .or_else(|| records.iter().find(|r| title_is(r, &want_title, title)))
         .or_else(|| {
             if want_cleaned != want_title {
-                records.iter().find(|r| title_is(r, &want_cleaned))
+                let cleaned = clean_title(title);
+                records
+                    .iter()
+                    .find(|r| title_is(r, &want_cleaned, &cleaned))
             } else {
                 None
             }
         })
         .or_else(|| records.first())
+}
+
+/// Literal title equality — trimmed, Unicode-case-folded. The only
+/// evidence available when `norm` folds a title to nothing.
+fn raw_title_eq(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 /// Whether a picked record plausibly *is* the queried track: its
@@ -160,10 +178,14 @@ pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Opt
 /// anything less is a tier miss, not a verdict on the track.
 pub fn names_query(r: &Record, title: &str, artist: Option<&str>) -> bool {
     let got = norm(&r.title);
-    if got.is_empty() {
-        return false;
-    }
-    if got != norm(title) && got != norm(&clean_title(title)) {
+    let title_hit = if got.is_empty() {
+        // Both sides folded away (non-Latin): only a literal title
+        // match, raw or against the cleaned query, names the query.
+        raw_title_eq(&r.title, title) || raw_title_eq(&r.title, &clean_title(title))
+    } else {
+        got == norm(title) || got == norm(&clean_title(title))
+    };
+    if !title_hit {
         return false;
     }
     match (artist.map(norm), r.artist.as_deref().map(norm)) {
@@ -492,6 +514,23 @@ mod tests {
         // The instrumental gate rejects the same collision.
         let cjk_inst = rec("別の歌", Some("別の人"), true);
         assert!(!names_query(&cjk_inst, "夜の歌", None));
+    }
+
+    /// When the query itself folds empty, a record whose raw title is
+    /// literally the query still names it — an identical non-Latin
+    /// title is exact evidence, not the empty-fold collision.
+    #[test]
+    fn identical_non_latin_title_still_matches() {
+        let latin = rec("Unrelated Latin", Some("Band"), false);
+        let cjk = rec("夜の歌", Some("ある人"), false);
+        let records = [latin, cjk];
+        let got = pick(&records, "夜の歌", None).map(|r| r.title.as_str());
+        assert_eq!(got, Some("夜の歌"));
+        let cjk_inst = rec("夜の歌", Some("ある人"), true);
+        assert!(names_query(&cjk_inst, "夜の歌", None));
+        // Whitespace/case padding still counts as the same title.
+        let padded = rec(" 夜の歌 ", None, true);
+        assert!(names_query(&padded, "夜の歌", None));
     }
 
     /// `names_query` needs a title hit on the raw or cleaned query

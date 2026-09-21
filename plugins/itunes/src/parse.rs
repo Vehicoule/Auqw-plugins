@@ -135,6 +135,11 @@ pub fn artwork_ref(track: &Track, size: u64) -> Option<Value> {
         ),
         None => (url.clone(), Value::Null),
     };
+    // The cap applies to the emitted URL: substituting a larger size
+    // grows the input past the limit `track_of` accepted.
+    if url.chars().count() > URL_MAX_CHARS {
+        return None;
+    }
     Some(serde_json::json!({
         "url": url,
         "width": dim,
@@ -218,6 +223,23 @@ mod tests {
             explicit,
             genre: None,
         }
+    }
+
+    #[test]
+    fn artwork_cap_applies_after_size_substitution() {
+        // An input URL just inside the cap that substitution pushes
+        // over must emit no artwork ref at all.
+        let base = "https://is1-ssl.mzstatic.com/image/thumb/";
+        let tail = format!(
+            "{}/100x100bb.jpg",
+            "a".repeat(URL_MAX_CHARS - base.len() - 14)
+        );
+        let url = format!("{base}{tail}");
+        assert_eq!(url.chars().count(), URL_MAX_CHARS);
+        let mut t = track("1", "Song", Some(60_000), None);
+        t.artwork100 = Some(url);
+        assert!(artwork_ref(&t, 100).is_some());
+        assert!(artwork_ref(&t, 1200).is_none());
     }
 
     #[test]
