@@ -13,6 +13,23 @@ use serde_json::{Map, Value};
 /// Edge length of the `cover_xl`/`picture_xl` artwork Deezer serves.
 pub const ARTWORK_XL: u64 = 1000;
 
+/// Contract cap on emitted text fields (`title`/`artist`/`album`/
+/// `genre`/`subtitle`) — an overlong upstream string truncates
+/// instead of failing a whole page downstream.
+const TEXT_MAX_CHARS: usize = 512;
+
+/// `trackMetadata.isrc` caps at 16 characters — a longer upstream
+/// string is not an ISRC and is dropped, not truncated.
+const ISRC_MAX_CHARS: usize = 16;
+
+/// `artworkRef.url` caps at 2048 characters — an overlong upstream
+/// URL is dropped, not truncated to a broken link.
+const URL_MAX_CHARS: usize = 2048;
+
+/// Largest value a contract integer field may carry downstream —
+/// `Number.MAX_SAFE_INTEGER`.
+const MAX_SAFE_MS: u64 = 9_007_199_254_740_991;
+
 fn bad(m: &str) -> GuestError {
     GuestError::Failed {
         kind: "invalid-response".into(),
@@ -99,7 +116,7 @@ pub fn track_row(v: &Value, genre: Option<&str>, release_year: Option<u64>) -> O
         title: str_field(o, "title").or_else(|| str_field(o, "title_short"))?,
         artist: artist.and_then(|a| str_field(a, "name")),
         album: album.and_then(|a| str_field(a, "title")),
-        duration_ms: u64_field(o, "duration").map(|s| s.saturating_mul(1000)),
+        duration_ms: duration_ms_of(o),
         release_year: str_field(o, "release_date")
             .and_then(|d| year_of(&d))
             .or_else(|| {
@@ -113,7 +130,7 @@ pub fn track_row(v: &Value, genre: Option<&str>, release_year: Option<u64>) -> O
         genre: genre.map(str::to_string),
         artist_id: artist.and_then(|a| id_field(a, "id")),
         album_id: album.and_then(|a| id_field(a, "id")),
-        isrc: str_field(o, "isrc"),
+        isrc: str_field(o, "isrc").filter(|s| s.chars().count() <= ISRC_MAX_CHARS),
     })
 }
 
@@ -140,7 +157,7 @@ pub fn album_row(v: &Value, ctx_artist: Option<(&str, &str)>) -> Option<Row> {
         title: str_field(o, "title")?,
         artist,
         album: None,
-        duration_ms: u64_field(o, "duration").map(|s| s.saturating_mul(1000)),
+        duration_ms: duration_ms_of(o),
         release_year: str_field(o, "release_date").and_then(|d| year_of(&d)),
         artwork_xl: https_field(o, "cover_xl"),
         explicit: bool_field(o, "explicit_lyrics"),
@@ -371,7 +388,13 @@ fn str_field(o: &Map<String, Value>, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(|s| s.chars().take(TEXT_MAX_CHARS).collect())
+}
+
+/// Upstream `duration` seconds → milliseconds, clamped to the largest
+/// integer the contract's fields may carry.
+fn duration_ms_of(o: &Map<String, Value>) -> Option<u64> {
+    u64_field(o, "duration").map(|s| s.saturating_mul(1000).min(MAX_SAFE_MS))
 }
 
 /// A Deezer id: a JSON number, or a digit string, in u64 range and
@@ -402,7 +425,7 @@ fn bool_field(o: &Map<String, Value>, key: &str) -> Option<bool> {
 fn https_field(o: &Map<String, Value>, key: &str) -> Option<String> {
     o.get(key)
         .and_then(Value::as_str)
-        .filter(|u| u.starts_with("https://"))
+        .filter(|u| u.starts_with("https://") && u.chars().count() <= URL_MAX_CHARS)
         .map(str::to_string)
 }
 

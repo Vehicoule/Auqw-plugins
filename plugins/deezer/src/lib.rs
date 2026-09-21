@@ -181,12 +181,24 @@ async fn metadata(payload: &Value) -> Result<Value, GuestError> {
         match http::get_json(&url).await? {
             http::Outcome::NotFound => continue,
             http::Outcome::Body(v) => {
-                let o = v.as_object().ok_or_else(|| {
-                    failed("invalid-response", "deezer: body is not an object".into())
-                })?;
+                // One malformed upstream row drops out of the batch
+                // rather than failing every ref it rode in with —
+                // same omission as a genuinely-absent resource, plus
+                // a sanitized diagnostic.
+                let Some(o) = v.as_object() else {
+                    warn("deezer: catalog row body is not an object").await?;
+                    continue;
+                };
+                let same = match parse::id_matches(o, &id) {
+                    Ok(same) => same,
+                    Err(_) => {
+                        warn("deezer: catalog row id malformed").await?;
+                        continue;
+                    }
+                };
                 // A body naming a different id is not this ref's
                 // resource — the ref resolves to nothing.
-                if !parse::id_matches(o, &id)? {
+                if !same {
                     continue;
                 }
                 let row = match kind.as_str() {
@@ -196,12 +208,7 @@ async fn metadata(payload: &Value) -> Result<Value, GuestError> {
                 };
                 match row {
                     Some(row) => items.push(parse::to_metadata(&row)),
-                    None => {
-                        return Err(failed(
-                            "invalid-response",
-                            format!("deezer: malformed {kind} object"),
-                        ));
-                    }
+                    None => warn("deezer: malformed catalog row dropped").await?,
                 }
             }
         }
@@ -657,6 +664,35 @@ mod tests {
         assert_eq!(items[2]["source_ref"]["kind"], "artist");
         assert_eq!(items[2]["title"], "Portishead");
         assert_eq!(items[3]["source_ref"]["id"], "982668");
+    }
+
+    /// A malformed upstream row drops out of the batch — the
+    /// surviving refs still resolve, each drop carrying a sanitized
+    /// diagnostic.
+    #[test]
+    fn metadata_drops_malformed_rows_keeps_rest() {
+        let out = invoke(
+            "catalog.metadata",
+            json!({"refs": [
+                {"provider": "deezer", "kind": "track", "id": "982668"},
+                {"provider": "deezer", "kind": "track", "id": "42"},
+                {"provider": "deezer", "kind": "track", "id": "43"},
+                {"provider": "deezer", "kind": "album", "id": "109301"},
+            ]}),
+        );
+        // A good track.
+        let out = feed(&out, TRACK);
+        // A JSON body that is not a resource object.
+        let out = feed(&out, r#"["not","an","object"]"#);
+        // A track object whose title is unusable.
+        let out = feed(&out, r#"{"id":43,"type":"track","title":"  "}"#);
+        // A good album.
+        let out = feed(&out, ALBUM);
+        assert_eq!(out["type"], "done", "{out}");
+        let items = items_of(&out);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["source_ref"]["id"], "982668");
+        assert_eq!(items[1]["source_ref"]["id"], "109301");
     }
 
     #[test]

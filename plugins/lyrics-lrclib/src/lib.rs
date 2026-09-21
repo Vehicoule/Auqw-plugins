@@ -26,6 +26,11 @@ use parse::Record;
 
 const API: &str = "https://lrclib.net";
 
+/// `/api/get` rejects `duration` outside 1..=3600 seconds — a longer
+/// track sends no duration hint rather than tripping a 400 that
+/// would abort the waterfall on tier 1.
+const DURATION_MAX_SECS: u64 = 3600;
+
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
         match inv.capability.as_str() {
@@ -167,7 +172,8 @@ fn tiers(q: &Query) -> Vec<Tier> {
     let duration_secs = q
         .duration_ms
         .filter(|d| *d > 0)
-        .map(|d| d.saturating_add(500) / 1000);
+        .map(|d| d.saturating_add(500) / 1000)
+        .filter(|d| *d <= DURATION_MAX_SECS);
     if let Some(artist) = &q.artist {
         let mut exact = format!(
             "{API}/api/get?track_name={}&artist_name={}",
@@ -251,12 +257,14 @@ fn tiers(q: &Query) -> Vec<Tier> {
 
 /// What one picked record means for the requested flavor: `Some` is
 /// the terminal `done` result, `None` is a contentless record — the
-/// waterfall keeps looking.
-fn record_result(rec: &Record, flavor: Flavor, matched: &Value) -> Option<Value> {
+/// waterfall keeps looking. `is_match` is whether the record actually
+/// names the queried track: an unrelated instrumental record is a
+/// miss, not a verdict.
+fn record_result(rec: &Record, flavor: Flavor, matched: &Value, is_match: bool) -> Option<Value> {
     // The flag is authoritative: an instrumental record answers
     // honestly and carries no text, whatever lyrics fields it holds.
     if rec.instrumental {
-        return Some(match flavor {
+        return is_match.then(|| match flavor {
             Flavor::Plain => json!({"state": "instrumental", "text": null, "matched": matched}),
             Flavor::Synced => {
                 json!({"state": "instrumental", "lines": null, "matched": matched})
@@ -336,7 +344,8 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
         if first_matched.is_null() {
             first_matched = record.matched();
         }
-        if let Some(result) = record_result(record, flavor, &record.matched()) {
+        let is_match = parse::names_query(record, &q.title, q.artist.as_deref());
+        if let Some(result) = record_result(record, flavor, &record.matched(), is_match) {
             return Ok(result);
         }
     }
@@ -626,6 +635,59 @@ mod tests {
         let url = url_of(&req);
         assert!(url.contains("/api/get?"), "{url}");
         assert!(!url.contains("duration="), "{url}");
+    }
+
+    /// LRCLIB rejects `duration` > 3600 — a longer track sends no
+    /// duration hint at all instead of tripping a 400 that would
+    /// abort the waterfall.
+    #[test]
+    fn duration_over_upstream_max_is_omitted() {
+        let mut q = query();
+        q["duration_ms"] = json!(7_200_000);
+        let req = invoke_request("lyrics.plain", &q);
+        let url = url_of(&req);
+        assert!(url.contains("/api/get?"), "{url}");
+        assert!(!url.contains("duration="), "{url}");
+        // The boundary value is still sent.
+        q["duration_ms"] = json!(3_600_000);
+        let url = url_of(&invoke_request("lyrics.plain", &q));
+        assert!(url.contains("duration=3600"), "{url}");
+    }
+
+    /// An instrumental record that does not name the queried track is
+    /// a tier miss — the waterfall keeps looking instead of answering
+    /// `state:"instrumental"` for the wrong song.
+    #[test]
+    fn unrelated_instrumental_record_is_a_miss() {
+        let req = invoke_request("lyrics.synced", &query());
+        let out = answer(
+            &req,
+            200,
+            r#"{"trackName":"Other Song","artistName":"Someone Else",
+               "albumName":"Elsewhere","duration":300,
+               "instrumental":true,"plainLyrics":null,"syncedLyrics":null}"#,
+        );
+        // Tier 1 is a miss: the waterfall advances to tier 2.
+        assert_eq!(out["type"], "host_request", "{out}");
+        assert!(url_of(&out).contains("/api/get?"), "{out}");
+        let (urls, out) = miss_all(out, 10);
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["state"], "absent", "{out}");
+        // The unrelated record's metadata still rides the absent
+        // result as the first usable hit — it is evidence, not a
+        // verdict.
+        assert_eq!(out["result"]["matched"]["title"], "Other Song");
+        assert_eq!(urls.len() + 1, 5, "{urls:?}");
+    }
+
+    /// A record that *does* name the queried track still answers
+    /// `instrumental` — the gate only rejects unrelated records.
+    #[test]
+    fn matching_instrumental_record_still_reports() {
+        let req = invoke_request("lyrics.plain", &query());
+        let out = answer(&req, 200, GET_INSTRUMENTAL);
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["state"], "instrumental");
     }
 
     #[test]
