@@ -48,12 +48,10 @@ src="$tmp/auqw-guest-sdk-${version}"
 
 rm -rf "$vendor_dir"
 mkdir -p "$vendor_dir"
-for f in Cargo.toml Cargo.lock; do
-    if [ -f "$src/$f" ]; then
-        cp "$src/$f" "$vendor_dir/$f"
-    fi
-done
+# The packaged crate's file list is authoritative — copy it verbatim so
+# new package members are never dropped. The GPL text lives outside the
+# package dir (license is an SPDX tag), so it is overlaid separately.
+cp -R "$src/." "$vendor_dir/"
 cp "$license_file" "$vendor_dir/LICENSE"
-cp -R "$src/src" "$vendor_dir/src"
 
 echo "vendor-sdk: vendored ${name} ${version} -> ${vendor_dir}"
