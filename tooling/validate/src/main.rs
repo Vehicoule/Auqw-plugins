@@ -111,7 +111,10 @@ fn check_size(wasm: &[u8]) -> Result<(), String> {
 /// Zero imports, no start section, required exports with exact
 /// signatures.
 fn check_shape(wasm: &[u8]) -> Result<(), String> {
-    let mut func_types: Vec<(Vec<ValType>, Vec<ValType>)> = Vec::new();
+    // Indexed by the module's full type-index space, which is what the
+    // function section references — non-func (GC) types occupy real
+    // slots, so a filtered func-only vec would shift every later index.
+    let mut types: Vec<Option<(Vec<ValType>, Vec<ValType>)>> = Vec::new();
     let mut func_type_idx: Vec<u32> = Vec::new();
     let mut exports: Vec<(String, ExternalKind, u32)> = Vec::new();
     let mut memories: Vec<wasmparser::MemoryType> = Vec::new();
@@ -125,9 +128,13 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
                 for group in reader {
                     let group = group.map_err(|e| format!("type section: {e}"))?;
                     for subtype in group.types() {
-                        if let CompositeInnerType::Func(ft) = &subtype.composite_type.inner {
-                            func_types.push((ft.params().to_vec(), ft.results().to_vec()));
-                        }
+                        let ty = match &subtype.composite_type.inner {
+                            CompositeInnerType::Func(ft) => {
+                                Some((ft.params().to_vec(), ft.results().to_vec()))
+                            }
+                            _ => None,
+                        };
+                        types.push(ty);
                     }
                 }
             }
@@ -195,7 +202,7 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
     }
     check_func(
         &exports,
-        &func_types,
+        &types,
         &func_type_idx,
         "alloc",
         &[ValType::I32],
@@ -203,7 +210,7 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
     )?;
     check_func(
         &exports,
-        &func_types,
+        &types,
         &func_type_idx,
         "handle",
         &[ValType::I32, ValType::I32],
@@ -214,7 +221,7 @@ fn check_shape(wasm: &[u8]) -> Result<(), String> {
 
 fn check_func(
     exports: &[(String, ExternalKind, u32)],
-    func_types: &[(Vec<ValType>, Vec<ValType>)],
+    types: &[Option<(Vec<ValType>, Vec<ValType>)>],
     func_type_idx: &[u32],
     name: &str,
     params: &[ValType],
@@ -226,9 +233,11 @@ fn check_func(
     let type_idx = func_type_idx
         .get(*idx as usize)
         .ok_or_else(|| format!("{name} export index out of range"))?;
-    let (p, r) = func_types
-        .get(*type_idx as usize)
-        .ok_or_else(|| format!("{name} type index out of range"))?;
+    let (p, r) = match types.get(*type_idx as usize) {
+        Some(Some((p, r))) => (p, r),
+        Some(None) => return Err(format!("{name} references a non-function type")),
+        None => return Err(format!("{name} type index out of range")),
+    };
     if p.as_slice() != params || r.as_slice() != results {
         return Err(format!("{name} has wrong signature"));
     }
@@ -458,6 +467,33 @@ mod tests {
     fn missing_exports_rejected() {
         let wat = "(module (memory (export \"memory\") 1))";
         assert!(shape(wat).is_err());
+    }
+
+    #[test]
+    fn non_func_types_do_not_shift_signature_lookup() {
+        // A GC struct occupies a slot in the type-index space the
+        // function section references; resolving through a filtered
+        // func-only list would mis-check every later func.
+        let good = "(module
+            (type (struct))
+            (type (func (param i32) (result i32)))
+            (type (func (param i32 i32) (result i64)))
+            (memory (export \"memory\") 1)
+            (func (export \"alloc\") (type 1) (param i32) (result i32) (i32.const 0))
+            (func (export \"handle\") (type 2) (param i32 i32) (result i64) (i64.const 0)))";
+        assert_eq!(shape(good), Ok(()));
+
+        // `alloc` is declared with a decoy signature; filtered indexing
+        // would land on the real alloc type and let it through.
+        let bad = "(module
+            (type (struct))
+            (type (func (param i32 i32) (result i32)))
+            (type (func (param i32) (result i32)))
+            (type (func (param i32 i32) (result i64)))
+            (memory (export \"memory\") 1)
+            (func (export \"alloc\") (type 1) (param i32 i32) (result i32) (i32.const 0))
+            (func (export \"handle\") (type 3) (param i32 i32) (result i64) (i64.const 0)))";
+        assert!(shape(bad).is_err_and(|e| e.contains("signature")));
     }
 
     #[test]
