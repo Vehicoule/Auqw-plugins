@@ -185,7 +185,9 @@ enforces the destination allowlist on every request — before the
 verdict lands. A
 second bot-check inside one invocation ends the bare pass — the
 rungs then get one attested replay each when a POT provider minted,
-and `transient` (`bot-check`) only when the wall holds anyway.
+and `transient` (`bot-check`) only when the wall holds anyway. A
+replay's verdict overwrites the rung's `Bot` record — a rung attested
+to SABR-only counts toward `unsupported`, not `bot-check`.
 `cancelled`
 propagates immediately; `permission-denied`/`invalid-response` host
 errors are terminal; a `rate-limit` host error stages the rate-limit

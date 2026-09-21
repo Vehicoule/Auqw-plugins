@@ -345,10 +345,12 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     let now = now_ms().await?;
     let mut outcomes: Vec<RungOutcome> = Vec::new();
     let mut bot_checks = 0u32;
-    // Ladder indices that produced `Bot` — the rungs the attested
-    // pass replays. Includes backoff-derived entries: a staged
-    // bot-backoff is exactly what attestation is for.
-    let mut bot_rungs: Vec<usize> = Vec::new();
+    // Ladder indices that produced `Bot`, paired with the slot that
+    // verdict occupies in `outcomes` — the attested pass replays only
+    // these rungs and overwrites the slot, so a superseded bot-check
+    // can't skew the ladder summary. Includes backoff-derived entries:
+    // a staged bot-backoff is exactly what attestation is for.
+    let mut bot_positions: Vec<(usize, usize)> = Vec::new();
     let mut pin_seen = false;
     let mut pin_missing = false;
     let mut mint_attempted = false;
@@ -371,7 +373,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     for pass in 0..2u8 {
         let attested = pass == 1;
         for (i, rung) in LADDER.iter().enumerate() {
-            if attested && !bot_rungs.contains(&i) {
+            if attested && !bot_positions.iter().any(|(rung, _)| *rung == i) {
                 continue;
             }
             let visitor_key = format!("visitor/{}", rung.kv_key());
@@ -386,7 +388,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     if until > now {
                         let outcome = outcome_for_reason(&reason);
                         if outcome == RungOutcome::Bot {
-                            bot_rungs.push(i);
+                            bot_positions.push((i, outcomes.len()));
                         }
                         outcomes.push(outcome);
                         continue;
@@ -409,7 +411,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     if let Some((reason, ms)) = backoff_for(outcome) {
                         stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                     }
-                    outcomes.push(outcome);
+                    record(&mut outcomes, attested, i, &bot_positions, outcome);
                     continue;
                 }
             };
@@ -435,7 +437,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         if let Some((reason, ms)) = backoff_for(outcome) {
                             stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                         }
-                        outcomes.push(outcome);
+                        record(&mut outcomes, attested, i, &bot_positions, outcome);
                         continue;
                     }
                 };
@@ -452,7 +454,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 if let Some((reason, ms)) = backoff_for(outcome) {
                     stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
-                outcomes.push(outcome);
+                record(&mut outcomes, attested, i, &bot_positions, outcome);
                 continue;
             }
             // A 2xx player response must be a JSON envelope carrying
@@ -496,7 +498,13 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 .and_then(Value::as_str)
                 .is_some_and(|id| id != p.video_id)
             {
-                outcomes.push(RungOutcome::Unavailable);
+                record(
+                    &mut outcomes,
+                    attested,
+                    i,
+                    &bot_positions,
+                    RungOutcome::Unavailable,
+                );
                 continue;
             }
             match classify_playability(&body).0 {
@@ -509,8 +517,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         "bot-check",
                     )
                     .await?;
-                    outcomes.push(RungOutcome::Bot);
-                    bot_rungs.push(i);
+                    record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Bot);
+                    if !attested {
+                        bot_positions.push((i, outcomes.len() - 1));
+                    }
                     // Shared invocation budget: the second unattested
                     // bot-check ends the bare pass — attestation is the
                     // remedy, not more bare requests.
@@ -520,15 +530,27 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     continue;
                 }
                 Playability::AgeRestricted => {
-                    outcomes.push(RungOutcome::Age);
+                    record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Age);
                     continue;
                 }
                 Playability::SignInRequired => {
-                    outcomes.push(RungOutcome::SignIn);
+                    record(
+                        &mut outcomes,
+                        attested,
+                        i,
+                        &bot_positions,
+                        RungOutcome::SignIn,
+                    );
                     continue;
                 }
                 Playability::Unavailable => {
-                    outcomes.push(RungOutcome::Unavailable);
+                    record(
+                        &mut outcomes,
+                        attested,
+                        i,
+                        &bot_positions,
+                        RungOutcome::Unavailable,
+                    );
                     continue;
                 }
             }
@@ -568,7 +590,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                                         stage_backoff(&backoff_key, now.saturating_add(ms), reason)
                                             .await?;
                                     }
-                                    outcomes.push(outcome);
+                                    record(&mut outcomes, attested, i, &bot_positions, outcome);
                                 }
                             }
                         }
@@ -589,20 +611,44 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             {
                                 pin_missing = true;
                             }
-                            outcomes.push(RungOutcome::NoAudio);
+                            record(
+                                &mut outcomes,
+                                attested,
+                                i,
+                                &bot_positions,
+                                RungOutcome::NoAudio,
+                            );
                         }
                     }
                 }
-                FormatOutcome::SabrOnly => outcomes.push(RungOutcome::SabrOnly),
-                FormatOutcome::CipheredOnly => outcomes.push(RungOutcome::CipheredOnly),
-                FormatOutcome::NoAudio => outcomes.push(RungOutcome::NoAudio),
+                FormatOutcome::SabrOnly => record(
+                    &mut outcomes,
+                    attested,
+                    i,
+                    &bot_positions,
+                    RungOutcome::SabrOnly,
+                ),
+                FormatOutcome::CipheredOnly => record(
+                    &mut outcomes,
+                    attested,
+                    i,
+                    &bot_positions,
+                    RungOutcome::CipheredOnly,
+                ),
+                FormatOutcome::NoAudio => record(
+                    &mut outcomes,
+                    attested,
+                    i,
+                    &bot_positions,
+                    RungOutcome::NoAudio,
+                ),
             }
         }
         // Escalation: bot-checks accumulate a remedy pass. One shared
         // mint — the same video-bound token also decorates picked URLs
         // via `finish_pick`. A denied/failed mint keeps today's
         // terminal outcome.
-        if attested || bot_rungs.is_empty() {
+        if attested || bot_positions.is_empty() {
             break;
         }
         if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
@@ -803,6 +849,26 @@ fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<Run
         500..=599 => Some(RungOutcome::Transport),
         _ => Some(RungOutcome::Capped),
     }
+}
+
+/// Append `outcome` — or, on the attested pass, overwrite the slot the
+/// rung's bare `Bot` verdict occupied. The replay's verdict is the
+/// rung's real answer: keeping the superseded `Bot` would report a
+/// bot-check a successful attestation already answered.
+fn record(
+    outcomes: &mut Vec<RungOutcome>,
+    attested: bool,
+    rung: usize,
+    bot_positions: &[(usize, usize)],
+    outcome: RungOutcome,
+) {
+    if attested {
+        if let Some(&(_, slot)) = bot_positions.iter().find(|(r, _)| *r == rung) {
+            outcomes[slot] = outcome;
+            return;
+        }
+    }
+    outcomes.push(outcome);
 }
 
 /// Map the accumulated outcomes to the terminal taxonomy. Precedence:
@@ -1742,6 +1808,29 @@ mod tests {
             ("transient".to_string(), "bot-check".to_string())
         );
         assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn attested_replay_supersedes_bot_for_unsupported() {
+        // Bare rungs bot-check; the attested replays then prove the
+        // rungs' formats are all SABR. The superseded Bot records must
+        // not poison the all-restricted read — the replay's verdict is
+        // the rung's real answer.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, BOT);
+        assert_eq!(rung_of(&out), 0);
+        let out = feed(&mut h, &out, SABR);
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, SABR);
+        assert_eq!(
+            fail_kind(&out),
+            ("unsupported".to_string(), "sabr-only".to_string())
+        );
     }
 
     #[test]
