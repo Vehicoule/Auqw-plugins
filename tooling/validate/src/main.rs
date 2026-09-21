@@ -363,6 +363,23 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
         {
             return Err(format!("manifest.permissions entry {p:?} is malformed"));
         }
+        // Mirrors plugin-host `validate`: a dotted DNS name or a
+        // loopback literal — non-loopback IPs, bare labels, empty
+        // labels, and `*.localhost` are not grantable destinations.
+        let is_loopback = body == "localhost"
+            || body
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !is_loopback
+            && (body.parse::<std::net::IpAddr>().is_ok()
+                || !body.contains('.')
+                || body.split('.').any(str::is_empty)
+                || body.ends_with(".localhost"))
+        {
+            return Err(format!(
+                "manifest.permissions entry {p:?} is not a public DNS name"
+            ));
+        }
     }
     // artifact: exactly {path: non-empty string, digest: sha256:<64 hex>}
     let artifact = manifest["artifact"]
