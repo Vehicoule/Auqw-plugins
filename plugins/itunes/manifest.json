@@ -1,7 +1,7 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:9bd55eb4be84803209fca59f5034127c175bfc231bd1daf58b1b40238a341602",
+    "digest": "sha256:c10f3a70c8140676c0c66659f30fabeac9cd8bb52ebd59c12288b7194adeaf6d",
     "path": "dist/itunes.wasm"
   },
   "capabilities": [
@@ -13,5 +13,5 @@
   "permissions": [
     "network:itunes.apple.com"
   ],
-  "version": "0.2.0"
+  "version": "0.2.1"
 }

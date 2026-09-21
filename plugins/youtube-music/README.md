@@ -114,9 +114,12 @@ non-object 2xx body or a missing queue panel → `invalid-response`.
 
 A picked URL is probed before it is returned: a `Range` request on the
 file's last 64 KiB (derived from `contentLength`; a fixed window past
-the ~1 MiB horizon when the length is unknown). A 206 proves this mint
-serves the whole file; a refusal marks the rung **capped** and advances
-the ladder. The probe rides the exact URL the downloader will fetch.
+the ~1 MiB horizon when the length is unknown). On the tail window a
+206 that reaches the file's last byte proves this mint serves the whole
+file; on the fallback window a 206 carrying the asked span — or a
+reported EOF inside it — proves the mint serves past the horizon. A
+refusal marks the rung **capped** and advances the ladder. The probe
+rides the exact URL the downloader will fetch.
 
 Once per resolve the guest may emit a `pot_token` host request — lazy,
 bound to the video id (the current upstream binding for both player
@@ -183,7 +186,9 @@ rungs then get one attested replay each when a POT provider minted,
 and `transient` (`bot-check`) only when the wall holds anyway.
 `cancelled`
 propagates immediately; `permission-denied`/`invalid-response` host
-errors are terminal; other host errors are transport weather. When the
+errors are terminal; a `rate-limit` host error stages the rate-limit
+backoff and reports as `rate-limit`; other host errors are transport
+weather. When the
 ladder is exhausted: any 429 or stored rate-limit → `rate-limit`; a
 requested pin no rung served → `expired-resource`
 (`pinned-itag-unavailable`); every playable rung SABR/ciphered →

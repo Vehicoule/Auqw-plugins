@@ -228,15 +228,17 @@ fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> 
     })
 }
 
-/// Propagate terminal host errors; fold retryable ones into a transport
+/// Propagate terminal host errors; fold retryable ones into a rung
 /// outcome. `cancelled`, `permission-denied`, and `invalid-response`
-/// are terminal; anything else is weather.
+/// are terminal; `rate-limit` keeps its taxonomy (its own backoff
+/// reason and fail kind); anything else is weather.
 fn terminal_or_transport(e: GuestError) -> Result<RungOutcome, GuestError> {
     match e {
         GuestError::Host { kind, message } => match kind.as_str() {
             "cancelled" | "permission-denied" | "invalid-response" => {
                 Err(GuestError::Host { kind, message })
             }
+            "rate-limit" => Ok(RungOutcome::RateLimited),
             _ => Ok(RungOutcome::Transport),
         },
         other => Err(other),
@@ -419,11 +421,14 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 };
                 // A 401 marks the access token dead — subsequent rungs
                 // retry bare so a stale token can't wall the ladder.
-                if resp.status == 401 {
-                    access_token = None;
-                }
-                if let Some((reason, ms)) = backoff_for(outcome) {
-                    stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                // When the refused request carried the token, the 401
+                // blames it rather than the rung, so it stages no
+                // backoff; a bare 401 still does.
+                let token_died = resp.status == 401 && access_token.take().is_some();
+                if !token_died {
+                    if let Some((reason, ms)) = backoff_for(outcome) {
+                        stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                    }
                 }
                 outcomes.push(outcome);
                 continue;
@@ -721,13 +726,18 @@ fn probe_start(content_length: Option<u64>) -> u64 {
 }
 
 /// The probe verdict: `None` means the mint demonstrably serves the
-/// file's tail — resolve `done`. A 206 only proves that when its
-/// `Content-Range` starts where the probe asked, reaches the file's
-/// last byte, and the body carried the whole advertised span — an
-/// empty body or an absent/foreign range verifies nothing. A 416 is a
-/// pass only for the fallback range (unknown `content_length`) *and*
-/// only with a `bytes */N` showing the file ends before the probe
-/// start — a cap can wear a bare 416. A 429 keeps its taxonomy:
+/// probed span — resolve `done`. On the tail probe (known
+/// `content_length`) a 206 proves that only when its `Content-Range`
+/// starts where the probe asked, reaches the file's last byte, and
+/// the body carried the whole advertised span — an empty body or an
+/// absent/foreign range verifies nothing. On the fixed fallback
+/// window (unknown `content_length`) `end + 1 == total` is
+/// unreachable for any file longer than the window, so there the bar
+/// is a matching start plus either the whole asked span or a reported
+/// EOF — the window only exists to prove the mint serves past the
+/// ~1 MiB cap horizon. A 416 is a pass only for the fallback range
+/// *and* only with a `bytes */N` showing the file ends before the
+/// probe start — a cap can wear a bare 416. A 429 keeps its taxonomy:
 /// rate-limiting is not evidence of a truncated mint. A 5xx is
 /// `Transport`, not `Capped` — server weather teaches nothing about
 /// serving. Anything else marks the mint capped and advances the
@@ -743,10 +753,19 @@ fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<Run
                 Some(t) => end.checked_add(1) == Some(t),
                 None => content_length.is_some_and(|l| end.checked_add(1) == Some(l)),
             };
+            let served_span = match content_length {
+                // The tail window ends at the file's last byte — only
+                // reaching EOF proves the whole file serves.
+                Some(_) => reached_eof,
+                // The fallback window ends past the ~1 MiB horizon, so
+                // the whole asked span — or an earlier reported EOF —
+                // proves the mint serves beyond it.
+                None => reached_eof || end == start_asked + PROBE_TAIL_BYTES - 1,
+            };
             let span_carried = end
                 .checked_sub(start)
                 .is_some_and(|span| span + 1 == resp.body.len() as u64);
-            if start == start_asked && reached_eof && span_carried {
+            if start == start_asked && served_span && span_carried {
                 None
             } else {
                 Some(RungOutcome::Capped)
@@ -1273,6 +1292,75 @@ mod tests {
     }
 
     #[test]
+    fn probe_206_on_fallback_window_is_done() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &ok_without_length());
+        assert_eq!(out["payload"]["method"], "GET");
+        assert_eq!(
+            header_of(&out, "Range").as_deref(),
+            Some("bytes=1048576-1114111")
+        );
+        // The file (3,000,000) runs past the window, so `end + 1 ==
+        // total` can never hold here — the fallback pass bar is the
+        // whole asked span from a matching start.
+        let out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 1048576-1114111/3000000")],
+            65536,
+        );
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        assert_eq!(out["result"]["content_length"], Value::Null);
+    }
+
+    #[test]
+    fn probe_206_fallback_short_of_window_is_capped() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &ok_without_length());
+        // Starts at the window but ends before both the window's last
+        // byte and the file's EOF — a cap cutting mid-window.
+        let out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 1048576-1090000/3000000")],
+            41425,
+        );
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_fallback_truncated_at_eof_is_done() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, &ok_without_length());
+        // The file ends inside the window: the advertised span runs
+        // short of the ask but `end + 1 == total` holds.
+        let out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 1048576-1099999/1100000")],
+            51424,
+        );
+        assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn probe_200_is_capped() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // A 200 means the edge ignored the Range ask and streams from
+        // byte 0 — it proves nothing about serving past the horizon,
+        // so the mint is judged capped, not transport weather.
+        let out = h.answer(&out, 200, "x");
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
     fn probe_206_without_content_range_is_capped() {
         let mut h = Harness::new();
         let out = begin(&mut h);
@@ -1742,6 +1830,42 @@ mod tests {
         let out = begin(&mut h);
         let out = h.answer_host_error(&out, "transient");
         assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn host_rate_limit_keeps_taxonomy_and_backoff() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        // A host-side `rate-limit` on the player call is not generic
+        // transport weather: it stages the 60 s rate-limit backoff.
+        let out = h.answer_host_error(&out, "rate-limit");
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        let stored: Value = serde_json::from_slice(
+            h.committed
+                .get(&format!("backoff/{VID}/VISIONOS"))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_eq!(stored["reason"], "rate-limit");
+        assert_eq!(stored["until_ms"], NOW + 60_000);
+    }
+
+    #[test]
+    fn host_rate_limit_on_every_rung_fails_rate_limit() {
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        for _ in 0..5 {
+            out = h.answer_host_error(&out, "rate-limit");
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("rate-limit".to_string(), "rate-limit".to_string())
+        );
     }
 
     #[test]
@@ -2288,6 +2412,31 @@ mod tests {
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "IOS");
+        // The 401 blamed the token, not the rung — no backoff was
+        // staged against `backoff/<vid>/VISIONOS`.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+    }
+
+    #[test]
+    fn bare_unauthorized_still_stages_transport_backoff() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        // No token was sent, so this 401 is the rung's refusal — it
+        // stages the transport backoff like any other failure.
+        let out = h.answer(&out, 401, "{}");
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        let stored: Value = serde_json::from_slice(
+            h.committed
+                .get(&format!("backoff/{VID}/VISIONOS"))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_eq!(stored["reason"], "transport");
     }
 
     #[test]

@@ -26,6 +26,19 @@ fn bad(m: &str) -> GuestError {
     }
 }
 
+/// Contract cap on emitted text fields (`title`/`artist`/`album`/
+/// `genre`) — an overlong upstream string truncates instead of
+/// failing a whole page downstream.
+const TEXT_MAX_CHARS: usize = 512;
+
+/// `artworkRef.url` caps at 2048 characters — an overlong upstream
+/// URL is dropped, not truncated to a broken link.
+const URL_MAX_CHARS: usize = 2048;
+
+/// Largest value a contract integer field may carry downstream —
+/// `Number.MAX_SAFE_INTEGER`.
+const MAX_SAFE_MS: u64 = 9_007_199_254_740_991;
+
 /// Parse the `results` array of an iTunes body. Non-song rows and
 /// rows with a zero/missing id or empty name drop out; a non-JSON,
 /// non-object, or `results`-less body is `invalid-response`.
@@ -57,8 +70,8 @@ fn track_of(row: &Value) -> Option<Track> {
         .get("trackName")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(TEXT_MAX_CHARS).collect())?;
     let explicit = match o.get("trackExplicitness").and_then(Value::as_str) {
         Some("explicit") => Some(true),
         Some("cleaned") | Some("notExplicit") => Some(false),
@@ -72,14 +85,17 @@ fn track_of(row: &Value) -> Option<Track> {
     let artwork100 = o
         .get("artworkUrl100")
         .and_then(Value::as_str)
-        .filter(|u| u.starts_with("https://"))
+        .filter(|u| u.starts_with("https://") && u.chars().count() <= URL_MAX_CHARS)
         .map(str::to_string);
     Some(Track {
         id,
         title,
         artist: str_field(o, "artistName"),
         album: str_field(o, "collectionName"),
-        duration_ms: o.get("trackTimeMillis").and_then(Value::as_u64),
+        duration_ms: o
+            .get("trackTimeMillis")
+            .and_then(Value::as_u64)
+            .map(|ms| ms.min(MAX_SAFE_MS)),
         release_year,
         artwork100,
         explicit,
@@ -92,7 +108,7 @@ fn str_field(o: &Map<String, Value>, key: &str) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(|s| s.chars().take(TEXT_MAX_CHARS).collect())
 }
 
 fn track_id(o: &Map<String, Value>) -> Option<String> {
@@ -119,6 +135,11 @@ pub fn artwork_ref(track: &Track, size: u64) -> Option<Value> {
         ),
         None => (url.clone(), Value::Null),
     };
+    // The cap applies to the emitted URL: substituting a larger size
+    // grows the input past the limit `track_of` accepted.
+    if url.chars().count() > URL_MAX_CHARS {
+        return None;
+    }
     Some(serde_json::json!({
         "url": url,
         "width": dim,
@@ -202,6 +223,23 @@ mod tests {
             explicit,
             genre: None,
         }
+    }
+
+    #[test]
+    fn artwork_cap_applies_after_size_substitution() {
+        // An input URL just inside the cap that substitution pushes
+        // over must emit no artwork ref at all.
+        let base = "https://is1-ssl.mzstatic.com/image/thumb/";
+        let tail = format!(
+            "{}/100x100bb.jpg",
+            "a".repeat(URL_MAX_CHARS - base.len() - 14)
+        );
+        let url = format!("{base}{tail}");
+        assert_eq!(url.chars().count(), URL_MAX_CHARS);
+        let mut t = track("1", "Song", Some(60_000), None);
+        t.artwork100 = Some(url);
+        assert!(artwork_ref(&t, 100).is_some());
+        assert!(artwork_ref(&t, 1200).is_none());
     }
 
     #[test]

@@ -41,6 +41,22 @@ fn bad(m: &str) -> GuestError {
     }
 }
 
+/// Largest value a contract integer field may carry downstream —
+/// `Number.MAX_SAFE_INTEGER`; an upstream outlier clamps instead of
+/// failing validation.
+const MAX_SAFE_MS: u64 = 9_007_199_254_740_991;
+
+/// `trackMetadata`/`lyricsMatched` text fields cap at 512 characters —
+/// an overlong upstream string truncates rather than failing a whole
+/// result downstream.
+const META_MAX_CHARS: usize = 512;
+
+/// An emitted metadata string: trimmed, nonempty, and within the
+/// contract's character cap.
+fn meta_field(o: &Map<String, Value>, key: &str) -> Option<String> {
+    str_field(o, key).map(|s| s.chars().take(META_MAX_CHARS).collect())
+}
+
 /// Parse an `/api/get` body: a single record object. Non-JSON, a
 /// non-object, or an unusable record is `invalid-response`.
 ///
@@ -77,8 +93,8 @@ fn record_of(v: &Value) -> Option<Record> {
         .get("trackName")
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(META_MAX_CHARS).collect())?;
     let instrumental = match o.get("instrumental") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -86,13 +102,13 @@ fn record_of(v: &Value) -> Option<Record> {
     };
     Some(Record {
         title,
-        artist: str_field(o, "artistName"),
-        album: str_field(o, "albumName"),
+        artist: meta_field(o, "artistName"),
+        album: meta_field(o, "albumName"),
         duration_ms: o
             .get("duration")
             .and_then(Value::as_f64)
             .filter(|d| d.is_finite() && *d >= 0.0)
-            .map(|d| (d * 1000.0).round() as u64),
+            .map(|d| ((d * 1000.0).round() as u64).min(MAX_SAFE_MS)),
         instrumental,
         plain: str_field(o, "plainLyrics"),
         synced: str_field(o, "syncedLyrics"),
@@ -117,21 +133,68 @@ pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Opt
     let want_artist = artist.map(norm);
     let artist_ok = |r: &&'a Record| match (&want_artist, &r.artist) {
         (None, _) => true,
-        (Some(want), Some(got)) => *want == norm(got),
+        (Some(want), Some(got)) => !want.is_empty() && *want == norm(got),
         (Some(_), None) => false,
+    };
+    // An empty fold is never evidence *between folded strings*: a
+    // non-Latin query title norms to "" and would collide with any
+    // equally-empty record title. Literal (trimmed, case-insensitive)
+    // equality still counts — a record titled identically to the
+    // query names it even when neither side survives `norm`.
+    let title_is = |r: &&'a Record, want: &str, want_raw: &str| {
+        if want.is_empty() {
+            raw_title_eq(&r.title, want_raw)
+        } else {
+            norm(&r.title) == *want
+        }
     };
     records
         .iter()
-        .find(|r| norm(&r.title) == want_title && artist_ok(r))
-        .or_else(|| records.iter().find(|r| norm(&r.title) == want_title))
+        .find(|r| title_is(r, &want_title, title) && artist_ok(r))
+        .or_else(|| records.iter().find(|r| title_is(r, &want_title, title)))
         .or_else(|| {
             if want_cleaned != want_title {
-                records.iter().find(|r| norm(&r.title) == want_cleaned)
+                let cleaned = clean_title(title);
+                records
+                    .iter()
+                    .find(|r| title_is(r, &want_cleaned, &cleaned))
             } else {
                 None
             }
         })
         .or_else(|| records.first())
+}
+
+/// Literal title equality — trimmed, then compared on the uppercase
+/// fold. Uppercasing, not lowercasing: the lowercase fold preserves
+/// the word-final σ/ς distinction, while uppercase maps both to Σ
+/// (and ß→SS, ligatures→pairs) — the closest the std library gets to
+/// caseless matching without a Unicode-casefold dependency.
+fn raw_title_eq(a: &str, b: &str) -> bool {
+    a.trim().to_uppercase() == b.trim().to_uppercase()
+}
+
+/// Whether a picked record plausibly *is* the queried track: its
+/// normalized title equals the query title (or its cleaned form) and
+/// the artists do not outright disagree when both sides name one.
+/// `instrumental` only answers the query when the record names it —
+/// anything less is a tier miss, not a verdict on the track.
+pub fn names_query(r: &Record, title: &str, artist: Option<&str>) -> bool {
+    let got = norm(&r.title);
+    let title_hit = if got.is_empty() {
+        // Both sides folded away (non-Latin): only a literal title
+        // match, raw or against the cleaned query, names the query.
+        raw_title_eq(&r.title, title) || raw_title_eq(&r.title, &clean_title(title))
+    } else {
+        got == norm(title) || got == norm(&clean_title(title))
+    };
+    if !title_hit {
+        return false;
+    }
+    match (artist.map(norm), r.artist.as_deref().map(norm)) {
+        (Some(w), Some(g)) => !w.is_empty() && !g.is_empty() && w == g,
+        _ => true,
+    }
 }
 
 /// Comparison key: ASCII-folded lowercase alphanumerics only — case,
@@ -183,8 +246,15 @@ pub fn parse_lrc(input: &str) -> Vec<(u64, String)> {
         }
         let text: String = rest.trim().chars().take(1024).collect();
         for stamp in stamps {
-            let t = stamp as i64 + offset_ms;
-            out.push((t.max(0) as u64, text.clone()));
+            // The offset is i64 while the stamp is u64 — shift
+            // saturating in u64 space, then clamp to the largest
+            // integer the wire validators accept.
+            let t = if offset_ms >= 0 {
+                stamp.saturating_add(offset_ms.unsigned_abs())
+            } else {
+                stamp.saturating_sub(offset_ms.unsigned_abs())
+            };
+            out.push((t.min(MAX_SAFE_MS), text.clone()));
         }
     }
     out.sort_by_key(|(t, _)| *t);
@@ -215,7 +285,14 @@ fn parse_timestamp(tag: &str) -> Option<u64> {
         }
         std::str::from_utf8(&d).ok()?.parse::<u64>().ok()?
     };
-    Some(minutes * 60_000 + seconds * 1_000 + ms)
+    // Pathological minute tags can exceed u64 range arithmetic —
+    // saturate rather than panic in debug or wrap in release.
+    Some(
+        minutes
+            .saturating_mul(60_000)
+            .saturating_add(seconds.saturating_mul(1_000))
+            .saturating_add(ms),
+    )
 }
 
 /// Version-suffix marker words for [`clean_title`]: exact words for
@@ -413,5 +490,95 @@ mod tests {
         assert_eq!(norm("  Roads (Remastered) "), norm("roads remastered"));
         assert_eq!(norm("Sigur Rós"), norm("sigur ros"));
         assert_eq!(norm("L'été"), norm("lete"));
+    }
+
+    fn rec(title: &str, artist: Option<&str>, instrumental: bool) -> Record {
+        Record {
+            title: title.into(),
+            artist: artist.map(str::to_string),
+            album: None,
+            duration_ms: None,
+            instrumental,
+            plain: None,
+            synced: None,
+        }
+    }
+
+    /// A non-Latin query title folds to "" — it must never "exact
+    /// match" an equally-folded record title; the first usable row
+    /// stays the pick.
+    #[test]
+    fn empty_norm_never_counts_as_exact_match() {
+        let latin = rec("Unrelated Latin", Some("Band"), false);
+        let cjk = rec("別の歌", Some("別の人"), false);
+        let records = [latin, cjk];
+        let got = pick(&records, "夜の歌", None).map(|r| r.title.as_str());
+        assert_eq!(got, Some("Unrelated Latin"));
+        // The instrumental gate rejects the same collision.
+        let cjk_inst = rec("別の歌", Some("別の人"), true);
+        assert!(!names_query(&cjk_inst, "夜の歌", None));
+    }
+
+    /// When the query itself folds empty, a record whose raw title is
+    /// literally the query still names it — an identical non-Latin
+    /// title is exact evidence, not the empty-fold collision.
+    #[test]
+    fn identical_non_latin_title_still_matches() {
+        let latin = rec("Unrelated Latin", Some("Band"), false);
+        let cjk = rec("夜の歌", Some("ある人"), false);
+        let records = [latin, cjk];
+        let got = pick(&records, "夜の歌", None).map(|r| r.title.as_str());
+        assert_eq!(got, Some("夜の歌"));
+        let cjk_inst = rec("夜の歌", Some("ある人"), true);
+        assert!(names_query(&cjk_inst, "夜の歌", None));
+        // Whitespace/case padding still counts as the same title.
+        let padded = rec(" 夜の歌 ", None, true);
+        assert!(names_query(&padded, "夜の歌", None));
+        // Case-fold exceptions: uppercase/lowercase sigma variants of
+        // the same word are the same title (both fold to Σ via the
+        // uppercase fold).
+        let sigma_upper = rec("ΟΣ", None, true);
+        assert!(names_query(&sigma_upper, "ος", None));
+        let sigma_final = rec("ος", None, true);
+        assert!(names_query(&sigma_final, "ΟΣ", None));
+        let sigma_records = [rec("Other", None, false), rec("ΟΣ", None, false)];
+        let picked = pick(&sigma_records, "ος", None);
+        assert_eq!(picked.map(|r| r.title.as_str()), Some("ΟΣ"));
+    }
+
+    /// `names_query` needs a title hit on the raw or cleaned query
+    /// title; a present artist on both sides must not disagree.
+    #[test]
+    fn names_query_matches_title_and_no_artist_disagreement() {
+        let r = rec("Roads", Some("Portishead"), true);
+        assert!(names_query(&r, "Roads", Some("Portishead")));
+        assert!(names_query(
+            &r,
+            "Roads (Remastered 2011)",
+            Some("Portishead")
+        ));
+        assert!(names_query(&r, "Roads", None));
+        assert!(!names_query(&r, "Other Song", Some("Portishead")));
+        assert!(!names_query(&r, "Roads", Some("Someone Else")));
+        // Missing upstream artist cannot disagree.
+        assert!(names_query(
+            &rec("Roads", None, true),
+            "Roads",
+            Some("Portishead")
+        ));
+    }
+
+    /// A minute tag beyond u64 arithmetic saturates instead of
+    /// panicking or wrapping, and the emitted timestamp stays within
+    /// the largest contract integer.
+    #[test]
+    fn lrc_pathological_minutes_saturate_and_clamp() {
+        let lines = parse_lrc("[307445734561825861:00.00] huge\n[18446744073709551616:00] toobig");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, 9_007_199_254_740_991);
+        assert_eq!(lines[0].1, "huge");
+        // And a huge positive offset can no longer wrap to zero.
+        let lines = parse_lrc("[offset:9223372036854775807]\n[00:01.00] x");
+        assert_eq!(lines[0].0, 9_007_199_254_740_991);
     }
 }
