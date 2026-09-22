@@ -1,0 +1,33 @@
+{
+  "name": "itunes catalog.metadata — lookup row",
+  "plugin": "itunes",
+  "capability": "catalog.metadata",
+  "request": {
+    "refs": [
+      { "provider": "itunes", "kind": "track", "id": "1440761789" }
+    ]
+  },
+  "upstreams": [
+    {
+      "url_contains": "itunes.apple.com/lookup",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/lookup.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "items": [
+        {
+          "source_ref": {
+            "provider": "itunes",
+            "kind": "track",
+            "id": "1440761789"
+          },
+          "title": "Roads"
+        }
+      ]
+    },
+    "max_http_calls": 1
+  }
+}

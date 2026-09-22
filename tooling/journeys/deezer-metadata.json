@@ -1,0 +1,29 @@
+{
+  "name": "deezer catalog.metadata — track row",
+  "plugin": "deezer",
+  "capability": "catalog.metadata",
+  "request": {
+    "refs": [
+      { "provider": "deezer", "kind": "track", "id": "982668" }
+    ]
+  },
+  "upstreams": [
+    {
+      "url_contains": "api.deezer.com/track/",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/track.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "items": [
+        {
+          "title": "Roads",
+          "isrc": "GBAQT9400064"
+        }
+      ]
+    },
+    "max_http_calls": 1
+  }
+}
