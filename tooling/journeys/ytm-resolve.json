@@ -19,6 +19,9 @@
     {
       "url_contains": "googlevideo.com",
       "status": 206,
+      "request_headers": {
+        "range": "bytes=4492129-4557664"
+      },
       "headers": {
         "content-range": "bytes 4492129-4557664/4557665"
       },
