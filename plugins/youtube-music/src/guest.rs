@@ -363,14 +363,17 @@ fn truncated_bot_check(body: &[u8]) -> bool {
             _ => {}
         }
     }
-    let tail: String = String::from_utf8_lossy(&rest[open..end])
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .collect();
-    if tail.contains("\"status\":\"ok\"") {
+    let span = String::from_utf8_lossy(&rest[open..end]).to_lowercase();
+    // Whitespace INSIDE a phrase is flexible (JSON pretty-printing
+    // varies) but the phrase's word boundaries are not — `"notabot"`
+    // is not `"not a bot"`. The compact form only checks structural
+    // JSON (`"status":"ok"`), where no word boundary can be lost.
+    let compact: String = span.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.contains("\"status\":\"ok\"") {
         return false;
     }
-    tail.contains("notabot") || tail.contains("unusualtraffic")
+    let collapsed = span.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.contains("not a bot") || collapsed.contains("unusual traffic")
 }
 
 /// The backoff reason + window staged for a rung outcome; `None` for
@@ -1938,6 +1941,55 @@ mod tests {
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_compact_reason_is_transport_not_a_bot_wall() {
+        // `"notabot"` as one word is not the bot-check phrase — word
+        // boundaries must survive the whitespace normalization, so a
+        // compact unrelated reason stays a truncated refusal.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"notabot\",";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 2);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_bot_check_with_json_spacing_books_bot() {
+        // Pretty-printed JSON can stretch the phrase's whitespace —
+        // `"not   a    bot"` is still the bot-check reason.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body =
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not   a    bot";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
         assert_eq!(h.pot_calls, 1);
     }
 
