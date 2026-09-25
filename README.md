@@ -46,8 +46,9 @@ repo — layout, payload format, and key custody are documented in
 Guest crates depend on `auqw-guest-sdk` by path under a versioned
 `vendor/auqw-guest-sdk-<version>/` directory — the `cargo package`d
 source of the authoritative SDK in `../auqw/sdk/rust`, including its
-GPL-3.0-only license text. Guests currently build on 0.3.0; ABI
-revisions coexist as sibling vendor dirs. Normal builds never reach
+GPL-3.0-only license text. Guests currently build on 0.3.0; a vendor dir
+persists only while a guest still builds against it (0.2.0 was dropped
+once every guest moved to 0.3.0). Normal builds never reach
 into a sibling checkout; this repo builds standalone.
 
 To refresh the vendor copy after an authoritative SDK change, a
@@ -68,7 +69,6 @@ vendor directory.
 | `plugins/youtube-music` | `playback.resolve` + `playback.candidates` + `radio.seed` guest (ABI 0.3.0) |
 | `plugins/itunes` | iTunes catalog guest (`catalog.search`/`metadata`/`artwork`) |
 | `plugins/deezer` | Deezer catalog guest (`catalog.search`/`metadata`/`entity`, ABI 0.3.0) |
-| `vendor/auqw-guest-sdk-0.2.0` | Packaged guest SDK 0.2.0 source |
 | `vendor/auqw-guest-sdk-0.3.0` | Packaged guest SDK 0.3.0 source |
 | `tooling/validate` | Standalone artifact validator |
 | `tooling/build.sh` | Build + stage + validate one plugin |
