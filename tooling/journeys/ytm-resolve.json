@@ -1,0 +1,42 @@
+{
+  "name": "youtube-music playback.resolve — plain-URL pick probes tail and serves",
+  "plugin": "youtube-music",
+  "capability": "playback.resolve",
+  "request": {
+    "source_ref": {
+      "provider": "youtube-music",
+      "kind": "track",
+      "id": "dQw4w9WgXcQ"
+    },
+    "target_bitrate_kbps": 128
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/player",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/player-ok-plain-urls.json"
+    },
+    {
+      "url_contains": "googlevideo.com",
+      "status": 206,
+      "request_headers": {
+        "range": "bytes=4492129-4557664"
+      },
+      "headers": {
+        "content-range": "bytes 4492129-4557664/4557665"
+      },
+      "body_file": "../../plugins/youtube-music/fixtures/probe-tail.bin"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "client": "VISIONOS",
+      "itag": 140,
+      "mime": "audio/mp4",
+      "bitrate_kbps": 130,
+      "content_length": 4557665
+    },
+    "max_http_calls": 2
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "itunes catalog.artwork — substituted 600px URL",
+  "plugin": "itunes",
+  "capability": "catalog.artwork",
+  "request": {
+    "ref": { "provider": "itunes", "kind": "track", "id": "1440761789" },
+    "size": 600
+  },
+  "upstreams": [
+    {
+      "url_contains": "itunes.apple.com/lookup",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/lookup.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "source_ref": {
+        "provider": "itunes",
+        "kind": "track",
+        "id": "1440761789"
+      },
+      "items": [
+        {
+          "url": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/600x600bb.jpg",
+          "width": 600,
+          "height": 600
+        }
+      ]
+    },
+    "max_http_calls": 1
+  }
+}
