@@ -445,11 +445,16 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             if !(200..300).contains(&resp.status) {
                 // A flagged IP's wall arrives as a bare 403 — Google's
                 // abuse edge answers with an HTML "automated queries"
-                // interstitial, never a playabilityStatus body. That is
-                // the bot wall in transport form: the attested replay
-                // is its remedy, so it books exactly like a body-
-                // classified BotCheck (position, backoff, replay).
-                let outcome = if resp.status == 403 {
+                // interstitial, never a JSON body. That is the bot
+                // wall in transport form: the attested replay is its
+                // remedy, so it books exactly like a body-classified
+                // BotCheck (position, backoff, replay). A 403 that
+                // does carry a JSON envelope is an API-level refusal
+                // for that client, not the edge — keep transport
+                // semantics and let later rungs try.
+                let interstitial = resp.status == 403
+                    && resp.body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{');
+                let outcome = if interstitial {
                     RungOutcome::Bot
                 } else if resp.status == 429 {
                     RungOutcome::RateLimited
@@ -1804,6 +1809,29 @@ mod tests {
         // still-walled rung's persists.
         assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
         assert!(h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+    }
+
+    #[test]
+    fn forbidden_json_body_is_transport_not_a_bot_wall() {
+        // A 403 carrying a JSON error envelope is an API-level refusal
+        // for that client — not the abuse-edge interstitial. It must
+        // not consume the bot-check budget, and no mint fires.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = h.answer(&out, 403, "{\"error\":{\"code\":403}}");
+        // Rung 0 recorded Transport → the ladder continues to rung 1.
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "IOS");
+        // The one mint is the finish_pick decoration — the JSON-403
+        // rung booked Transport, so no attested replay ever ran.
+        assert_eq!(h.pot_calls, 1);
     }
 
     #[test]
