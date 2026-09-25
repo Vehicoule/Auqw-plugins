@@ -328,11 +328,49 @@ fn truncated_bot_check(body: &[u8]) -> bool {
     let Some(at) = blob.find("playabilitystatus") else {
         return false;
     };
-    let tail = &blob[at..];
+    let rest = &blob.as_bytes()[at..];
+    let Some(open) = rest.iter().position(|b| *b == b'{') else {
+        return false;
+    };
+    // The `playabilityStatus` object's own span — braces inside string
+    // values don't count, and a truncated object runs to the end. A
+    // `"status":"ok"` after this span belongs to an unrelated field.
+    let mut depth = 0i32;
+    let mut end = rest.len();
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, b) in rest.iter().enumerate().skip(open) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if *b == b'\\' {
+                escaped = true;
+            } else if *b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match *b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let tail: String = String::from_utf8_lossy(&rest[open..end])
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     if tail.contains("\"status\":\"ok\"") {
         return false;
     }
-    tail.contains("not a bot") || tail.contains("unusual traffic")
+    tail.contains("notabot") || tail.contains("unusualtraffic")
 }
 
 /// The backoff reason + window staged for a rung outcome; `None` for
@@ -1916,6 +1954,33 @@ mod tests {
         let out = begin(&mut h);
         let body =
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_bot_check_ignores_an_unrelated_later_ok_status() {
+        // An unrelated `"status":"OK"` after the playabilityStatus
+        // object must not veto its bot-check reason — the marker scan
+        // is bounded to that object's own span.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not a bot\"},\"metadata\":{\"status\":\"OK\"},";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         assert_eq!(rung_of(&out), 0);
