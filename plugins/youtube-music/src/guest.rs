@@ -443,7 +443,15 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 };
             }
             if !(200..300).contains(&resp.status) {
-                let outcome = if resp.status == 429 {
+                // A flagged IP's wall arrives as a bare 403 — Google's
+                // abuse edge answers with an HTML "automated queries"
+                // interstitial, never a playabilityStatus body. That is
+                // the bot wall in transport form: the attested replay
+                // is its remedy, so it books exactly like a body-
+                // classified BotCheck (position, backoff, replay).
+                let outcome = if resp.status == 403 {
+                    RungOutcome::Bot
+                } else if resp.status == 429 {
                     RungOutcome::RateLimited
                 } else {
                     RungOutcome::Transport
@@ -455,6 +463,15 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
                 record(&mut outcomes, attested, i, &bot_positions, outcome);
+                if !attested && outcome == RungOutcome::Bot {
+                    bot_positions.push((i, outcomes.len() - 1));
+                    bot_checks += 1;
+                    // Same bare-pass budget as a body-classified
+                    // BotCheck — the second transport wall ends it.
+                    if bot_checks >= 2 {
+                        break;
+                    }
+                }
                 continue;
             }
             // A 2xx player response must be a JSON envelope carrying
@@ -1782,6 +1799,42 @@ mod tests {
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "VISIONOS");
         // One mint served both attestation and the URL decoration.
+        assert_eq!(h.pot_calls, 1);
+        // The recovered rung's staged bot-backoff was cleared; the
+        // still-walled rung's persists.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+    }
+
+    #[test]
+    fn forbidden_player_response_gets_an_attested_replay() {
+        // The wall's transport shape: Google's abuse edge answers a
+        // flagged IP's player request with a bare 403 and an HTML
+        // interstitial — never JSON. It books like a BotCheck so the
+        // attested replay fires (a Transport verdict never did).
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        // The second transport wall ends the bare pass; the mint
+        // fires and pass 2 replays rung 0 attested.
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        // The attested rung resolves: pick -> probe -> done.
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        assert!(url_of(&out).contains("pot=tok-xyz"));
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
         assert_eq!(h.pot_calls, 1);
         // The recovered rung's staged bot-backoff was cleared; the
         // still-walled rung's persists.
