@@ -318,6 +318,23 @@ fn outcome_for_reason(reason: &str) -> RungOutcome {
     }
 }
 
+/// Bot-check recovery for a JSON-shaped 403 body that failed to parse:
+/// the wall truncated mid-envelope still carries a recognizable partial
+/// `playabilityStatus` — a non-OK status plus the same reason markers
+/// `classify_playability` keys on. Anything else (an `error` envelope,
+/// an ambiguous prefix) is an API refusal, not the wall.
+fn truncated_bot_check(body: &[u8]) -> bool {
+    let blob = String::from_utf8_lossy(body).to_lowercase();
+    let Some(at) = blob.find("playabilitystatus") else {
+        return false;
+    };
+    let tail = &blob[at..];
+    if tail.contains("\"status\":\"ok\"") {
+        return false;
+    }
+    tail.contains("not a bot") || tail.contains("unusual traffic")
+}
+
 /// The backoff reason + window staged for a rung outcome; `None` for
 /// deterministic content answers that are not weather.
 fn backoff_for(outcome: RungOutcome) -> Option<(&'static str, u64)> {
@@ -474,8 +491,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
                         (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
                         (true, None) => {
-                            let blob = String::from_utf8_lossy(&resp.body).to_lowercase();
-                            if blob.contains("not a bot") || blob.contains("unusual traffic") {
+                            if truncated_bot_check(&resp.body) {
                                 RungOutcome::Bot
                             } else {
                                 RungOutcome::Transport
@@ -1872,7 +1888,9 @@ mod tests {
             ..Harness::new()
         };
         let out = begin(&mut h);
-        let out = h.answer(&out, 403, "{\"error\":{\"code\":403,");
+        // A marker phrase outside `playabilityStatus` (here inside an
+        // `error` envelope) is not the wall — it must not book Bot.
+        let out = h.answer(&out, 403, "{\"error\":{\"message\":\"not a bot\",");
         let out = h.answer(&out, 403, "{\"error\":{\"code\":403,");
         // Two truncated refusals must not trip the 2-strike bot
         // budget — the ladder continues bare to rung 2.
