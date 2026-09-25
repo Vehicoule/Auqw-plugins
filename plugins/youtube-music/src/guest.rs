@@ -318,6 +318,64 @@ fn outcome_for_reason(reason: &str) -> RungOutcome {
     }
 }
 
+/// Bot-check recovery for a JSON-shaped 403 body that failed to parse:
+/// the wall truncated mid-envelope still carries a recognizable partial
+/// `playabilityStatus` — a non-OK status plus the same reason markers
+/// `classify_playability` keys on. Anything else (an `error` envelope,
+/// an ambiguous prefix) is an API refusal, not the wall.
+fn truncated_bot_check(body: &[u8]) -> bool {
+    let blob = String::from_utf8_lossy(body).to_lowercase();
+    let Some(at) = blob.find("playabilitystatus") else {
+        return false;
+    };
+    let rest = &blob.as_bytes()[at..];
+    let Some(open) = rest.iter().position(|b| *b == b'{') else {
+        return false;
+    };
+    // The `playabilityStatus` object's own span — braces inside string
+    // values don't count, and a truncated object runs to the end. A
+    // `"status":"ok"` after this span belongs to an unrelated field.
+    let mut depth = 0i32;
+    let mut end = rest.len();
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, b) in rest.iter().enumerate().skip(open) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if *b == b'\\' {
+                escaped = true;
+            } else if *b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match *b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let span = String::from_utf8_lossy(&rest[open..end]).to_lowercase();
+    // Whitespace INSIDE a phrase is flexible (JSON pretty-printing
+    // varies) but the phrase's word boundaries are not — `"notabot"`
+    // is not `"not a bot"`. The compact form only checks structural
+    // JSON (`"status":"ok"`), where no word boundary can be lost.
+    let compact: String = span.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.contains("\"status\":\"ok\"") {
+        return false;
+    }
+    let collapsed = span.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.contains("not a bot") || collapsed.contains("unusual traffic")
+}
+
 /// The backoff reason + window staged for a rung outcome; `None` for
 /// deterministic content answers that are not weather.
 fn backoff_for(outcome: RungOutcome) -> Option<(&'static str, u64)> {
@@ -443,7 +501,46 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 };
             }
             if !(200..300).contains(&resp.status) {
-                let outcome = if resp.status == 429 {
+                // A flagged IP's wall arrives as a bare 403 — Google's
+                // abuse edge answers with an HTML "automated queries"
+                // interstitial, never a JSON body. That is the bot
+                // wall in transport form: the attested replay is its
+                // remedy, so it books exactly like a body-classified
+                // BotCheck (position, backoff, replay). A 403 that
+                // does carry a JSON envelope is classified by its
+                // playabilityStatus — a bot-check inside is still a
+                // wall; anything else is an API-level refusal for that
+                // client, not the edge. A body shaped like JSON that
+                // fails to parse (a truncated refusal) books Transport
+                // — unless its surviving prefix still carries a
+                // bot-check marker, which is the wall truncated, not a
+                // refusal. Only a non-JSON body books Bot outright.
+                let outcome = if resp.status == 403 {
+                    let looks_json = resp
+                        .body
+                        .iter()
+                        .find(|b| !b.is_ascii_whitespace())
+                        .is_some_and(|b| *b == b'{' || *b == b'[');
+                    match (
+                        looks_json,
+                        serde_json::from_slice::<Value>(&resp.body)
+                            .ok()
+                            .map(|b| classify_playability(&b).0),
+                    ) {
+                        (false, _) | (_, Some(Playability::BotCheck)) => RungOutcome::Bot,
+                        (_, Some(Playability::SignInRequired)) => RungOutcome::SignIn,
+                        (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
+                        (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
+                        (true, None) => {
+                            if truncated_bot_check(&resp.body) {
+                                RungOutcome::Bot
+                            } else {
+                                RungOutcome::Transport
+                            }
+                        }
+                        (_, Some(Playability::Ok)) => RungOutcome::Transport,
+                    }
+                } else if resp.status == 429 {
                     RungOutcome::RateLimited
                 } else {
                     RungOutcome::Transport
@@ -455,6 +552,15 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
                 record(&mut outcomes, attested, i, &bot_positions, outcome);
+                if !attested && outcome == RungOutcome::Bot {
+                    bot_positions.push((i, outcomes.len() - 1));
+                    bot_checks += 1;
+                    // Same bare-pass budget as a body-classified
+                    // BotCheck — the second transport wall ends it.
+                    if bot_checks >= 2 {
+                        break;
+                    }
+                }
                 continue;
             }
             // A 2xx player response must be a JSON envelope carrying
@@ -1782,6 +1888,224 @@ mod tests {
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "VISIONOS");
         // One mint served both attestation and the URL decoration.
+        assert_eq!(h.pot_calls, 1);
+        // The recovered rung's staged bot-backoff was cleared; the
+        // still-walled rung's persists.
+        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+    }
+
+    #[test]
+    fn forbidden_json_body_is_transport_not_a_bot_wall() {
+        // A 403 carrying a JSON error envelope is an API-level refusal
+        // for that client — not the abuse-edge interstitial. It must
+        // not consume the bot-check budget, and no mint fires.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = h.answer(&out, 403, "{\"error\":{\"code\":403}}");
+        // Rung 0 recorded Transport → the ladder continues to rung 1.
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "IOS");
+        // The one mint is the finish_pick decoration — the JSON-403
+        // rung booked Transport, so no attested replay ever ran.
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_truncated_json_is_transport_not_a_bot_wall() {
+        // A 403 carrying a JSON-shaped body that fails to parse is a
+        // truncated API refusal — not the abuse-edge interstitial.
+        // Booking it Bot would end the bare pass early and replay
+        // only the walled rungs, skipping a later playable client.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        // A marker phrase outside `playabilityStatus` (here inside an
+        // `error` envelope) is not the wall — it must not book Bot.
+        let out = h.answer(&out, 403, "{\"error\":{\"message\":\"not a bot\",");
+        let out = h.answer(&out, 403, "{\"error\":{\"code\":403,");
+        // Two truncated refusals must not trip the 2-strike bot
+        // budget — the ladder continues bare to rung 2.
+        assert_eq!(rung_of(&out), 2);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_compact_reason_is_transport_not_a_bot_wall() {
+        // `"notabot"` as one word is not the bot-check phrase — word
+        // boundaries must survive the whitespace normalization, so a
+        // compact unrelated reason stays a truncated refusal.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"notabot\",";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 2);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_bot_check_with_json_spacing_books_bot() {
+        // Pretty-printed JSON can stretch the phrase's whitespace —
+        // `"not   a    bot"` is still the bot-check reason.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body =
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not   a    bot";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_truncated_bot_check_gets_an_attested_replay() {
+        // A 403 cut short mid-envelope cannot be parsed, but when the
+        // surviving prefix still carries the bot-check marker it is
+        // the wall truncated, not a refusal — it must book Bot and
+        // enter the attested replay like the complete body does.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body =
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_bot_check_ignores_an_unrelated_later_ok_status() {
+        // An unrelated `"status":"OK"` after the playabilityStatus
+        // object must not veto its bot-check reason — the marker scan
+        // is bounded to that object's own span.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not a bot\"},\"metadata\":{\"status\":\"OK\"},";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_json_bot_check_gets_an_attested_replay() {
+        // A JSON envelope can still carry the wall: a 403 whose
+        // playabilityStatus is a bot-check books like the HTML
+        // interstitial — attested replay, not a transport shrug.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body =
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_player_response_gets_an_attested_replay() {
+        // The wall's transport shape: Google's abuse edge answers a
+        // flagged IP's player request with a bare 403 and an HTML
+        // interstitial — never JSON. It books like a BotCheck so the
+        // attested replay fires (a Transport verdict never did).
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        // The second transport wall ends the bare pass; the mint
+        // fires and pass 2 replays rung 0 attested.
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        // The attested rung resolves: pick -> probe -> done.
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        assert!(url_of(&out).contains("pot=tok-xyz"));
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
         assert_eq!(h.pot_calls, 1);
         // The recovered rung's staged bot-backoff was cleared; the
         // still-walled rung's persists.

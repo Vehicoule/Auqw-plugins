@@ -177,7 +177,10 @@ preserved for the host.
 
 ## Failure mapping
 
-Per rung: non-2xx advances the ladder (429 is remembered), bot-check /
+Per rung: non-2xx advances the ladder (429 is remembered; a 403
+carrying a non-JSON body — the abuse edge's HTML interstitial —
+books as bot-check, a 403 with a JSON envelope stays transport),
+bot-check /
 sign-in / age / unavailable playability advances, SABR / ciphered /
 no-audio advances, and a refused tail probe advances as `capped`. A
 3xx probe is re-requested once against its `Location` — the host
