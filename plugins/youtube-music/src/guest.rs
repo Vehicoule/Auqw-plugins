@@ -449,13 +449,21 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 // wall in transport form: the attested replay is its
                 // remedy, so it books exactly like a body-classified
                 // BotCheck (position, backoff, replay). A 403 that
-                // does carry a JSON envelope is an API-level refusal
-                // for that client, not the edge — keep transport
-                // semantics and let later rungs try.
-                let interstitial = resp.status == 403
-                    && resp.body.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'{');
-                let outcome = if interstitial {
-                    RungOutcome::Bot
+                // does carry a JSON envelope is classified by its
+                // playabilityStatus — a bot-check inside is still a
+                // wall; anything else is an API-level refusal for that
+                // client, not the edge.
+                let outcome = if resp.status == 403 {
+                    match serde_json::from_slice::<Value>(&resp.body)
+                        .ok()
+                        .map(|b| classify_playability(&b).0)
+                    {
+                        None | Some(Playability::BotCheck) => RungOutcome::Bot,
+                        Some(Playability::SignInRequired) => RungOutcome::SignIn,
+                        Some(Playability::AgeRestricted) => RungOutcome::Age,
+                        Some(Playability::Unavailable) => RungOutcome::Unavailable,
+                        Some(Playability::Ok) => RungOutcome::Transport,
+                    }
                 } else if resp.status == 429 {
                     RungOutcome::RateLimited
                 } else {
@@ -1831,6 +1839,34 @@ mod tests {
         assert_eq!(out["result"]["client"], "IOS");
         // The one mint is the finish_pick decoration — the JSON-403
         // rung booked Transport, so no attested replay ever ran.
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_json_bot_check_gets_an_attested_replay() {
+        // A JSON envelope can still carry the wall: a 403 whose
+        // playabilityStatus is a bot-check books like the HTML
+        // interstitial — attested replay, not a transport shrug.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body =
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
         assert_eq!(h.pot_calls, 1);
     }
 
