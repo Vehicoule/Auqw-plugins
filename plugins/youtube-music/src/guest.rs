@@ -453,9 +453,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 // playabilityStatus — a bot-check inside is still a
                 // wall; anything else is an API-level refusal for that
                 // client, not the edge. A body shaped like JSON that
-                // fails to parse (a truncated refusal) is that same
-                // refusal, not the wall — only a non-JSON body books
-                // Bot.
+                // fails to parse (a truncated refusal) books Transport
+                // — unless its surviving prefix still carries a
+                // bot-check marker, which is the wall truncated, not a
+                // refusal. Only a non-JSON body books Bot outright.
                 let outcome = if resp.status == 403 {
                     let looks_json = resp
                         .body
@@ -469,10 +470,18 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             .map(|b| classify_playability(&b).0),
                     ) {
                         (false, _) | (_, Some(Playability::BotCheck)) => RungOutcome::Bot,
-                        (true, None) | (_, Some(Playability::Ok)) => RungOutcome::Transport,
                         (_, Some(Playability::SignInRequired)) => RungOutcome::SignIn,
                         (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
                         (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
+                        (true, None) => {
+                            let blob = String::from_utf8_lossy(&resp.body).to_lowercase();
+                            if blob.contains("not a bot") || blob.contains("unusual traffic") {
+                                RungOutcome::Bot
+                            } else {
+                                RungOutcome::Transport
+                            }
+                        }
+                        (_, Some(Playability::Ok)) => RungOutcome::Transport,
                     }
                 } else if resp.status == 429 {
                     RungOutcome::RateLimited
@@ -1873,6 +1882,35 @@ mod tests {
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_truncated_bot_check_gets_an_attested_replay() {
+        // A 403 cut short mid-envelope cannot be parsed, but when the
+        // surviving prefix still carries the bot-check marker it is
+        // the wall truncated, not a refusal — it must book Bot and
+        // enter the attested replay like the complete body does.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let body =
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot";
+        let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        assert_eq!(rung_of(&out), 0);
+        let body = body_of(&out);
+        assert_eq!(
+            body["context"]["serviceIntegrityDimensions"]["poToken"],
+            "tok-xyz"
+        );
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
         assert_eq!(h.pot_calls, 1);
     }
 
