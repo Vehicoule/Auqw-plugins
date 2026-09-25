@@ -1,0 +1,6 @@
+# Release artifacts are byte-hashed into provenance.json and ed25519-signed
+# (tooling/sign.mjs): a checkout must reproduce the exact signed bytes.
+# core.autocrlf CRLF rewriting on Windows makes the digests differ, so
+# text is pinned to LF and .wasm stays opaque to text detection.
+* text=auto eol=lf
+*.wasm binary
