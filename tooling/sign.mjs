@@ -7,7 +7,7 @@
 //   tooling/sign.mjs pubkey                print key_id + public PEM
 //
 // The keypair lives outside every repository (default
-// /Users/btw/Documents/Repo/keys/auqw-ed25519.json; override with
+// ~/.auqw/keys/auqw-ed25519.json; override with
 // --key-file <path> or AUQW_KEY_FILE). The private key is never printed.
 //
 // `sign` reads <plugin-dir>/manifest.json (or plugin.manifest.json) and
@@ -30,11 +30,12 @@
 
 import { createHash, generateKeyPairSync, sign as edSign, verify as edVerify, createPublicKey } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, copyFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const DEFAULT_KEY_FILE = '/Users/btw/Documents/Repo/keys/auqw-ed25519.json';
+const DEFAULT_KEY_FILE = join(homedir(), '.auqw', 'keys', 'auqw-ed25519.json');
 const RELEASES_DIR = join(REPO_ROOT, 'releases');
 
 const fail = (msg) => {

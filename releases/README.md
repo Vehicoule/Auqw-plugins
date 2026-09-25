@@ -62,10 +62,10 @@ file, or bad signature exits non-zero.
 
 ## Key custody
 
-Signing keys live at **`/Users/btw/Documents/Repo/keys/`** — outside all
-repositories, never committed, never copied into a checkout
-([AGENTS.md](../AGENTS.md): no secrets in code). The keypair file
-`auqw-ed25519.json` is created by:
+Signing keys live at **`~/.auqw/keys/`** (mode 600, created by
+`keygen`) — outside all repositories, never committed, never copied into
+a checkout ([AGENTS.md](../AGENTS.md): no secrets in code). The keypair
+file `auqw-ed25519.json` is created by:
 
 ```sh
 node tooling/sign.mjs keygen     # mode 600; refuses to overwrite without --force
