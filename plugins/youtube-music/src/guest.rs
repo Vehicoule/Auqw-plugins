@@ -452,17 +452,27 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 // does carry a JSON envelope is classified by its
                 // playabilityStatus — a bot-check inside is still a
                 // wall; anything else is an API-level refusal for that
-                // client, not the edge.
+                // client, not the edge. A body shaped like JSON that
+                // fails to parse (a truncated refusal) is that same
+                // refusal, not the wall — only a non-JSON body books
+                // Bot.
                 let outcome = if resp.status == 403 {
-                    match serde_json::from_slice::<Value>(&resp.body)
-                        .ok()
-                        .map(|b| classify_playability(&b).0)
-                    {
-                        None | Some(Playability::BotCheck) => RungOutcome::Bot,
-                        Some(Playability::SignInRequired) => RungOutcome::SignIn,
-                        Some(Playability::AgeRestricted) => RungOutcome::Age,
-                        Some(Playability::Unavailable) => RungOutcome::Unavailable,
-                        Some(Playability::Ok) => RungOutcome::Transport,
+                    let looks_json = resp
+                        .body
+                        .iter()
+                        .find(|b| !b.is_ascii_whitespace())
+                        .is_some_and(|b| *b == b'{' || *b == b'[');
+                    match (
+                        looks_json,
+                        serde_json::from_slice::<Value>(&resp.body)
+                            .ok()
+                            .map(|b| classify_playability(&b).0),
+                    ) {
+                        (false, _) | (_, Some(Playability::BotCheck)) => RungOutcome::Bot,
+                        (true, None) | (_, Some(Playability::Ok)) => RungOutcome::Transport,
+                        (_, Some(Playability::SignInRequired)) => RungOutcome::SignIn,
+                        (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
+                        (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
                     }
                 } else if resp.status == 429 {
                     RungOutcome::RateLimited
@@ -1839,6 +1849,30 @@ mod tests {
         assert_eq!(out["result"]["client"], "IOS");
         // The one mint is the finish_pick decoration — the JSON-403
         // rung booked Transport, so no attested replay ever ran.
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn forbidden_truncated_json_is_transport_not_a_bot_wall() {
+        // A 403 carrying a JSON-shaped body that fails to parse is a
+        // truncated API refusal — not the abuse-edge interstitial.
+        // Booking it Bot would end the bare pass early and replay
+        // only the walled rungs, skipping a later playable client.
+        let mut h = Harness {
+            pot: Pot::Token("tok-xyz"),
+            ..Harness::new()
+        };
+        let out = begin(&mut h);
+        let out = h.answer(&out, 403, "{\"error\":{\"code\":403,");
+        let out = h.answer(&out, 403, "{\"error\":{\"code\":403,");
+        // Two truncated refusals must not trip the 2-strike bot
+        // budget — the ladder continues bare to rung 2.
+        assert_eq!(rung_of(&out), 2);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
         assert_eq!(h.pot_calls, 1);
     }
 
