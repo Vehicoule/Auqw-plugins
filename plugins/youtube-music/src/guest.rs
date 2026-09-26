@@ -318,6 +318,41 @@ fn outcome_for_reason(reason: &str) -> RungOutcome {
     }
 }
 
+/// Unicode escapes hide marker whitespace: a reason whose spaces
+/// arrive as `\u0020` never matches the byte-level phrase scan until
+/// the escapes decode. Only the `\uXXXX` form matters here; `\"` and
+/// friends stay escaped so they can't fake structure.
+fn unescape_json_unicode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'u') {
+            chars.next();
+            let mut code = 0u32;
+            let mut ok = true;
+            for _ in 0..4 {
+                match chars.next().and_then(|h| h.to_digit(16)) {
+                    Some(d) => code = code * 16 + d,
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            match ok.then(|| char::from_u32(code)).flatten() {
+                Some(decoded) => out.push(decoded),
+                None => {
+                    out.push('\\');
+                    out.push('u');
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Bot-check recovery for a JSON-shaped 403 body that failed to parse:
 /// the wall truncated mid-envelope still carries a recognizable partial
 /// `playabilityStatus` — a non-OK status plus the same reason markers
@@ -325,21 +360,44 @@ fn outcome_for_reason(reason: &str) -> RungOutcome {
 /// an ambiguous prefix) is an API refusal, not the wall.
 fn truncated_bot_check(body: &[u8]) -> bool {
     let blob = String::from_utf8_lossy(body).to_lowercase();
-    let Some(at) = blob.find("playabilitystatus") else {
-        return false;
+    // Anchor on the quoted, colon-bound KEY — a bare `playabilitystatus`
+    // substring inside a string value or a longer key (`xPlayabilityStatus`)
+    // would misplace the whole span scan.
+    let mut search = 0usize;
+    let open = loop {
+        let Some(found) = blob[search..].find("\"playabilitystatus\"") else {
+            return false;
+        };
+        let after = search + found + "\"playabilitystatus\"".len();
+        let mut i = after;
+        while blob
+            .as_bytes()
+            .get(i)
+            .is_some_and(|b| b.is_ascii_whitespace())
+        {
+            i += 1;
+        }
+        if blob.as_bytes().get(i) != Some(&b':') {
+            search = after;
+            continue;
+        }
+        match blob.as_bytes()[i + 1..].iter().position(|b| *b == b'{') {
+            Some(o) => break i + 1 + o,
+            None => return false,
+        }
     };
-    let rest = &blob.as_bytes()[at..];
-    let Some(open) = rest.iter().position(|b| *b == b'{') else {
-        return false;
-    };
+    let rest = &blob.as_bytes()[open..];
     // The `playabilityStatus` object's own span — braces inside string
     // values don't count, and a truncated object runs to the end. A
-    // `"status":"ok"` after this span belongs to an unrelated field.
+    // `"status":"ok"` veto is only trustworthy on a CLOSED span: in an
+    // unclosed tail it can belong to a later sibling field, and
+    // vetoing a genuine wall marker books the wall as Transport.
     let mut depth = 0i32;
     let mut end = rest.len();
+    let mut closed = false;
     let mut in_str = false;
     let mut escaped = false;
-    for (i, b) in rest.iter().enumerate().skip(open) {
+    for (i, b) in rest.iter().enumerate() {
         if in_str {
             if escaped {
                 escaped = false;
@@ -357,19 +415,20 @@ fn truncated_bot_check(body: &[u8]) -> bool {
                 depth -= 1;
                 if depth == 0 {
                     end = i;
+                    closed = true;
                     break;
                 }
             }
             _ => {}
         }
     }
-    let span = String::from_utf8_lossy(&rest[open..end]).to_lowercase();
+    let span = unescape_json_unicode(&String::from_utf8_lossy(&rest[..end])).to_lowercase();
     // Whitespace INSIDE a phrase is flexible (JSON pretty-printing
     // varies) but the phrase's word boundaries are not — `"notabot"`
     // is not `"not a bot"`. The compact form only checks structural
     // JSON (`"status":"ok"`), where no word boundary can be lost.
     let compact: String = span.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact.contains("\"status\":\"ok\"") {
+    if closed && compact.contains("\"status\":\"ok\"") {
         return false;
     }
     let collapsed = span.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -516,14 +575,20 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 // bot-check marker, which is the wall truncated, not a
                 // refusal. Only a non-JSON body books Bot outright.
                 let outcome = if resp.status == 403 {
-                    let looks_json = resp
+                    // A UTF-8 BOM precedes some stacks' JSON emitters —
+                    // strip it or a valid envelope looks non-JSON and
+                    // books Bot on shape alone.
+                    let body = resp
                         .body
+                        .strip_prefix(b"\xEF\xBB\xBF")
+                        .unwrap_or(&resp.body);
+                    let looks_json = body
                         .iter()
                         .find(|b| !b.is_ascii_whitespace())
                         .is_some_and(|b| *b == b'{' || *b == b'[');
                     match (
                         looks_json,
-                        serde_json::from_slice::<Value>(&resp.body)
+                        serde_json::from_slice::<Value>(body)
                             .ok()
                             .map(|b| classify_playability(&b).0),
                     ) {
@@ -532,7 +597,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
                         (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
                         (true, None) => {
-                            if truncated_bot_check(&resp.body) {
+                            if truncated_bot_check(body) {
                                 RungOutcome::Bot
                             } else {
                                 RungOutcome::Transport
