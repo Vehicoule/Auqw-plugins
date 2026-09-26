@@ -89,15 +89,21 @@ Keystroke-time query completions over the WEB_REMIX
 `music/get_search_suggestions` endpoint — the same client identity,
 headers, and `visitor/web-remix` KV as search. The payload is
 `{input, limit?}`: `input` is required (1..=256 chars, trimmed),
-`limit` defaults to 10 and caps at 20. The result is
+`limit` defaults to 10 and clamps to 20. The result is
 `{suggestions: [..]}` — flat strings in upstream order, exact
 duplicates collapsed, whitespace-only rows dropped, and
 `historySuggestionRenderer` rows (the caller's own history, already
-known to the host) skipped. One request per invocation; the guest
-never loops. Error mapping mirrors `playback.candidates`: 429 →
-`rate-limit`, other non-2xx and transport host errors → `transient`,
+known to the host) skipped. Each row emits its canonical
+`navigationEndpoint.searchEndpoint.query` — display runs can drop
+word separators at bold splits, so joined `suggestion.runs` text is
+only the fallback for rows without a navigation endpoint. One request
+per invocation; the guest never loops. Error mapping mirrors
+`playback.candidates`: 429 → `rate-limit`, other non-2xx and
+transport host errors → `transient`,
 `cancelled`/`permission-denied`/`invalid-response` propagate, a
-non-object 2xx body → `invalid-response`.
+non-object 2xx body or one missing the suggestion section →
+`invalid-response` (a present but empty section is the honest "no
+completions").
 
 ## radio.seed
 

@@ -42,10 +42,10 @@ fn parse_suggest_payload(payload: &Value) -> Result<SuggestPayload, GuestError> 
     let limit = match obj.get("limit") {
         None | Some(Value::Null) => 10,
         Some(Value::Number(n)) => match n.as_u64() {
-            Some(v) if v >= 1 && v <= MAX_SUGGESTIONS as u64 => v as usize,
-            _ => return Err(bad_payload("limit must be an integer 1..=20")),
+            Some(v) if v >= 1 => (v as usize).min(MAX_SUGGESTIONS),
+            _ => return Err(bad_payload("limit must be a positive integer")),
         },
-        _ => return Err(bad_payload("limit must be an integer 1..=20")),
+        _ => return Err(bad_payload("limit must be a positive integer")),
     };
     Ok(SuggestPayload { input, limit })
 }
@@ -59,9 +59,23 @@ fn suggest_request(input: &str, visitor: Option<&str>) -> HttpRequest {
     web_remix_request(SUGGEST_URL, body, visitor, None)
 }
 
-/// One suggestion row: `suggestion.runs[].text` joined (bold/normal
-/// runs both carry text). Empty results drop, duplicates collapse.
+/// One suggestion row: the canonical query it commits is
+/// `navigationEndpoint.searchEndpoint.query` — display runs can drop
+/// word separators at bold splits, so joined runs are only the
+/// fallback for rows that carry no navigation endpoint. Empty results
+/// drop, duplicates collapse.
 fn suggestion_text(renderer: &Map<String, Value>) -> Option<String> {
+    if let Some(query) = renderer
+        .get("navigationEndpoint")
+        .and_then(|n| n.get("searchEndpoint"))
+        .and_then(|s| s.get("query"))
+        .and_then(Value::as_str)
+    {
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
     let runs = renderer.get("suggestion")?.get("runs")?.as_array()?;
     let mut text = String::new();
     for run in runs {
@@ -108,30 +122,40 @@ pub async fn suggest(payload: &Value) -> Result<Value, GuestError> {
             warn("ignoring malformed visitor value").await?;
         }
     }
-    let mut out: Vec<String> = Vec::new();
-    if let Some(contents) = body
+    // The suggestion section must exist: an upstream error body or an
+    // unexpected shape is `invalid-response`, not an empty completion
+    // set — while a present-but-empty contents array is the honest
+    // "no completions" signal.
+    let contents = body
         .get("contents")
         .and_then(Value::as_array)
         .and_then(|c| c.first())
         .and_then(|s| s.get("searchSuggestionsSectionRenderer"))
         .and_then(|s| s.get("contents"))
         .and_then(Value::as_array)
-    {
-        for item in contents {
-            let renderer = match item
-                .get("searchSuggestionRenderer")
-                .and_then(Value::as_object)
-            {
-                Some(r) => r,
-                None => continue,
-            };
-            if let Some(text) = suggestion_text(renderer) {
-                if !out.contains(&text) {
-                    out.push(text);
-                }
-                if out.len() >= p.limit.min(MAX_SUGGESTIONS) {
-                    break;
-                }
+        .ok_or_else(|| {
+            failed(
+                "invalid-response",
+                "suggest body carries no suggestion section".into(),
+            )
+        })?;
+    let mut out: Vec<String> = Vec::new();
+    // Scan bound: a pathological renderer list is bounded regardless
+    // of how many rows skip or dedupe.
+    for item in contents.iter().take(MAX_SUGGESTIONS * 4) {
+        let renderer = match item
+            .get("searchSuggestionRenderer")
+            .and_then(Value::as_object)
+        {
+            Some(r) => r,
+            None => continue,
+        };
+        if let Some(text) = suggestion_text(renderer) {
+            if !out.contains(&text) {
+                out.push(text);
+            }
+            if out.len() >= p.limit.min(MAX_SUGGESTIONS) {
+                break;
             }
         }
     }
@@ -233,11 +257,12 @@ mod tests {
         let suggestions = out["result"]["suggestions"]
             .as_array()
             .unwrap_or_else(|| panic!("suggestions array"));
-        // Bold/normal runs join; history renderers skip; the exact
-        // duplicate of row 1 collapses; whitespace-only drops.
+        // Canonical `searchEndpoint.query` wins over joined runs (row
+        // 2 would join to "awa 2lacrim"); history renderers skip; the
+        // exact duplicate of row 1 collapses; whitespace-only drops.
         assert_eq!(
             suggestions,
-            &json!(["awa lacrim", "awa 2lacrim", "awa imani"])
+            &json!(["awa lacrim", "awa 2 lacrim", "awa imani"])
                 .as_array()
                 .unwrap_or_else(|| panic!("expected array"))[..]
         );

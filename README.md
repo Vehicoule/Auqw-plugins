@@ -66,7 +66,7 @@ vendor directory.
 
 | Path | Contents |
 | --- | --- |
-| `plugins/youtube-music` | `playback.resolve` + `playback.candidates` + `radio.seed` guest (ABI 0.3.0) |
+| `plugins/youtube-music` | `playback.resolve` + `playback.candidates` + `radio.seed` + `catalog.suggest` guest (ABI 0.3.0) |
 | `plugins/itunes` | iTunes catalog guest (`catalog.search`/`metadata`/`artwork`) |
 | `plugins/deezer` | Deezer catalog guest (`catalog.search`/`metadata`/`entity`, ABI 0.3.0) |
 | `vendor/auqw-guest-sdk-0.3.0` | Packaged guest SDK 0.3.0 source |
