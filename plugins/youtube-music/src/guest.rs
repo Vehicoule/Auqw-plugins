@@ -461,12 +461,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     let _ = p.resume_offset;
     let now = now_ms().await?;
     let mut outcomes: Vec<RungOutcome> = Vec::new();
-    let mut bot_checks = 0u32;
     // Ladder indices that produced `Bot`, paired with the slot that
     // verdict occupies in `outcomes` — the attested pass replays only
-    // these rungs and overwrites the slot, so a superseded bot-check
-    // can't skew the ladder summary. Includes backoff-derived entries:
-    // a staged bot-backoff is exactly what attestation is for.
+    // the attestable ones and overwrites the slot, so a superseded
+    // bot-check can't skew the ladder summary. Includes backoff-derived
+    // entries: a staged bot-backoff is exactly what attestation is for.
     let mut bot_positions: Vec<(usize, usize)> = Vec::new();
     let mut pin_seen = false;
     let mut pin_missing = false;
@@ -623,16 +622,6 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 record(&mut outcomes, attested, i, &bot_positions, outcome);
                 if !attested && outcome == RungOutcome::Bot {
                     bot_positions.push((i, outcomes.len() - 1));
-                    // Only attestable rungs spend the shared budget — a
-                    // bot-check on a rung attestation cannot lift is a
-                    // dead end, not a reason to end the bare pass for
-                    // later rungs that might still serve.
-                    if rung.attestable {
-                        bot_checks += 1;
-                    }
-                    if bot_checks >= 2 {
-                        break;
-                    }
                 }
                 continue;
             }
@@ -698,18 +687,6 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Bot);
                     if !attested {
                         bot_positions.push((i, outcomes.len() - 1));
-                        // Shared invocation budget: the second bot-check
-                        // on an *attestable* rung ends the bare pass —
-                        // attestation is the remedy, not more bare
-                        // requests to rungs the same IP already walled.
-                        // Non-attestable rungs can't be lifted, so their
-                        // bot-checks never consume the budget.
-                        if rung.attestable {
-                            bot_checks += 1;
-                        }
-                        if bot_checks >= 2 {
-                            break;
-                        }
                     }
                     continue;
                 }
@@ -1778,17 +1755,14 @@ mod tests {
     }
 
     #[test]
-    fn second_bot_check_aborts_terminal() {
+    fn bot_check_on_every_rung_is_terminal() {
         let mut h = Harness::new();
-        let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        assert_eq!(rung_of(&out), 1);
-        // A bot-check on the non-attestable rung does not spend the
-        // shared budget — the pass continues.
-        let out = feed(&mut h, &out, BOT);
-        assert_eq!(rung_of(&out), 2);
-        // The second bot-check on an attestable rung ends the resolve.
-        let out = feed(&mut h, &out, BOT);
+        let mut out = begin(&mut h);
+        // No early exit: the bare pass walks every rung, so a fully
+        // walled IP costs the whole ladder before failing.
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "bot-check".to_string())
@@ -1953,17 +1927,19 @@ mod tests {
             pot: Pot::Token("tok-xyz"),
             ..Harness::new()
         };
-        let out = begin(&mut h);
+        let mut out = begin(&mut h);
         // Pass 1 runs bare: no attestation on the wire.
         assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
-        let out = feed(&mut h, &out, BOT);
-        // Rung 1 is not attestable — its bot-check doesn't spend the
-        // budget, so the bare pass continues to rung 2.
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
-        // The second attestable bot-check ends the pass; the mint
-        // fires and pass 2 replays rung 0 attested (rung 1's bot is
-        // never replayed — nothing can lift it).
+        // Pass 1 runs bare and walks the whole ladder: walls on the
+        // Apple rungs never starve the bare-only Android rungs.
+        out = feed(&mut h, &out, BOT); // VISIONOS
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29
+        out = feed(&mut h, &out, BOT); // IOS
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        // The mint fires and pass 2 replays rung 0 attested (rung 1's
+        // wall needs DroidGuard — never replayed).
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2070,6 +2046,12 @@ mod tests {
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2100,6 +2082,12 @@ mod tests {
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2128,6 +2116,12 @@ mod tests {
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2157,6 +2151,12 @@ mod tests {
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2186,8 +2186,12 @@ mod tests {
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
-        // The second attestable transport wall ends the bare pass; the
-        // mint fires and pass 2 replays rung 0 attested.
+        // Walls never end the bare pass — the rest of the ladder still
+        // runs, then pass 2 replays rung 0 attested after the mint.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2238,11 +2242,12 @@ mod tests {
             ..Harness::new()
         };
         let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
-        // Attested replay of rung 0 then rung 2 (rung 1's wall needs
-        // DroidGuard — never replayed) — still walled.
+        let mut out = feed(&mut h, &out, BOT);
+        for _ in 0..7 {
+            out = feed(&mut h, &out, BOT);
+        }
+        // Attested replay of rung 0 then rung 2 (non-attestable walls
+        // need DroidGuard — never replayed) — still walled.
         assert_eq!(rung_of(&out), 0);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(rung_of(&out), 2);
@@ -2264,12 +2269,15 @@ mod tests {
             pot: Pot::Token("tok-xyz"),
             ..Harness::new()
         };
-        let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, SABR);
-        let out = feed(&mut h, &out, BOT);
+        let first = begin(&mut h);
+        let mut out = feed(&mut h, &first, BOT);
+        out = feed(&mut h, &out, SABR);
+        out = feed(&mut h, &out, BOT);
+        for _ in 0..5 {
+            out = feed(&mut h, &out, SABR);
+        }
         assert_eq!(rung_of(&out), 0);
-        let out = feed(&mut h, &out, SABR);
+        out = feed(&mut h, &out, SABR);
         assert_eq!(rung_of(&out), 2);
         let out = feed(&mut h, &out, SABR);
         assert_eq!(
@@ -2284,10 +2292,10 @@ mod tests {
         // resolve with the same typed failure — one locally-denied
         // `pot_token` call is the only added cost.
         let mut h = Harness::new();
-        let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
+        let mut out = begin(&mut h);
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "bot-check".to_string())
@@ -2678,7 +2686,7 @@ mod tests {
     #[test]
     fn pinned_resolve_preserves_uninspectable_player_outcomes() {
         for (body, attempts, expected) in [
-            (BOT, 3, "transient"),
+            (BOT, 8, "transient"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
                 8,

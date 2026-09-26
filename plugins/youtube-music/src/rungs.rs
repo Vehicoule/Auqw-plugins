@@ -43,17 +43,18 @@ impl Rung {
 /// `ANDROID_VR` 1.57.29 — the predecessor plugin's primary context,
 /// proven-bare on real devices with no poToken — runs second so it is
 /// always reached whenever `VISIONOS` walls, before the attestable
-/// bot-check budget can end the bare pass. `IOS` is the second
+/// `IOS` is the second
 /// web-attestable rung (occasionally SABR-only on newer versions —
 /// hence the 20.10.4 pin), then `ANDROID_VR` 1.61.29, plain `ANDROID`,
 /// and the Oculus-pinned `ANDROID_VR` trio.
 ///
-/// Only web-attestable rungs consume the shared bot-check budget: a
-/// bot-check on an `ANDROID*` client demonstrates nothing attestation
-/// can fix (those walls need DroidGuard, not BotGuard), so it never
-/// starves the bare pass for later rungs — it only records the rung's
-/// backoff and moves on. `WEB_REMIX` is excluded permanently — it
-/// requires signature deciphering, which is out of scope by contract.
+/// The bare pass always walks the whole ladder — a bot-check on an
+/// `ANDROID*` client demonstrates nothing attestation can fix (those
+/// walls need DroidGuard, not BotGuard) and no bot-check may starve a
+/// later rung that could still serve, so every rung gets its bare shot
+/// before the attestable rungs replay. `WEB_REMIX` is excluded
+/// permanently — it requires signature deciphering, which is out of
+/// scope by contract.
 ///
 /// Attestation: on a flagged IP the bare `player` call is answered
 /// `LOGIN_REQUIRED`/bot-check. A video-bound BotGuard poToken carried

@@ -47,7 +47,7 @@ serves https destinations.
 ## KV visitors and backoff
 
 Each rung has a stable KV key (`VISIONOS`, `IOS`,
-`ANDROID_VR@<version>`):
+`ANDROID`, `ANDROID_VR@<version>`):
 
 - `visitor/<rung-key>` — the last `responseContext.visitorData` that
   rung returned, replayed as `X-Goog-Visitor-Id`. A fresher visitor
@@ -140,8 +140,8 @@ URL; `cancelled` propagates. The one token serves two consumers:
   Live-verified 2026-09: VISIONOS and IOS return full format lists
   attested where bare requests answer `LOGIN_REQUIRED`; ANDROID_VR
   stays walled (VR needs DroidGuard, not BotGuard). With no POT
-  provider configured the replay never runs and the second
-  attestable bot-check stays terminal as before — one locally-denied `pot_token` call is the only
+  provider configured the replay never runs and an all-walled ladder
+  stays terminal as before — one locally-denied `pot_token` call is the only
   added cost.
 
 Measured 2026-09-19: `pot=` did not lift a capped IOS mint — serving
@@ -192,10 +192,9 @@ no-audio advances, and a refused tail probe advances as `capped`. A
 3xx probe is re-requested once against its `Location` — the host
 enforces the destination allowlist on every request — before the
 verdict lands. A
-second bot-check on a web-attestable
-rung (`VISIONOS`/`IOS`) inside one invocation ends the bare pass —
-walls on `ANDROID*` rungs never spend that budget — and the
-attestable rungs then get one attested replay each when a POT
+bot-check never ends the bare pass — every
+rung gets its bare try — and the walled web-attestable rungs
+(`VISIONOS`/`IOS`) then get one attested replay each when a POT
 provider minted,
 and `transient` (`bot-check`) only when the wall holds anyway. A
 replay's verdict overwrites the rung's `Bot` record — a rung attested
