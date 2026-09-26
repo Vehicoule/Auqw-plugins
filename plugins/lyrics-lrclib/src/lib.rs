@@ -317,11 +317,54 @@ fn plain_from_synced(synced: &str) -> Option<String> {
     }
 }
 
+/// Route one candidate's usable content: a name-matching record inside
+/// the queried duration bound serves immediately; a name-matching
+/// record that *violates* the duration can only defer — the app would
+/// reject it on drift anyway, and a later tier may carry the exact
+/// recording. An unrelated row defers lower still: a wrong edit is a
+/// better last resort than a wrong song, since the app's own drift
+/// check turns the wrong edit into an honest 'unavailable'.
+fn serve_or_defer(
+    rec: &Record,
+    flavor: Flavor,
+    is_match: bool,
+    query_duration_ms: Option<u64>,
+    deferred_matched: &mut Option<Value>,
+    deferred_unrelated: &mut Option<Value>,
+) -> Option<Value> {
+    let result = record_result(rec, flavor, &rec.matched(), is_match)?;
+    let violates = matches!(
+        (rec.duration_ms, query_duration_ms),
+        (Some(got), Some(want)) if got.abs_diff(want) > parse::DRIFT_TOLERANCE_MS
+    );
+    match (is_match, violates) {
+        (true, false) => Some(result),
+        (true, true) => {
+            if deferred_matched.is_none() {
+                *deferred_matched = Some(result);
+            }
+            None
+        }
+        (false, _) => {
+            if deferred_unrelated.is_none() {
+                *deferred_unrelated = Some(result);
+            }
+            None
+        }
+    }
+}
+
 async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
     let q = parse_query(payload)?;
     // The first usable record seen — its `matched` rides the `absent`
     // result so the app can score a near-match that had no lyrics.
     let mut first_matched = Value::Null;
+    // Usable content that may not end the waterfall: a name match whose
+    // duration contradicts the query (the app would reject it on drift)
+    // and rows that do not name the query at all. Both answer only
+    // after every tier's candidates have been tried.
+    let mut deferred_matched: Option<Value> = None;
+    let mut deferred: Option<Value> = None;
     for tier in tiers(&q) {
         let body = match http::get_json(&tier.url).await? {
             http::Outcome::NotFound => continue,
@@ -336,19 +379,57 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
             }
             TierKind::Search => {
                 search_records = parse::parse_search(&body)?;
-                match parse::pick(&search_records, &q.title, q.artist.as_deref()) {
-                    Some(r) => r,
-                    None => continue,
+                // A search answers a whole candidate list, not one
+                // record: walk them evidence-first (name strength,
+                // then duration within the drift bound) and take the
+                // first whose content serves the flavor. Picking a
+                // single row used to discard siblings carrying synced
+                // lyrics — and to serve a wrong-edit record the app
+                // then had to reject on drift.
+                for candidate in parse::ranked(
+                    &search_records,
+                    &q.title,
+                    q.artist.as_deref(),
+                    q.duration_ms,
+                ) {
+                    if first_matched.is_null() {
+                        first_matched = candidate.matched();
+                    }
+                    let is_match = parse::names_query(candidate, &q.title, q.artist.as_deref());
+                    if let Some(result) = serve_or_defer(
+                        candidate,
+                        flavor,
+                        is_match,
+                        q.duration_ms,
+                        &mut deferred_matched,
+                        &mut deferred,
+                    ) {
+                        return Ok(result);
+                    }
                 }
+                continue;
             }
         };
         if first_matched.is_null() {
             first_matched = record.matched();
         }
         let is_match = parse::names_query(record, &q.title, q.artist.as_deref());
-        if let Some(result) = record_result(record, flavor, &record.matched(), is_match) {
+        if let Some(result) = serve_or_defer(
+            record,
+            flavor,
+            is_match,
+            q.duration_ms,
+            &mut deferred_matched,
+            &mut deferred,
+        ) {
             return Ok(result);
         }
+    }
+    // Every tier exhausted without in-bound name-matching content: a
+    // violating name match still beats an unrelated row (the app turns
+    // it into an honest 'unavailable'); either beats `absent` itself.
+    if let Some(result) = deferred_matched.or(deferred) {
+        return Ok(result);
     }
     Ok(match flavor {
         Flavor::Plain => {
@@ -371,6 +452,8 @@ mod tests {
     const GET_INSTRUMENTAL: &str = include_str!("../fixtures/get-instrumental.json");
     const GET_REMASTERED: &str = include_str!("../fixtures/get-remastered.json");
     const SEARCH_HIT: &str = include_str!("../fixtures/search-hit.json");
+    const SEARCH_DEFERRAL: &str = include_str!("../fixtures/search-deferral.json");
+    const SEARCH_WRONG_EDIT: &str = include_str!("../fixtures/search-wrong-edit.json");
     const MISS_404: &str = include_str!("../fixtures/miss-404.json");
     const MALFORMED: &str = include_str!("../fixtures/malformed.json");
 
@@ -522,6 +605,70 @@ mod tests {
         // The plain-only record was the first usable hit: its metadata
         // rides the absent result.
         assert_eq!(out["result"]["matched"]["title"], "Roads");
+    }
+
+    /// A search tier's mixed rows: the name-matching record is
+    /// contentless for the synced flavor and the unrelated row's
+    /// synced lyrics defer — a later tier's real match must still win.
+    #[test]
+    fn search_walks_past_contentless_and_unrelated_rows_to_later_tier() {
+        let req = invoke_request("lyrics.synced", &query());
+        // Both /api/get tiers miss, then the album-scoped search
+        // answers [Roads plain-only (matched, no synced), Roadrunner
+        // (unrelated, synced)] — neither may end the waterfall.
+        let out = answer(&req, 404, MISS_404);
+        let out = answer(&out, 404, MISS_404);
+        assert!(url_of(&out).contains("/api/search?"), "{out}");
+        let out = answer(&out, 200, SEARCH_DEFERRAL);
+        // Deferred unrelated content holds while the artist-scoped
+        // tier is still asked.
+        assert!(url_of(&out).contains("/api/search?"), "{out}");
+        let out = answer(&out, 200, SEARCH_HIT);
+        assert_eq!(out["type"], "done", "{out}");
+        let r = &out["result"];
+        assert_eq!(r["state"], "synced");
+        assert_eq!(r["matched"]["title"], "Roads");
+        let text = r["lines"].to_string();
+        assert!(text.contains("can't anybody see"), "{text}");
+        assert!(!text.contains("Roadrunner"), "{text}");
+    }
+
+    /// A name-matching record whose duration contradicts the query
+    /// must not end the waterfall: the app would reject it on drift,
+    /// and a later tier may carry the exact-length recording.
+    #[test]
+    fn violating_name_match_defers_to_later_tier() {
+        let req = invoke_request("lyrics.synced", &query());
+        let out = answer(&req, 404, MISS_404);
+        let out = answer(&out, 404, MISS_404);
+        // Album-scoped search answers the 120s radio edit — same name,
+        // wrong length. It defers rather than serving content the app
+        // can only reject.
+        let out = answer(&out, 200, SEARCH_WRONG_EDIT);
+        assert!(url_of(&out).contains("/api/search?"), "{out}");
+        let out = answer(&out, 200, SEARCH_HIT);
+        assert_eq!(out["type"], "done", "{out}");
+        let r = &out["result"];
+        assert_eq!(r["state"], "synced");
+        assert_eq!(r["matched"]["duration_ms"], 307_000);
+    }
+
+    /// Unrelated content is a last resort, not a veto against serving:
+    /// when no tier yields a name-matching record with usable content,
+    /// the deferred row still answers rather than reporting absent.
+    #[test]
+    fn deferred_unrelated_row_answers_when_every_tier_is_dry() {
+        let req = invoke_request("lyrics.synced", &query());
+        let out = answer(&req, 404, MISS_404);
+        let out = answer(&out, 404, MISS_404);
+        let out = answer(&out, 200, SEARCH_DEFERRAL);
+        // Every remaining tier 404s — the deferred unrelated synced
+        // row is the only content the whole waterfall saw.
+        let (urls, out) = miss_all(out, 10);
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["state"], "synced");
+        assert_eq!(out["result"]["matched"]["title"], "Roadrunner");
     }
 
     #[test]

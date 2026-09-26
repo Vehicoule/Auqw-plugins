@@ -34,6 +34,11 @@ impl Record {
     }
 }
 
+/// Record-vs-recording duration evidence for `ranked`: mirrors the
+/// app-side acceptance bound so a record we serve isn't one the app
+/// will reject on drift.
+pub const DRIFT_TOLERANCE_MS: u64 = 5_000;
+
 fn bad(m: &str) -> GuestError {
     GuestError::Failed {
         kind: "invalid-response".into(),
@@ -123,15 +128,28 @@ fn str_field(o: &Map<String, Value>, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Pick the record a search tier answers with: prefer an exact
-/// normalized title+artist match, then exact title, then the cleaned
-/// query title, else the first usable row. Provider order is never
-/// re-ranked beyond this evidence preference.
-pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Option<&'a Record> {
+/// Order the records a search tier answers with for a walk that tries
+/// each until one carries content. A record that *violates* the
+/// queried duration (both sides known, beyond `DRIFT_TOLERANCE_MS`)
+/// sorts below every non-violating row — the app rejects such records
+/// outright, so they must never preempt a same-length sibling across
+/// name tiers. Inside the non-violating set, name-evidence tiers lead
+/// (exact normalized title+artist, then title alone, then the cleaned
+/// query title, then rows that name nothing — the old single-`pick`
+/// loose fallback kept as the tail rather than a veto), each tier
+/// duration-preferring: in-bound before unknown. Provider order is
+/// never re-ranked beyond this evidence ordering.
+pub fn ranked<'a>(
+    records: &'a [Record],
+    title: &str,
+    artist: Option<&str>,
+    duration_ms: Option<u64>,
+) -> Vec<&'a Record> {
     let want_title = norm(title);
-    let want_cleaned = norm(&clean_title(title));
+    let cleaned = clean_title(title);
+    let want_cleaned = norm(&cleaned);
     let want_artist = artist.map(norm);
-    let artist_ok = |r: &&'a Record| match (&want_artist, &r.artist) {
+    let artist_ok = |r: &Record| match (&want_artist, &r.artist) {
         (None, _) => true,
         (Some(want), Some(got)) => !want.is_empty() && *want == norm(got),
         (Some(_), None) => false,
@@ -141,28 +159,43 @@ pub fn pick<'a>(records: &'a [Record], title: &str, artist: Option<&str>) -> Opt
     // equally-empty record title. Literal (trimmed, case-insensitive)
     // equality still counts — a record titled identically to the
     // query names it even when neither side survives `norm`.
-    let title_is = |r: &&'a Record, want: &str, want_raw: &str| {
+    let title_is = |r: &Record, want: &str, want_raw: &str| {
         if want.is_empty() {
             raw_title_eq(&r.title, want_raw)
         } else {
             norm(&r.title) == *want
         }
     };
-    records
+    let mut keyed: Vec<(u8, u8, u8, &'a Record)> = records
         .iter()
-        .find(|r| title_is(r, &want_title, title) && artist_ok(r))
-        .or_else(|| records.iter().find(|r| title_is(r, &want_title, title)))
-        .or_else(|| {
-            if want_cleaned != want_title {
-                let cleaned = clean_title(title);
-                records
-                    .iter()
-                    .find(|r| title_is(r, &want_cleaned, &cleaned))
+        .map(|r| {
+            let name_tier = if title_is(r, &want_title, title) && artist_ok(r) {
+                0
+            } else if title_is(r, &want_title, title) {
+                1
+            } else if want_cleaned != want_title && title_is(r, &want_cleaned, &cleaned) {
+                2
             } else {
-                None
-            }
+                3
+            };
+            // (violates, in-bound evidence): a hard violation ranks
+            // below everything; among the rest, an in-bound pair is
+            // better evidence than a missing duration on either side.
+            let (violates, in_bound) = match (r.duration_ms, duration_ms) {
+                (Some(got), Some(want)) => {
+                    if got.abs_diff(want) <= DRIFT_TOLERANCE_MS {
+                        (0u8, 0u8)
+                    } else {
+                        (1u8, 1u8)
+                    }
+                }
+                _ => (0u8, 1u8),
+            };
+            (violates, name_tier, in_bound, r)
         })
-        .or_else(|| records.first())
+        .collect();
+    keyed.sort_by_key(|(v, n, d, _)| (*v, *n, *d));
+    keyed.into_iter().map(|(_, _, _, r)| r).collect()
 }
 
 /// Literal title equality — trimmed, then compared on the uppercase
@@ -512,7 +545,9 @@ mod tests {
         let latin = rec("Unrelated Latin", Some("Band"), false);
         let cjk = rec("別の歌", Some("別の人"), false);
         let records = [latin, cjk];
-        let got = pick(&records, "夜の歌", None).map(|r| r.title.as_str());
+        let got = ranked(&records, "夜の歌", None, None)
+            .first()
+            .map(|r| r.title.as_str());
         assert_eq!(got, Some("Unrelated Latin"));
         // The instrumental gate rejects the same collision.
         let cjk_inst = rec("別の歌", Some("別の人"), true);
@@ -527,7 +562,9 @@ mod tests {
         let latin = rec("Unrelated Latin", Some("Band"), false);
         let cjk = rec("夜の歌", Some("ある人"), false);
         let records = [latin, cjk];
-        let got = pick(&records, "夜の歌", None).map(|r| r.title.as_str());
+        let got = ranked(&records, "夜の歌", None, None)
+            .first()
+            .map(|r| r.title.as_str());
         assert_eq!(got, Some("夜の歌"));
         let cjk_inst = rec("夜の歌", Some("ある人"), true);
         assert!(names_query(&cjk_inst, "夜の歌", None));
@@ -542,8 +579,82 @@ mod tests {
         let sigma_final = rec("ος", None, true);
         assert!(names_query(&sigma_final, "ΟΣ", None));
         let sigma_records = [rec("Other", None, false), rec("ΟΣ", None, false)];
-        let picked = pick(&sigma_records, "ος", None);
+        let picked = ranked(&sigma_records, "ος", None, None).first().copied();
         assert_eq!(picked.map(|r| r.title.as_str()), Some("ΟΣ"));
+    }
+
+    /// A duration-matching record outranks a same-name sibling outside
+    /// the drift bound — the wrong-edit row the app would have to
+    /// reject never leads the walk.
+    #[test]
+    fn ranked_prefers_same_name_record_within_drift_bound() {
+        let mut off_edit = rec("Roads", Some("Portishead"), false);
+        off_edit.duration_ms = Some(120_000);
+        let mut album_cut = rec("Roads", Some("Portishead"), false);
+        album_cut.duration_ms = Some(295_000);
+        let records = [off_edit, album_cut];
+        let order: Vec<&str> = ranked(&records, "Roads", Some("Portishead"), Some(298_000))
+            .iter()
+            .map(|r| r.title.as_str())
+            .collect();
+        assert_eq!(order, ["Roads", "Roads"]);
+        assert_eq!(
+            ranked(&records, "Roads", Some("Portishead"), Some(298_000))
+                .first()
+                .map(|r| r.duration_ms),
+            Some(Some(295_000))
+        );
+    }
+
+    /// Name evidence beats unknown duration: an unrelated record with
+    /// no duration never jumps ahead of a name-matching row.
+    #[test]
+    fn ranked_keeps_name_evidence_ahead_of_duration() {
+        let decoy = rec("Unrelated", None, false);
+        let mut match_ = rec("Roads", Some("Portishead"), false);
+        match_.duration_ms = Some(298_000);
+        let records = [decoy, match_];
+        let first = ranked(&records, "Roads", Some("Portishead"), Some(298_000))
+            .first()
+            .map(|r| r.title.as_str());
+        assert_eq!(first, Some("Roads"));
+    }
+
+    /// A hard duration violation ranks below every servable row — even
+    /// across name tiers: the exact-name wrong edit must lose to a
+    /// title-only sibling that sits in-bound (its missing upstream
+    /// artist is less disqualifying than a length the app will reject).
+    #[test]
+    fn ranked_sinks_violating_exact_match_below_in_bound_title_only() {
+        let mut wrong_edit = rec("Roads", Some("Portishead"), false);
+        wrong_edit.duration_ms = Some(120_000);
+        let mut nameless_cut = rec("Roads", None, false);
+        nameless_cut.duration_ms = Some(307_000);
+        let records = [wrong_edit, nameless_cut];
+        let order = ranked(&records, "Roads", Some("Portishead"), Some(307_000));
+        assert_eq!(order.first().map(|r| r.duration_ms), Some(Some(307_000)));
+        // An in-bound unrelated row may even lead the walk over a
+        // violating name-match — the walk's own deferral is what keeps
+        // unrelated content from answering early.
+        let mut unrelated = rec("Roadrunner", None, false);
+        unrelated.duration_ms = Some(307_000);
+        let mut wrong_edit = rec("Roads", Some("Portishead"), false);
+        wrong_edit.duration_ms = Some(120_000);
+        let pair = [unrelated, wrong_edit];
+        let order = ranked(&pair, "Roads", Some("Portishead"), Some(307_000));
+        assert_eq!(order.first().map(|r| r.title.as_str()), Some("Roadrunner"));
+    }
+
+    /// A query with no duration compares nothing: the name tiers alone
+    /// decide, provider order preserved inside a tier.
+    #[test]
+    fn ranked_without_duration_keeps_name_order() {
+        let first_row = rec("Roads", Some("Portishead"), false);
+        let second_row = rec("Roads", Some("Portishead"), false);
+        let records = [first_row, second_row];
+        let order = ranked(&records, "Roads", Some("Portishead"), None);
+        assert_eq!(order.len(), 2);
+        assert!(order.iter().all(|r| r.title == "Roads"));
     }
 
     /// `names_query` needs a title hit on the raw or cleaned query
