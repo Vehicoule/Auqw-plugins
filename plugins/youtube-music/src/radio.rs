@@ -19,7 +19,7 @@ use crate::candidates::{
 use crate::guest::{bad_payload, failed, is_video_id, load_visitor, payload_keys, warn};
 use crate::parse::{classify_playability, visitor_data, visitor_token, Playability};
 
-const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?prettyPrint=false";
+const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
 /// A validated `radio.seed` payload: exactly one of the schema's two
 /// envelope shapes.
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(out["payload"]["method"], "POST");
         assert_eq!(
             out["payload"]["url"],
-            "https://music.youtube.com/youtubei/v1/next?prettyPrint=false"
+            "https://music.youtube.com/youtubei/v1/next?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
         );
         assert_eq!(
             header_of(&out, "X-YouTube-Client-Name").as_deref(),

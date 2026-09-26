@@ -23,26 +23,31 @@ accepts the legacy 11-character video-id string or a
 - `resume_offset` (null/absent or u64): validated seam input for the
   Slice 1.5 re-mint path; byte pumping itself is Slice 1.5-owned.
 
-It walks a five-rung, version-pinned client ladder, in order:
+It walks an eight-rung, version-pinned client ladder, in order:
 
 1. `VISIONOS` 1.02
-2. `IOS` 20.10.4
-3. `ANDROID_VR` 1.61.48
-4. `ANDROID_VR` 1.60.19
-5. `ANDROID_VR` 1.43.32
+2. `ANDROID_VR` 1.57.29
+3. `IOS` 20.10.4
+4. `ANDROID_VR` 1.61.29
+5. `ANDROID` 19.09.37
+6. `ANDROID_VR` 1.61.48
+7. `ANDROID_VR` 1.60.19
+8. `ANDROID_VR` 1.43.32
 
-For each rung it POSTs `youtubei/v1/player?prettyPrint=false` with the
-rung's client identity (`User-Agent`, `X-YouTube-Client-Name`/`Version`,
-`X-Origin`/`Referer: https://music.youtube.com`), then scans
-`streamingData.adaptiveFormats` for `audio/*` entries with a **plain
-`url` field**. Entries carrying `signatureCipher`/`cipher` are dropped,
-never deciphered; non-https URLs are skipped — the host only serves
-https destinations.
+For each rung it POSTs `youtubei/v1/player?key=<public InnerTube
+key>&prettyPrint=false` with the rung's client identity (`User-Agent`,
+`X-YouTube-Client-Name`/`Version`, `X-Goog-Api-Format-Version: 2`) and
+`context.user: {}` — the same request shape the official native clients
+send (no Origin/Referer; web clients carry those instead). It then
+scans `streamingData.adaptiveFormats` for `audio/*` entries with a
+**plain `url` field**. Entries carrying `signatureCipher`/`cipher` are
+dropped, never deciphered; non-https URLs are skipped — the host only
+serves https destinations.
 
 ## KV visitors and backoff
 
 Each rung has a stable KV key (`VISIONOS`, `IOS`,
-`ANDROID_VR@<version>`):
+`ANDROID`, `ANDROID_VR@<version>`):
 
 - `visitor/<rung-key>` — the last `responseContext.visitorData` that
   rung returned, replayed as `X-Goog-Visitor-Id`. A fresher visitor
@@ -130,12 +135,13 @@ URL; `cancelled` propagates. The one token serves two consumers:
   tail probe.
 - `context.serviceIntegrityDimensions.poToken` on the **attested
   replay**: when bare `player` calls bot-check, the second pass
-  replays only those rungs with the token in the request body.
+  replays only those *attestable* rungs with the token in the
+  request body.
   Live-verified 2026-09: VISIONOS and IOS return full format lists
   attested where bare requests answer `LOGIN_REQUIRED`; ANDROID_VR
   stays walled (VR needs DroidGuard, not BotGuard). With no POT
-  provider configured the replay never runs and a second bot-check is
-  terminal as before — one locally-denied `pot_token` call is the only
+  provider configured the replay never runs and an all-walled ladder
+  stays terminal as before — one locally-denied `pot_token` call is the only
   added cost.
 
 Measured 2026-09-19: `pot=` did not lift a capped IOS mint — serving
@@ -186,8 +192,10 @@ no-audio advances, and a refused tail probe advances as `capped`. A
 3xx probe is re-requested once against its `Location` — the host
 enforces the destination allowlist on every request — before the
 verdict lands. A
-second bot-check inside one invocation ends the bare pass — the
-rungs then get one attested replay each when a POT provider minted,
+bot-check never ends the bare pass — every
+rung gets its bare try — and the walled web-attestable rungs
+(`VISIONOS`/`IOS`) then get one attested replay each when a POT
+provider minted,
 and `transient` (`bot-check`) only when the wall holds anyway. A
 replay's verdict overwrites the rung's `Bot` record — a rung attested
 to SABR-only counts toward `unsupported`, not `bot-check`.

@@ -461,12 +461,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     let _ = p.resume_offset;
     let now = now_ms().await?;
     let mut outcomes: Vec<RungOutcome> = Vec::new();
-    let mut bot_checks = 0u32;
     // Ladder indices that produced `Bot`, paired with the slot that
     // verdict occupies in `outcomes` — the attested pass replays only
-    // these rungs and overwrites the slot, so a superseded bot-check
-    // can't skew the ladder summary. Includes backoff-derived entries:
-    // a staged bot-backoff is exactly what attestation is for.
+    // the attestable ones and overwrites the slot, so a superseded
+    // bot-check can't skew the ladder summary. Includes backoff-derived
+    // entries: a staged bot-backoff is exactly what attestation is for.
     let mut bot_positions: Vec<(usize, usize)> = Vec::new();
     let mut pin_seen = false;
     let mut pin_missing = false;
@@ -490,7 +489,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     for pass in 0..2u8 {
         let attested = pass == 1;
         for (i, rung) in LADDER.iter().enumerate() {
-            if attested && !bot_positions.iter().any(|(rung, _)| *rung == i) {
+            // Pass 2 replays only rungs attestation can lift — a
+            // non-attestable client's bot-check is permanent (its wall
+            // needs DroidGuard, which a BotGuard mint never produces),
+            // so replaying it would be a provably wasted request.
+            if attested && (!rung.attestable || !bot_positions.iter().any(|(rung, _)| *rung == i)) {
                 continue;
             }
             let visitor_key = format!("visitor/{}", rung.kv_key());
@@ -619,12 +622,6 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 record(&mut outcomes, attested, i, &bot_positions, outcome);
                 if !attested && outcome == RungOutcome::Bot {
                     bot_positions.push((i, outcomes.len() - 1));
-                    bot_checks += 1;
-                    // Same bare-pass budget as a body-classified
-                    // BotCheck — the second transport wall ends it.
-                    if bot_checks >= 2 {
-                        break;
-                    }
                 }
                 continue;
             }
@@ -681,7 +678,6 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             match classify_playability(&body).0 {
                 Playability::Ok => {}
                 Playability::BotCheck => {
-                    bot_checks += 1;
                     stage_backoff(
                         &backoff_key,
                         now.saturating_add(BOT_BACKOFF_MS),
@@ -691,12 +687,6 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Bot);
                     if !attested {
                         bot_positions.push((i, outcomes.len() - 1));
-                    }
-                    // Shared invocation budget: the second unattested
-                    // bot-check ends the bare pass — attestation is the
-                    // remedy, not more bare requests.
-                    if bot_checks >= 2 && !attested {
-                        break;
                     }
                     continue;
                 }
@@ -819,7 +809,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
         // mint — the same video-bound token also decorates picked URLs
         // via `finish_pick`. A denied/failed mint keeps today's
         // terminal outcome.
-        if attested || bot_positions.is_empty() {
+        if attested
+            || !bot_positions
+                .iter()
+                .any(|(rung, _)| LADDER[*rung].attestable)
+        {
             break;
         }
         if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
@@ -1324,10 +1318,13 @@ mod tests {
             header_of(out, "X-YouTube-Client-Version").as_deref(),
         ) {
             (Some("101"), Some("1.02")) => 0,
-            (Some("5"), Some("20.10.4")) => 1,
-            (Some("28"), Some("1.61.48")) => 2,
-            (Some("28"), Some("1.60.19")) => 3,
-            (Some("28"), Some("1.43.32")) => 4,
+            (Some("28"), Some("1.57.29")) => 1,
+            (Some("5"), Some("20.10.4")) => 2,
+            (Some("28"), Some("1.61.29")) => 3,
+            (Some("3"), Some("19.09.37")) => 4,
+            (Some("28"), Some("1.61.48")) => 5,
+            (Some("28"), Some("1.60.19")) => 6,
+            (Some("28"), Some("1.43.32")) => 7,
             other => panic!("unexpected rung headers {other:?} in {out}"),
         }
     }
@@ -1384,7 +1381,7 @@ mod tests {
         let out = begin(&mut h);
         assert_eq!(
             url_of(&out),
-            "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+            "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
         );
         let out = feed(&mut h, &out, SABR);
         assert_eq!(rung_of(&out), 1);
@@ -1394,7 +1391,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["client"], "IOS");
         assert_eq!(out["result"]["mime"], "audio/mp4");
         assert_eq!(out["result"]["bitrate_kbps"], 130);
         assert_eq!(out["result"]["itag"], 140);
@@ -1409,7 +1406,7 @@ mod tests {
     fn last_rung_success_reports_client() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for rung in 1..=4usize {
+        for rung in 1..=7usize {
             out = feed(&mut h, &out, SABR);
             assert_eq!(rung_of(&out), rung);
         }
@@ -1682,7 +1679,7 @@ mod tests {
     fn probe_429_reports_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 429, "");
@@ -1697,7 +1694,7 @@ mod tests {
     fn probe_5xx_is_transport() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 503, "");
@@ -1728,7 +1725,7 @@ mod tests {
     fn all_capped_fails_streams_capped() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
@@ -1758,14 +1755,14 @@ mod tests {
     }
 
     #[test]
-    fn second_bot_check_aborts_terminal() {
+    fn bot_check_on_every_rung_is_terminal() {
         let mut h = Harness::new();
-        let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        assert_eq!(rung_of(&out), 1);
-        // The shared invocation budget allows one retry, not a loop:
-        // the second bot-check ends the resolve.
-        let out = feed(&mut h, &out, BOT);
+        let mut out = begin(&mut h);
+        // No early exit: the bare pass walks every rung, so a fully
+        // walled IP costs the whole ladder before failing.
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "bot-check".to_string())
@@ -1790,17 +1787,13 @@ mod tests {
         let mut h = Harness::new();
         let out = begin(&mut h);
         assert_eq!(out["payload"]["method"], "POST");
-        assert_eq!(
-            header_of(&out, "X-Origin").as_deref(),
-            Some("https://music.youtube.com")
-        );
-        assert_eq!(
-            header_of(&out, "Referer").as_deref(),
-            Some("https://music.youtube.com")
-        );
+        // Native identities send no web-origin headers and use api
+        // format version 2.
+        assert!(header_of(&out, "X-Origin").is_none());
+        assert!(header_of(&out, "Referer").is_none());
         assert_eq!(
             header_of(&out, "X-Goog-Api-Format-Version").as_deref(),
-            Some("1")
+            Some("2")
         );
         assert!(header_of(&out, "Origin").is_none());
         let body = String::from_utf8(
@@ -1811,6 +1804,8 @@ mod tests {
         assert!(body.contains("\"videoId\":\"vid12345678\""));
         assert!(body.contains("\"contentCheckOk\":true"));
         assert!(body.contains("\"clientName\":\"VISIONOS\""));
+        // The anonymous-user object rides every native request.
+        assert!(body.contains("\"user\":{}"));
         // The bare pass carries no attestation — the shared token only
         // enters `serviceIntegrityDimensions` on the bot-replay pass.
         assert!(!body.contains("serviceIntegrityDimensions"));
@@ -1932,13 +1927,19 @@ mod tests {
             pot: Pot::Token("tok-xyz"),
             ..Harness::new()
         };
-        let out = begin(&mut h);
+        let mut out = begin(&mut h);
         // Pass 1 runs bare: no attestation on the wire.
         assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
-        // The second bare bot-check ends the pass; the mint fires and
-        // pass 2 replays rung 0 attested.
+        // Pass 1 runs bare and walks the whole ladder: walls on the
+        // Apple rungs never starve the bare-only Android rungs.
+        out = feed(&mut h, &out, BOT); // VISIONOS
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29
+        out = feed(&mut h, &out, BOT); // IOS
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        // The mint fires and pass 2 replays rung 0 attested (rung 1's
+        // wall needs DroidGuard — never replayed).
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -1977,7 +1978,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "IOS");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         // The one mint is the finish_pick decoration — the JSON-403
         // rung booked Transport, so no attested replay ever ran.
         assert_eq!(h.pot_calls, 1);
@@ -2005,7 +2006,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["client"], "IOS");
         assert_eq!(h.pot_calls, 1);
     }
 
@@ -2027,7 +2028,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["client"], "IOS");
         assert_eq!(h.pot_calls, 1);
     }
 
@@ -2044,6 +2045,13 @@ mod tests {
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not   a    bot";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2073,6 +2081,13 @@ mod tests {
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2100,6 +2115,13 @@ mod tests {
         let body = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not a bot\"},\"metadata\":{\"status\":\"OK\"},";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2128,6 +2150,13 @@ mod tests {
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
+        // Non-attestable walls never end the bare pass — the
+        // ladder is walked out, then rung 0 replays attested.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2156,8 +2185,13 @@ mod tests {
         assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
-        // The second transport wall ends the bare pass; the mint
-        // fires and pass 2 replays rung 0 attested.
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        // Walls never end the bare pass — the rest of the ladder still
+        // runs, then pass 2 replays rung 0 attested after the mint.
+        let mut out = out;
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2179,18 +2213,44 @@ mod tests {
     }
 
     #[test]
+    fn non_attestable_bot_checks_never_starve_later_rungs() {
+        // A bot-check on a rung attestation cannot lift proves nothing
+        // about later clients — it must not spend the bare budget.
+        // SABR on the Apple rungs + walls on the plain-UA ANDROID_VR
+        // rungs still leaves the Oculus pin reachable.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, SABR); // VISIONOS
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29 — no budget spend
+        out = feed(&mut h, &out, SABR); // IOS
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.61.29 — no budget spend
+        out = feed(&mut h, &out, UNPLAYABLE); // ANDROID
+        assert_eq!(rung_of(&out), 5);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        // No attestable rung bot-checked -> no mint, no replay pass.
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
     fn attested_replay_also_walled_is_terminal() {
         let mut h = Harness {
             pot: Pot::Token("tok-xyz"),
             ..Harness::new()
         };
         let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
-        // Attested replay of rung 0 then rung 1 — still walled.
+        let mut out = feed(&mut h, &out, BOT);
+        for _ in 0..7 {
+            out = feed(&mut h, &out, BOT);
+        }
+        // Attested replay of rung 0 then rung 2 (non-attestable walls
+        // need DroidGuard — never replayed) — still walled.
         assert_eq!(rung_of(&out), 0);
         let out = feed(&mut h, &out, BOT);
-        assert_eq!(rung_of(&out), 1);
+        assert_eq!(rung_of(&out), 2);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
@@ -2209,12 +2269,16 @@ mod tests {
             pot: Pot::Token("tok-xyz"),
             ..Harness::new()
         };
-        let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
+        let first = begin(&mut h);
+        let mut out = feed(&mut h, &first, BOT);
+        out = feed(&mut h, &out, SABR);
+        out = feed(&mut h, &out, BOT);
+        for _ in 0..5 {
+            out = feed(&mut h, &out, SABR);
+        }
         assert_eq!(rung_of(&out), 0);
-        let out = feed(&mut h, &out, SABR);
-        assert_eq!(rung_of(&out), 1);
+        out = feed(&mut h, &out, SABR);
+        assert_eq!(rung_of(&out), 2);
         let out = feed(&mut h, &out, SABR);
         assert_eq!(
             fail_kind(&out),
@@ -2228,9 +2292,10 @@ mod tests {
         // resolve with the same typed failure — one locally-denied
         // `pot_token` call is the only added cost.
         let mut h = Harness::new();
-        let out = begin(&mut h);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
+        let mut out = begin(&mut h);
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "bot-check".to_string())
@@ -2253,11 +2318,16 @@ mod tests {
                 .to_string()
                 .into_bytes(),
         );
-        // Pass 1: rung 0 is backoff-skipped, rungs 1-2 bot-check live.
+        // Pass 1: rung 0 is backoff-skipped; rung 1's live bot-check
+        // is non-attestable so it never spends the budget — the pass
+        // walks the rest of the ladder before attestation.
         let out = h.invoke(json!({ "source_ref": VID }));
         assert_eq!(rung_of(&out), 1);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
+        let mut out = feed(&mut h, &out, BOT);
+        out = feed(&mut h, &out, BOT);
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         // Pass 2 replays rung 0 first despite its stored backoff.
         assert_eq!(rung_of(&out), 0);
         assert_eq!(
@@ -2276,7 +2346,7 @@ mod tests {
     fn all_sabr_fails_unsupported_sabr() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, SABR);
         }
         assert_eq!(
@@ -2289,7 +2359,7 @@ mod tests {
     fn all_ciphered_fails_unsupported_ciphered() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, CIPHERED);
         }
         assert_eq!(
@@ -2307,7 +2377,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, BOT);
-        for _ in 0..4 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, SABR);
         }
         // The single bare bot-check does not end the pass, so the
@@ -2324,7 +2394,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         out = h.answer(&out, 500, "{}");
-        for _ in 0..4 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, SABR);
         }
         assert_eq!(
@@ -2339,7 +2409,7 @@ mod tests {
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, UNPLAYABLE);
         out = h.answer(&out, 429, "{}");
-        for _ in 0..3 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
@@ -2352,7 +2422,7 @@ mod tests {
     fn unavailable_ladder_fails_no_result() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
@@ -2396,7 +2466,7 @@ mod tests {
     fn host_rate_limit_on_every_rung_fails_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = h.answer_host_error(&out, "rate-limit");
         }
         assert_eq!(
@@ -2438,7 +2508,7 @@ mod tests {
         // Every rung answering the wrong video -> honest no-result.
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, &wrong);
         }
         assert_eq!(
@@ -2520,6 +2590,9 @@ mod tests {
         for rung in [
             "VISIONOS",
             "IOS",
+            "ANDROID_VR@1.57.29",
+            "ANDROID_VR@1.61.29",
+            "ANDROID",
             "ANDROID_VR@1.61.48",
             "ANDROID_VR@1.60.19",
             "ANDROID_VR@1.43.32",
@@ -2580,7 +2653,7 @@ mod tests {
         // rung 0: 429 stages a backoff; the rest of the ladder serves
         // unplayable -> `fail` discards the staged write by contract.
         let mut out = h.answer(&out, 429, "{}");
-        for _ in 0..4 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(fail_kind(&out).0, "rate-limit");
@@ -2604,7 +2677,7 @@ mod tests {
     fn pinned_resolve_preserves_transport_failures() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = h.answer_host_error(&out, "transient");
         }
         assert_eq!(fail_kind(&out).0, "transient");
@@ -2613,18 +2686,18 @@ mod tests {
     #[test]
     fn pinned_resolve_preserves_uninspectable_player_outcomes() {
         for (body, attempts, expected) in [
-            (BOT, 2, "transient"),
+            (BOT, 8, "transient"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
-                5,
+                8,
                 "auth-required",
             ),
-            (SABR, 5, "unsupported"),
-            (CIPHERED, 5, "unsupported"),
-            (UNPLAYABLE, 5, "no-result"),
+            (SABR, 8, "unsupported"),
+            (CIPHERED, 8, "unsupported"),
+            (UNPLAYABLE, 8, "no-result"),
             (
                 r#"{"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"itag":140,"mimeType":"audio/mp4","url":"http://example.test/audio"}]}}"#,
-                5,
+                8,
                 "no-result",
             ),
         ] {
@@ -2641,7 +2714,7 @@ mod tests {
     fn pin_itag_missing_everywhere_is_expired_resource() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 774 }));
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             if out["type"] == "host_request" && out["payload"]["method"] == "GET" {
                 panic!("a missing pin must never reach the probe");
@@ -2755,15 +2828,15 @@ mod tests {
     fn pin_seen_then_capped_is_not_pinned_unavailable() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
-        // rung 0 lacks itag 251 -> advances; rungs 1-4 provide it but
+        // rung 0 lacks itag 251 -> advances; rungs 1-7 provide it but
         // every probe refuses -> capped weather, not a missing resource.
         out = feed(&mut h, &out, &ok_without_itag(251));
         assert_eq!(rung_of(&out), 1);
-        for rung in 1..5usize {
+        for rung in 1..8usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            if rung < 4 {
+            if rung < 7 {
                 assert_eq!(rung_of(&out), rung + 1);
             }
         }
@@ -2778,7 +2851,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
         // No rung carries itag 251 -> the requested pin is unavailable.
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, &ok_without_itag(251));
         }
         assert_eq!(
@@ -2974,7 +3047,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "IOS");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         let stored: Value = serde_json::from_slice(
             h.committed
                 .get(&format!("backoff/{VID}/VISIONOS"))

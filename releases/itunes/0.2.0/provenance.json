@@ -4,10 +4,10 @@
   "abi_version": "0.3.0",
   "wasm_sha256": "sha256:103bf9bcac4d02943fd42d86d5e9ce12f86e74d720fd1200c32be2c7a7061dc5",
   "manifest_sha256": "sha256:02fa57b52d0e0e1f7d137cc43a1e99071d977ff63db19d4eed099aa5ff0440f6",
-  "signed_at": "2026-09-20T19:38:50.050Z",
-  "key_id": "e6023b53aa9bfb3c",
+  "signed_at": "2026-09-26T15:55:36.554Z",
+  "key_id": "42d8cac606f16c04",
   "toolchain": {
-    "node": "v26.8.2",
-    "platform": "darwin/arm64"
+    "node": "v24.19.0",
+    "platform": "linux/x64"
   }
 }

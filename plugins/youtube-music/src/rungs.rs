@@ -1,6 +1,7 @@
-//! The Slice 0 client ladder: `VISIONOS`, `IOS`, three `ANDROID_VR`
-//! pins. Client versions are load-bearing: newer IOS builds are served
-//! SABR-only. Pin, don't track upstream.
+//! The client ladder: `VISIONOS`, `IOS`, the predecessor's proven-bare
+//! `ANDROID_VR` pins and a plain `ANDROID`, then three `ANDROID_VR`
+//! fallbacks. Client versions are load-bearing: newer IOS builds are
+//! served SABR-only. Pin, don't track upstream.
 
 use auqw_guest_sdk::HttpRequest;
 use serde_json::{json, Value};
@@ -17,6 +18,11 @@ pub struct Rung {
     pub user_agent: &'static str,
     /// Extra `context.client` fields (device, OS, locale).
     pub context: fn() -> Value,
+    /// Whether a BotGuard poToken can lift this rung's bot-check.
+    /// Web-attestable rungs only — `ANDROID_VR`/`ANDROID` need
+    /// DroidGuard, which a BotGuard mint never produces, so their
+    /// bot-checks are permanent and never replayed attested.
+    pub attestable: bool,
 }
 
 impl Rung {
@@ -34,12 +40,21 @@ impl Rung {
 
 /// The ladder, in fallback order. `VISIONOS` runs first: it resolves
 /// nearly everywhere and almost never bot-checks from residential IPs.
-/// `ANDROID_VR` rungs are the fallback — their URLs serve full streams
-/// but the rung itself is the most bot-checked from residential IPs, so
-/// it runs only after the Apple clients fail. `IOS` sits between:
-/// resolves widely, occasionally SABR-only on newer versions (hence the
-/// 20.10.4 pin). `WEB_REMIX` is excluded permanently — it requires
-/// signature deciphering, which is out of scope by contract.
+/// `ANDROID_VR` 1.57.29 — the predecessor plugin's primary context,
+/// proven-bare on real devices with no poToken — runs second so it is
+/// always reached whenever `VISIONOS` walls, before the attestable
+/// `IOS` is the second
+/// web-attestable rung (occasionally SABR-only on newer versions —
+/// hence the 20.10.4 pin), then `ANDROID_VR` 1.61.29, plain `ANDROID`,
+/// and the Oculus-pinned `ANDROID_VR` trio.
+///
+/// The bare pass always walks the whole ladder — a bot-check on an
+/// `ANDROID*` client demonstrates nothing attestation can fix (those
+/// walls need DroidGuard, not BotGuard) and no bot-check may starve a
+/// later rung that could still serve, so every rung gets its bare shot
+/// before the attestable rungs replay. `WEB_REMIX` is excluded
+/// permanently — it requires signature deciphering, which is out of
+/// scope by contract.
 ///
 /// Attestation: on a flagged IP the bare `player` call is answered
 /// `LOGIN_REQUIRED`/bot-check. A video-bound BotGuard poToken carried
@@ -48,8 +63,8 @@ impl Rung {
 /// return full format lists attested where bare requests bot-check;
 /// ANDROID_VR stays walled (VR needs DroidGuard, not BotGuard), and
 /// MWEB fails `UNPLAYABLE` either way. The resolve therefore runs the
-/// ladder bare first, then replays only the bot-checked rungs with
-/// attestation — see `guest.rs`.
+/// ladder bare first, then replays only the *attestable* bot-checked
+/// rungs with attestation — see `guest.rs`.
 ///
 /// Stream caps: any minted URL may be GVS-capped to a ~1 MiB served
 /// budget; enforcement is stochastic per-mint, not client-deterministic
@@ -60,6 +75,7 @@ impl Rung {
 pub const LADDER: &[Rung] = &[
     Rung {
         name: "VISIONOS",
+        attestable: true,
         client_name_id: "101",
         client_version: "1.02",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
@@ -75,7 +91,21 @@ pub const LADDER: &[Rung] = &[
         },
     },
     Rung {
+        name: "ANDROID_VR@1.57.29",
+        attestable: false,
+        client_name_id: "28",
+        client_version: "1.57.29",
+        user_agent: "com.google.android.youtube/1.57.29 (Linux; U; Android 13; US) gzip",
+        context: || {
+            json!({
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
         name: "IOS",
+        attestable: true,
         client_name_id: "5",
         client_version: "20.10.4",
         user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
@@ -90,7 +120,35 @@ pub const LADDER: &[Rung] = &[
         },
     },
     Rung {
+        name: "ANDROID_VR@1.61.29",
+        attestable: false,
+        client_name_id: "28",
+        client_version: "1.61.29",
+        user_agent: "com.google.android.youtube/1.61.29 (Linux; U; Android 13; US) gzip",
+        context: || {
+            json!({
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
+        name: "ANDROID",
+        attestable: false,
+        client_name_id: "3",
+        client_version: "19.09.37",
+        user_agent: "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+        context: || {
+            json!({
+                "androidSdkVersion": 30,
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
         name: "ANDROID_VR@1.61.48",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.61.48",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
@@ -108,6 +166,7 @@ pub const LADDER: &[Rung] = &[
     },
     Rung {
         name: "ANDROID_VR@1.60.19",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.60.19",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
@@ -125,6 +184,7 @@ pub const LADDER: &[Rung] = &[
     },
     Rung {
         name: "ANDROID_VR@1.43.32",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.43.32",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
@@ -143,8 +203,10 @@ pub const LADDER: &[Rung] = &[
 ];
 
 /// The InnerTube `player` endpoint. `music.youtube.com` is the canonical
-/// host for this provider.
-pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false";
+/// host for this provider. The embedded `key` is YouTube's public
+/// InnerTube API key — the same one every official client ships; a
+/// keyless `player` call reads as a forged request to the abuse edge.
+pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
 /// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
 /// URLs and URLs already carrying `pot=` pass through unchanged. The
@@ -254,6 +316,10 @@ pub fn player_request(
     }
     let mut context = serde_json::Map::new();
     context.insert("client".into(), Value::Object(client));
+    // Anonymous-user marker: official native clients always send an
+    // (empty) `user` object; its absence is another forged-request
+    // signal.
+    context.insert("user".into(), json!({}));
     if let Some(token) = pot {
         context.insert(
             "serviceIntegrityDimensions".into(),
@@ -266,17 +332,19 @@ pub fn player_request(
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
+    // Native clients use api format version 2 (web contexts use 1 —
+    // see `web_remix_request`), and they send no Origin/Referer: a
+    // native client identity carrying web-origin headers is itself an
+    // inconsistency the abuse edge can key on.
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
         ("User-Agent".into(), rung.user_agent.into()),
-        ("X-Goog-Api-Format-Version".into(), "1".into()),
+        ("X-Goog-Api-Format-Version".into(), "2".into()),
         ("X-YouTube-Client-Name".into(), rung.client_name_id.into()),
         (
             "X-YouTube-Client-Version".into(),
             rung.client_version.into(),
         ),
-        ("X-Origin".into(), "https://music.youtube.com".into()),
-        ("Referer".into(), "https://music.youtube.com".into()),
     ];
     if let Some(visitor) = visitor_id {
         headers.push(("X-Goog-Visitor-Id".into(), visitor.into()));
