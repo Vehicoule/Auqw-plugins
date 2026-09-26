@@ -129,12 +129,15 @@ fn str_field(o: &Map<String, Value>, key: &str) -> Option<String> {
 }
 
 /// Order the records a search tier answers with for a walk that tries
-/// each until one carries content: name-evidence tiers first (exact
-/// normalized title+artist, then title alone, then the cleaned query
-/// title, then rows that name nothing — the old single-`pick` loose
-/// fallback kept as the tail rather than a veto), each tier
-/// duration-preferring: a record within `DRIFT_TOLERANCE_MS` of the
-/// queried duration sorts ahead of its tier-mates. Provider order is
+/// each until one carries content. A record that *violates* the
+/// queried duration (both sides known, beyond `DRIFT_TOLERANCE_MS`)
+/// sorts below every non-violating row — the app rejects such records
+/// outright, so they must never preempt a same-length sibling across
+/// name tiers. Inside the non-violating set, name-evidence tiers lead
+/// (exact normalized title+artist, then title alone, then the cleaned
+/// query title, then rows that name nothing — the old single-`pick`
+/// loose fallback kept as the tail rather than a veto), each tier
+/// duration-preferring: in-bound before unknown. Provider order is
 /// never re-ranked beyond this evidence ordering.
 pub fn ranked<'a>(
     records: &'a [Record],
@@ -163,7 +166,7 @@ pub fn ranked<'a>(
             norm(&r.title) == *want
         }
     };
-    let mut keyed: Vec<(u8, u8, &'a Record)> = records
+    let mut keyed: Vec<(u8, u8, u8, &'a Record)> = records
         .iter()
         .map(|r| {
             let name_tier = if title_is(r, &want_title, title) && artist_ok(r) {
@@ -175,15 +178,24 @@ pub fn ranked<'a>(
             } else {
                 3
             };
-            let drift_tier = match (r.duration_ms, duration_ms) {
-                (Some(got), Some(want)) if got.abs_diff(want) <= DRIFT_TOLERANCE_MS => 0,
-                _ => 1,
+            // (violates, in-bound evidence): a hard violation ranks
+            // below everything; among the rest, an in-bound pair is
+            // better evidence than a missing duration on either side.
+            let (violates, in_bound) = match (r.duration_ms, duration_ms) {
+                (Some(got), Some(want)) => {
+                    if got.abs_diff(want) <= DRIFT_TOLERANCE_MS {
+                        (0u8, 0u8)
+                    } else {
+                        (1u8, 1u8)
+                    }
+                }
+                _ => (0u8, 1u8),
             };
-            (name_tier, drift_tier, r)
+            (violates, name_tier, in_bound, r)
         })
         .collect();
-    keyed.sort_by_key(|(n, d, _)| (*n, *d));
-    keyed.into_iter().map(|(_, _, r)| r).collect()
+    keyed.sort_by_key(|(v, n, d, _)| (*v, *n, *d));
+    keyed.into_iter().map(|(_, _, _, r)| r).collect()
 }
 
 /// Literal title equality — trimmed, then compared on the uppercase
@@ -594,19 +606,43 @@ mod tests {
         );
     }
 
-    /// Name evidence beats duration evidence: an unrelated record of
-    /// the right length never jumps ahead of a name-matching row.
+    /// Name evidence beats unknown duration: an unrelated record with
+    /// no duration never jumps ahead of a name-matching row.
     #[test]
     fn ranked_keeps_name_evidence_ahead_of_duration() {
-        let mut decoy = rec("Unrelated", None, false);
-        decoy.duration_ms = Some(298_000);
+        let decoy = rec("Unrelated", None, false);
         let mut match_ = rec("Roads", Some("Portishead"), false);
-        match_.duration_ms = Some(120_000);
+        match_.duration_ms = Some(298_000);
         let records = [decoy, match_];
         let first = ranked(&records, "Roads", Some("Portishead"), Some(298_000))
             .first()
             .map(|r| r.title.as_str());
         assert_eq!(first, Some("Roads"));
+    }
+
+    /// A hard duration violation ranks below every servable row — even
+    /// across name tiers: the exact-name wrong edit must lose to a
+    /// title-only sibling that sits in-bound (its missing upstream
+    /// artist is less disqualifying than a length the app will reject).
+    #[test]
+    fn ranked_sinks_violating_exact_match_below_in_bound_title_only() {
+        let mut wrong_edit = rec("Roads", Some("Portishead"), false);
+        wrong_edit.duration_ms = Some(120_000);
+        let mut nameless_cut = rec("Roads", None, false);
+        nameless_cut.duration_ms = Some(307_000);
+        let records = [wrong_edit, nameless_cut];
+        let order = ranked(&records, "Roads", Some("Portishead"), Some(307_000));
+        assert_eq!(order.first().map(|r| r.duration_ms), Some(Some(307_000)));
+        // An in-bound unrelated row may even lead the walk over a
+        // violating name-match — the walk's own deferral is what keeps
+        // unrelated content from answering early.
+        let mut unrelated = rec("Roadrunner", None, false);
+        unrelated.duration_ms = Some(307_000);
+        let mut wrong_edit = rec("Roads", Some("Portishead"), false);
+        wrong_edit.duration_ms = Some(120_000);
+        let pair = [unrelated, wrong_edit];
+        let order = ranked(&pair, "Roads", Some("Portishead"), Some(307_000));
+        assert_eq!(order.first().map(|r| r.title.as_str()), Some("Roadrunner"));
     }
 
     /// A query with no duration compares nothing: the name tiers alone

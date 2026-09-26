@@ -322,6 +322,10 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
     // The first usable record seen — its `matched` rides the `absent`
     // result so the app can score a near-match that had no lyrics.
     let mut first_matched = Value::Null;
+    // Usable content from a record that does NOT name the query: it can
+    // only answer after every tier's name-matching candidates have been
+    // tried — wrong-song lyrics are worse than an honest `absent`.
+    let mut deferred: Option<Value> = None;
     for tier in tiers(&q) {
         let body = match http::get_json(&tier.url).await? {
             http::Outcome::NotFound => continue,
@@ -356,7 +360,12 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
                     if let Some(result) =
                         record_result(candidate, flavor, &candidate.matched(), is_match)
                     {
-                        return Ok(result);
+                        if is_match {
+                            return Ok(result);
+                        }
+                        if deferred.is_none() {
+                            deferred = Some(result);
+                        }
                     }
                 }
                 continue;
@@ -367,8 +376,18 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
         }
         let is_match = parse::names_query(record, &q.title, q.artist.as_deref());
         if let Some(result) = record_result(record, flavor, &record.matched(), is_match) {
-            return Ok(result);
+            if is_match {
+                return Ok(result);
+            }
+            if deferred.is_none() {
+                deferred = Some(result);
+            }
         }
+    }
+    // Every tier exhausted without name-matching content: a deferred
+    // unrelated row is still better than nothing — otherwise absent.
+    if let Some(result) = deferred {
+        return Ok(result);
     }
     Ok(match flavor {
         Flavor::Plain => {
@@ -391,6 +410,7 @@ mod tests {
     const GET_INSTRUMENTAL: &str = include_str!("../fixtures/get-instrumental.json");
     const GET_REMASTERED: &str = include_str!("../fixtures/get-remastered.json");
     const SEARCH_HIT: &str = include_str!("../fixtures/search-hit.json");
+    const SEARCH_DEFERRAL: &str = include_str!("../fixtures/search-deferral.json");
     const MISS_404: &str = include_str!("../fixtures/miss-404.json");
     const MALFORMED: &str = include_str!("../fixtures/malformed.json");
 
@@ -542,6 +562,50 @@ mod tests {
         // The plain-only record was the first usable hit: its metadata
         // rides the absent result.
         assert_eq!(out["result"]["matched"]["title"], "Roads");
+    }
+
+    /// A search tier's mixed rows: the name-matching record is
+    /// contentless for the synced flavor and the unrelated row's
+    /// synced lyrics defer — a later tier's real match must still win.
+    #[test]
+    fn search_walks_past_contentless_and_unrelated_rows_to_later_tier() {
+        let req = invoke_request("lyrics.synced", &query());
+        // Both /api/get tiers miss, then the album-scoped search
+        // answers [Roads plain-only (matched, no synced), Roadrunner
+        // (unrelated, synced)] — neither may end the waterfall.
+        let out = answer(&req, 404, MISS_404);
+        let out = answer(&out, 404, MISS_404);
+        assert!(url_of(&out).contains("/api/search?"), "{out}");
+        let out = answer(&out, 200, SEARCH_DEFERRAL);
+        // Deferred unrelated content holds while the artist-scoped
+        // tier is still asked.
+        assert!(url_of(&out).contains("/api/search?"), "{out}");
+        let out = answer(&out, 200, SEARCH_HIT);
+        assert_eq!(out["type"], "done", "{out}");
+        let r = &out["result"];
+        assert_eq!(r["state"], "synced");
+        assert_eq!(r["matched"]["title"], "Roads");
+        let text = r["lines"].to_string();
+        assert!(text.contains("can't anybody see"), "{text}");
+        assert!(!text.contains("Roadrunner"), "{text}");
+    }
+
+    /// Unrelated content is a last resort, not a veto against serving:
+    /// when no tier yields a name-matching record with usable content,
+    /// the deferred row still answers rather than reporting absent.
+    #[test]
+    fn deferred_unrelated_row_answers_when_every_tier_is_dry() {
+        let req = invoke_request("lyrics.synced", &query());
+        let out = answer(&req, 404, MISS_404);
+        let out = answer(&out, 404, MISS_404);
+        let out = answer(&out, 200, SEARCH_DEFERRAL);
+        // Every remaining tier 404s — the deferred unrelated synced
+        // row is the only content the whole waterfall saw.
+        let (urls, out) = miss_all(out, 10);
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["state"], "synced");
+        assert_eq!(out["result"]["matched"]["title"], "Roadrunner");
     }
 
     #[test]
