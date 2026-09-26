@@ -311,6 +311,7 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             "catalog.entity",
             "catalog.metadata",
             "catalog.search",
+            "catalog.suggest",
             "lyrics.plain",
             "lyrics.synced",
             "playback.candidates",

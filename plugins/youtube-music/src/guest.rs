@@ -52,6 +52,7 @@ pub fn dispatch(inv: Invocation) -> GuestFuture {
             "playback.resolve" => resolve(&inv.payload).await,
             "playback.candidates" => crate::candidates::candidates(&inv.payload).await,
             "radio.seed" => crate::radio::radio_seed(&inv.payload).await,
+            "catalog.suggest" => crate::suggest::suggest(&inv.payload).await,
             other => Err(failed(
                 "not-applicable",
                 format!("capability {other} not supported"),

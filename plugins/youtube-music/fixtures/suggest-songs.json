@@ -1,0 +1,84 @@
+{
+  "responseContext": {
+    "visitorData": "CgtVQ0dOWlVxQVdwRSi4_abcdefghi",
+    "serviceTrackingParams": []
+  },
+  "contents": [
+    {
+      "searchSuggestionsSectionRenderer": {
+        "contents": [
+          {
+            "searchSuggestionRenderer": {
+              "suggestion": {
+                "runs": [
+                  { "text": "awa " },
+                  { "text": "lacrim", "bold": true }
+                ]
+              },
+              "navigationEndpoint": {
+                "clickTrackingParams": "x",
+                "searchEndpoint": {
+                  "query": "awa lacrim",
+                  "params": "Eg-KAQ"
+                }
+              },
+              "trackingParams": "x"
+            }
+          },
+          {
+            "searchSuggestionRenderer": {
+              "suggestion": {
+                "runs": [
+                  { "text": "awa " },
+                  { "text": "2", "bold": true },
+                  { "text": "lacrim", "bold": true }
+                ]
+              },
+              "navigationEndpoint": {
+                "searchEndpoint": { "query": "awa 2 lacrim" }
+              },
+              "trackingParams": "x"
+            }
+          },
+          {
+            "historySuggestionRenderer": {
+              "suggestion": {
+                "runs": [{ "text": "awa " }, { "text": "lacrim" }]
+              }
+            }
+          },
+          {
+            "searchSuggestionRenderer": {
+              "suggestion": {
+                "runs": [
+                  { "text": "awa " },
+                  { "text": "lacrim", "bold": true }
+                ]
+              },
+              "trackingParams": "x"
+            }
+          },
+          {
+            "searchSuggestionRenderer": {
+              "suggestion": { "runs": [{ "text": "   " }] },
+              "trackingParams": "x"
+            }
+          },
+          {
+            "searchSuggestionRenderer": {
+              "suggestion": {
+                "runs": [
+                  { "text": "awa " },
+                  { "text": "imani", "bold": true }
+                ]
+              },
+              "trackingParams": "x"
+            }
+          }
+        ],
+        "trackingParams": "x"
+      }
+    }
+  ],
+  "trackingParams": "x"
+}
