@@ -26,8 +26,8 @@ accepts the legacy 11-character video-id string or a
 It walks an eight-rung, version-pinned client ladder, in order:
 
 1. `VISIONOS` 1.02
-2. `IOS` 20.10.4
-3. `ANDROID_VR` 1.57.29
+2. `ANDROID_VR` 1.57.29
+3. `IOS` 20.10.4
 4. `ANDROID_VR` 1.61.29
 5. `ANDROID` 19.09.37
 6. `ANDROID_VR` 1.61.48
@@ -135,7 +135,8 @@ URL; `cancelled` propagates. The one token serves two consumers:
   tail probe.
 - `context.serviceIntegrityDimensions.poToken` on the **attested
   replay**: when bare `player` calls bot-check, the second pass
-  replays only those rungs with the token in the request body.
+  replays only those *attestable* rungs with the token in the
+  request body.
   Live-verified 2026-09: VISIONOS and IOS return full format lists
   attested where bare requests answer `LOGIN_REQUIRED`; ANDROID_VR
   stays walled (VR needs DroidGuard, not BotGuard). With no POT

@@ -490,7 +490,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     for pass in 0..2u8 {
         let attested = pass == 1;
         for (i, rung) in LADDER.iter().enumerate() {
-            if attested && !bot_positions.iter().any(|(rung, _)| *rung == i) {
+            // Pass 2 replays only rungs attestation can lift — a
+            // non-attestable client's bot-check is permanent (its wall
+            // needs DroidGuard, which a BotGuard mint never produces),
+            // so replaying it would be a provably wasted request.
+            if attested && (!rung.attestable || !bot_positions.iter().any(|(rung, _)| *rung == i)) {
                 continue;
             }
             let visitor_key = format!("visitor/{}", rung.kv_key());
@@ -619,9 +623,13 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 record(&mut outcomes, attested, i, &bot_positions, outcome);
                 if !attested && outcome == RungOutcome::Bot {
                     bot_positions.push((i, outcomes.len() - 1));
-                    bot_checks += 1;
-                    // Same bare-pass budget as a body-classified
-                    // BotCheck — the second transport wall ends it.
+                    // Only attestable rungs spend the shared budget — a
+                    // bot-check on a rung attestation cannot lift is a
+                    // dead end, not a reason to end the bare pass for
+                    // later rungs that might still serve.
+                    if rung.attestable {
+                        bot_checks += 1;
+                    }
                     if bot_checks >= 2 {
                         break;
                     }
@@ -681,7 +689,6 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             match classify_playability(&body).0 {
                 Playability::Ok => {}
                 Playability::BotCheck => {
-                    bot_checks += 1;
                     stage_backoff(
                         &backoff_key,
                         now.saturating_add(BOT_BACKOFF_MS),
@@ -691,12 +698,18 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Bot);
                     if !attested {
                         bot_positions.push((i, outcomes.len() - 1));
-                    }
-                    // Shared invocation budget: the second unattested
-                    // bot-check ends the bare pass — attestation is the
-                    // remedy, not more bare requests.
-                    if bot_checks >= 2 && !attested {
-                        break;
+                        // Shared invocation budget: the second bot-check
+                        // on an *attestable* rung ends the bare pass —
+                        // attestation is the remedy, not more bare
+                        // requests to rungs the same IP already walled.
+                        // Non-attestable rungs can't be lifted, so their
+                        // bot-checks never consume the budget.
+                        if rung.attestable {
+                            bot_checks += 1;
+                        }
+                        if bot_checks >= 2 {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -819,7 +832,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
         // mint — the same video-bound token also decorates picked URLs
         // via `finish_pick`. A denied/failed mint keeps today's
         // terminal outcome.
-        if attested || bot_positions.is_empty() {
+        if attested
+            || !bot_positions
+                .iter()
+                .any(|(rung, _)| LADDER[*rung].attestable)
+        {
             break;
         }
         if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
@@ -1324,8 +1341,8 @@ mod tests {
             header_of(out, "X-YouTube-Client-Version").as_deref(),
         ) {
             (Some("101"), Some("1.02")) => 0,
-            (Some("5"), Some("20.10.4")) => 1,
-            (Some("28"), Some("1.57.29")) => 2,
+            (Some("28"), Some("1.57.29")) => 1,
+            (Some("5"), Some("20.10.4")) => 2,
             (Some("28"), Some("1.61.29")) => 3,
             (Some("3"), Some("19.09.37")) => 4,
             (Some("28"), Some("1.61.48")) => 5,
@@ -1397,7 +1414,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
+        assert_eq!(out["result"]["client"], "IOS");
         assert_eq!(out["result"]["mime"], "audio/mp4");
         assert_eq!(out["result"]["bitrate_kbps"], 130);
         assert_eq!(out["result"]["itag"], 140);
@@ -1766,8 +1783,11 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(rung_of(&out), 1);
-        // The shared invocation budget allows one retry, not a loop:
-        // the second bot-check ends the resolve.
+        // A bot-check on the non-attestable rung does not spend the
+        // shared budget — the pass continues.
+        let out = feed(&mut h, &out, BOT);
+        assert_eq!(rung_of(&out), 2);
+        // The second bot-check on an attestable rung ends the resolve.
         let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
@@ -1937,9 +1957,13 @@ mod tests {
         // Pass 1 runs bare: no attestation on the wire.
         assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
         let out = feed(&mut h, &out, BOT);
+        // Rung 1 is not attestable — its bot-check doesn't spend the
+        // budget, so the bare pass continues to rung 2.
         let out = feed(&mut h, &out, BOT);
-        // The second bare bot-check ends the pass; the mint fires and
-        // pass 2 replays rung 0 attested.
+        let out = feed(&mut h, &out, BOT);
+        // The second attestable bot-check ends the pass; the mint
+        // fires and pass 2 replays rung 0 attested (rung 1's bot is
+        // never replayed — nothing can lift it).
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -1978,7 +2002,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "IOS");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         // The one mint is the finish_pick decoration — the JSON-403
         // rung booked Transport, so no attested replay ever ran.
         assert_eq!(h.pot_calls, 1);
@@ -2006,7 +2030,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
+        assert_eq!(out["result"]["client"], "IOS");
         assert_eq!(h.pot_calls, 1);
     }
 
@@ -2028,7 +2052,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
+        assert_eq!(out["result"]["client"], "IOS");
         assert_eq!(h.pot_calls, 1);
     }
 
@@ -2043,6 +2067,7 @@ mod tests {
         let out = begin(&mut h);
         let body =
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not   a    bot";
+        let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         assert_eq!(rung_of(&out), 0);
@@ -2074,6 +2099,7 @@ mod tests {
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2099,6 +2125,7 @@ mod tests {
         };
         let out = begin(&mut h);
         let body = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"not a bot\"},\"metadata\":{\"status\":\"OK\"},";
+        let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
         assert_eq!(rung_of(&out), 0);
@@ -2129,6 +2156,7 @@ mod tests {
             "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}";
         let out = h.answer(&out, 403, body);
         let out = h.answer(&out, 403, body);
+        let out = h.answer(&out, 403, body);
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2157,8 +2185,9 @@ mod tests {
         assert!(body_of(&out)["context"]["serviceIntegrityDimensions"].is_null());
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
-        // The second transport wall ends the bare pass; the mint
-        // fires and pass 2 replays rung 0 attested.
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        // The second attestable transport wall ends the bare pass; the
+        // mint fires and pass 2 replays rung 0 attested.
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
         assert_eq!(
@@ -2180,6 +2209,29 @@ mod tests {
     }
 
     #[test]
+    fn non_attestable_bot_checks_never_starve_later_rungs() {
+        // A bot-check on a rung attestation cannot lift proves nothing
+        // about later clients — it must not spend the bare budget.
+        // SABR on the Apple rungs + walls on the plain-UA ANDROID_VR
+        // rungs still leaves the Oculus pin reachable.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, SABR); // VISIONOS
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29 — no budget spend
+        out = feed(&mut h, &out, SABR); // IOS
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.61.29 — no budget spend
+        out = feed(&mut h, &out, UNPLAYABLE); // ANDROID
+        assert_eq!(rung_of(&out), 5);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        // No attestable rung bot-checked -> no mint, no replay pass.
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
     fn attested_replay_also_walled_is_terminal() {
         let mut h = Harness {
             pot: Pot::Token("tok-xyz"),
@@ -2188,10 +2240,12 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, BOT);
         let out = feed(&mut h, &out, BOT);
-        // Attested replay of rung 0 then rung 1 — still walled.
+        let out = feed(&mut h, &out, BOT);
+        // Attested replay of rung 0 then rung 2 (rung 1's wall needs
+        // DroidGuard — never replayed) — still walled.
         assert_eq!(rung_of(&out), 0);
         let out = feed(&mut h, &out, BOT);
-        assert_eq!(rung_of(&out), 1);
+        assert_eq!(rung_of(&out), 2);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
@@ -2212,10 +2266,11 @@ mod tests {
         };
         let out = begin(&mut h);
         let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, SABR);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(rung_of(&out), 0);
         let out = feed(&mut h, &out, SABR);
-        assert_eq!(rung_of(&out), 1);
+        assert_eq!(rung_of(&out), 2);
         let out = feed(&mut h, &out, SABR);
         assert_eq!(
             fail_kind(&out),
@@ -2230,6 +2285,7 @@ mod tests {
         // `pot_token` call is the only added cost.
         let mut h = Harness::new();
         let out = begin(&mut h);
+        let out = feed(&mut h, &out, BOT);
         let out = feed(&mut h, &out, BOT);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(
@@ -2254,11 +2310,16 @@ mod tests {
                 .to_string()
                 .into_bytes(),
         );
-        // Pass 1: rung 0 is backoff-skipped, rungs 1-2 bot-check live.
+        // Pass 1: rung 0 is backoff-skipped; rung 1's live bot-check
+        // is non-attestable so it never spends the budget — the pass
+        // walks the rest of the ladder before attestation.
         let out = h.invoke(json!({ "source_ref": VID }));
         assert_eq!(rung_of(&out), 1);
-        let out = feed(&mut h, &out, BOT);
-        let out = feed(&mut h, &out, BOT);
+        let mut out = feed(&mut h, &out, BOT);
+        out = feed(&mut h, &out, BOT);
+        for _ in 0..5 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
         // Pass 2 replays rung 0 first despite its stored backoff.
         assert_eq!(rung_of(&out), 0);
         assert_eq!(
@@ -2617,7 +2678,7 @@ mod tests {
     #[test]
     fn pinned_resolve_preserves_uninspectable_player_outcomes() {
         for (body, attempts, expected) in [
-            (BOT, 2, "transient"),
+            (BOT, 3, "transient"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
                 8,
@@ -2978,7 +3039,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "IOS");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         let stored: Value = serde_json::from_slice(
             h.committed
                 .get(&format!("backoff/{VID}/VISIONOS"))

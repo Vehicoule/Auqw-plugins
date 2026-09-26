@@ -18,6 +18,11 @@ pub struct Rung {
     pub user_agent: &'static str,
     /// Extra `context.client` fields (device, OS, locale).
     pub context: fn() -> Value,
+    /// Whether a BotGuard poToken can lift this rung's bot-check.
+    /// Web-attestable rungs only — `ANDROID_VR`/`ANDROID` need
+    /// DroidGuard, which a BotGuard mint never produces, so their
+    /// bot-checks are permanent and never replayed attested.
+    pub attestable: bool,
 }
 
 impl Rung {
@@ -34,19 +39,20 @@ impl Rung {
 }
 
 /// The ladder, in fallback order. `VISIONOS` runs first: it resolves
-/// nearly everywhere and almost never bot-checks from residential IPs,
-/// and — with `IOS` second — the two web-attestable rungs are always
-/// the ones the bare pass reaches before its shared bot-check budget
-/// ends it, so a flagged IP still gets its attested replay. `IOS` sits
-/// second: resolves widely, occasionally SABR-only on newer versions
-/// (hence the 20.10.4 pin).
+/// nearly everywhere and almost never bot-checks from residential IPs.
+/// `ANDROID_VR` 1.57.29 — the predecessor plugin's primary context,
+/// proven-bare on real devices with no poToken — runs second so it is
+/// always reached whenever `VISIONOS` walls, before the attestable
+/// bot-check budget can end the bare pass. `IOS` is the second
+/// web-attestable rung (occasionally SABR-only on newer versions —
+/// hence the 20.10.4 pin), then `ANDROID_VR` 1.61.29, plain `ANDROID`,
+/// and the Oculus-pinned `ANDROID_VR` trio.
 ///
-/// `ANDROID_VR` 1.57.29 / 1.61.29 and plain `ANDROID` follow: they are
-/// the predecessor plugin's proven-bare chain — its default context
-/// resolved instantly on real devices with no poToken. They run before
-/// the Oculus-pinned `ANDROID_VR` trio so a partially-gated IP that
-/// refuses the Apple clients still reaches a known-good identity
-/// inside the bare budget. `WEB_REMIX` is excluded permanently — it
+/// Only web-attestable rungs consume the shared bot-check budget: a
+/// bot-check on an `ANDROID*` client demonstrates nothing attestation
+/// can fix (those walls need DroidGuard, not BotGuard), so it never
+/// starves the bare pass for later rungs — it only records the rung's
+/// backoff and moves on. `WEB_REMIX` is excluded permanently — it
 /// requires signature deciphering, which is out of scope by contract.
 ///
 /// Attestation: on a flagged IP the bare `player` call is answered
@@ -56,8 +62,8 @@ impl Rung {
 /// return full format lists attested where bare requests bot-check;
 /// ANDROID_VR stays walled (VR needs DroidGuard, not BotGuard), and
 /// MWEB fails `UNPLAYABLE` either way. The resolve therefore runs the
-/// ladder bare first, then replays only the bot-checked rungs with
-/// attestation — see `guest.rs`.
+/// ladder bare first, then replays only the *attestable* bot-checked
+/// rungs with attestation — see `guest.rs`.
 ///
 /// Stream caps: any minted URL may be GVS-capped to a ~1 MiB served
 /// budget; enforcement is stochastic per-mint, not client-deterministic
@@ -68,6 +74,7 @@ impl Rung {
 pub const LADDER: &[Rung] = &[
     Rung {
         name: "VISIONOS",
+        attestable: true,
         client_name_id: "101",
         client_version: "1.02",
         user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
@@ -83,7 +90,21 @@ pub const LADDER: &[Rung] = &[
         },
     },
     Rung {
+        name: "ANDROID_VR@1.57.29",
+        attestable: false,
+        client_name_id: "28",
+        client_version: "1.57.29",
+        user_agent: "com.google.android.youtube/1.57.29 (Linux; U; Android 13; US) gzip",
+        context: || {
+            json!({
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
         name: "IOS",
+        attestable: true,
         client_name_id: "5",
         client_version: "20.10.4",
         user_agent: "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
@@ -98,19 +119,8 @@ pub const LADDER: &[Rung] = &[
         },
     },
     Rung {
-        name: "ANDROID_VR@1.57.29",
-        client_name_id: "28",
-        client_version: "1.57.29",
-        user_agent: "com.google.android.youtube/1.57.29 (Linux; U; Android 13; US) gzip",
-        context: || {
-            json!({
-                "gl": "US",
-                "hl": "en",
-            })
-        },
-    },
-    Rung {
         name: "ANDROID_VR@1.61.29",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.61.29",
         user_agent: "com.google.android.youtube/1.61.29 (Linux; U; Android 13; US) gzip",
@@ -123,6 +133,7 @@ pub const LADDER: &[Rung] = &[
     },
     Rung {
         name: "ANDROID",
+        attestable: false,
         client_name_id: "3",
         client_version: "19.09.37",
         user_agent: "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
@@ -136,6 +147,7 @@ pub const LADDER: &[Rung] = &[
     },
     Rung {
         name: "ANDROID_VR@1.61.48",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.61.48",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/132.0.6808.3)",
@@ -153,6 +165,7 @@ pub const LADDER: &[Rung] = &[
     },
     Rung {
         name: "ANDROID_VR@1.60.19",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.60.19",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
@@ -170,6 +183,7 @@ pub const LADDER: &[Rung] = &[
     },
     Rung {
         name: "ANDROID_VR@1.43.32",
+        attestable: false,
         client_name_id: "28",
         client_version: "1.43.32",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.43.32 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1; Cronet/107.0.5284.2)",
