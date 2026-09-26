@@ -1,6 +1,7 @@
-//! The Slice 0 client ladder: `VISIONOS`, `IOS`, three `ANDROID_VR`
-//! pins. Client versions are load-bearing: newer IOS builds are served
-//! SABR-only. Pin, don't track upstream.
+//! The client ladder: `VISIONOS`, `IOS`, the predecessor's proven-bare
+//! `ANDROID_VR` pins and a plain `ANDROID`, then three `ANDROID_VR`
+//! fallbacks. Client versions are load-bearing: newer IOS builds are
+//! served SABR-only. Pin, don't track upstream.
 
 use auqw_guest_sdk::HttpRequest;
 use serde_json::{json, Value};
@@ -33,13 +34,20 @@ impl Rung {
 }
 
 /// The ladder, in fallback order. `VISIONOS` runs first: it resolves
-/// nearly everywhere and almost never bot-checks from residential IPs.
-/// `ANDROID_VR` rungs are the fallback — their URLs serve full streams
-/// but the rung itself is the most bot-checked from residential IPs, so
-/// it runs only after the Apple clients fail. `IOS` sits between:
-/// resolves widely, occasionally SABR-only on newer versions (hence the
-/// 20.10.4 pin). `WEB_REMIX` is excluded permanently — it requires
-/// signature deciphering, which is out of scope by contract.
+/// nearly everywhere and almost never bot-checks from residential IPs,
+/// and — with `IOS` second — the two web-attestable rungs are always
+/// the ones the bare pass reaches before its shared bot-check budget
+/// ends it, so a flagged IP still gets its attested replay. `IOS` sits
+/// second: resolves widely, occasionally SABR-only on newer versions
+/// (hence the 20.10.4 pin).
+///
+/// `ANDROID_VR` 1.57.29 / 1.61.29 and plain `ANDROID` follow: they are
+/// the predecessor plugin's proven-bare chain — its default context
+/// resolved instantly on real devices with no poToken. They run before
+/// the Oculus-pinned `ANDROID_VR` trio so a partially-gated IP that
+/// refuses the Apple clients still reaches a known-good identity
+/// inside the bare budget. `WEB_REMIX` is excluded permanently — it
+/// requires signature deciphering, which is out of scope by contract.
 ///
 /// Attestation: on a flagged IP the bare `player` call is answered
 /// `LOGIN_REQUIRED`/bot-check. A video-bound BotGuard poToken carried
@@ -85,6 +93,43 @@ pub const LADDER: &[Rung] = &[
                 "deviceModel": "iPhone16,2",
                 "osName": "iPhone",
                 "osVersion": "18.3.2.22F90",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
+        name: "ANDROID_VR@1.57.29",
+        client_name_id: "28",
+        client_version: "1.57.29",
+        user_agent: "com.google.android.youtube/1.57.29 (Linux; U; Android 13; US) gzip",
+        context: || {
+            json!({
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
+        name: "ANDROID_VR@1.61.29",
+        client_name_id: "28",
+        client_version: "1.61.29",
+        user_agent: "com.google.android.youtube/1.61.29 (Linux; U; Android 13; US) gzip",
+        context: || {
+            json!({
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
+        name: "ANDROID",
+        client_name_id: "3",
+        client_version: "19.09.37",
+        user_agent: "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+        context: || {
+            json!({
+                "androidSdkVersion": 30,
+                "gl": "US",
                 "hl": "en",
             })
         },
@@ -143,8 +188,10 @@ pub const LADDER: &[Rung] = &[
 ];
 
 /// The InnerTube `player` endpoint. `music.youtube.com` is the canonical
-/// host for this provider.
-pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?prettyPrint=false";
+/// host for this provider. The embedded `key` is YouTube's public
+/// InnerTube API key — the same one every official client ships; a
+/// keyless `player` call reads as a forged request to the abuse edge.
+pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
 /// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
 /// URLs and URLs already carrying `pot=` pass through unchanged. The
@@ -254,6 +301,10 @@ pub fn player_request(
     }
     let mut context = serde_json::Map::new();
     context.insert("client".into(), Value::Object(client));
+    // Anonymous-user marker: official native clients always send an
+    // (empty) `user` object; its absence is another forged-request
+    // signal.
+    context.insert("user".into(), json!({}));
     if let Some(token) = pot {
         context.insert(
             "serviceIntegrityDimensions".into(),
@@ -266,17 +317,19 @@ pub fn player_request(
         "contentCheckOk": true,
         "racyCheckOk": true,
     });
+    // Native clients use api format version 2 (web contexts use 1 —
+    // see `web_remix_request`), and they send no Origin/Referer: a
+    // native client identity carrying web-origin headers is itself an
+    // inconsistency the abuse edge can key on.
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
         ("User-Agent".into(), rung.user_agent.into()),
-        ("X-Goog-Api-Format-Version".into(), "1".into()),
+        ("X-Goog-Api-Format-Version".into(), "2".into()),
         ("X-YouTube-Client-Name".into(), rung.client_name_id.into()),
         (
             "X-YouTube-Client-Version".into(),
             rung.client_version.into(),
         ),
-        ("X-Origin".into(), "https://music.youtube.com".into()),
-        ("Referer".into(), "https://music.youtube.com".into()),
     ];
     if let Some(visitor) = visitor_id {
         headers.push(("X-Goog-Visitor-Id".into(), visitor.into()));

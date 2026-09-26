@@ -11,7 +11,9 @@ use serde_json::{json, Map, Value};
 use crate::guest::{bad_payload, failed, is_video_id, payload_keys, warn};
 use crate::parse::{visitor_data, visitor_token};
 
-const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?prettyPrint=false";
+/// InnerTube `search`. The `key` is YouTube's public embedded API key
+/// — every official client carries it on each `youtubei` call.
+const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 pub(crate) const CLIENT_NAME_ID: &str = "67";
 pub(crate) const CLIENT_VERSION: &str = "1.20260114.01.00";
 pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
@@ -160,7 +162,8 @@ pub(crate) fn web_remix_context() -> Value {
             "hl": "en",
             "gl": "US",
             "userAgent": USER_AGENT,
-        }
+        },
+        "user": {},
     })
 }
 
@@ -762,7 +765,7 @@ mod tests {
         assert_eq!(out["kind"], "http_request");
         assert_eq!(
             out["payload"]["url"],
-            "https://music.youtube.com/youtubei/v1/search?prettyPrint=false"
+            "https://music.youtube.com/youtubei/v1/search?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
         );
         let out = h.answer(&out, 200, SONGS);
         assert_eq!(out["type"], "done");

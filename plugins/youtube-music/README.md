@@ -23,21 +23,26 @@ accepts the legacy 11-character video-id string or a
 - `resume_offset` (null/absent or u64): validated seam input for the
   Slice 1.5 re-mint path; byte pumping itself is Slice 1.5-owned.
 
-It walks a five-rung, version-pinned client ladder, in order:
+It walks an eight-rung, version-pinned client ladder, in order:
 
 1. `VISIONOS` 1.02
 2. `IOS` 20.10.4
-3. `ANDROID_VR` 1.61.48
-4. `ANDROID_VR` 1.60.19
-5. `ANDROID_VR` 1.43.32
+3. `ANDROID_VR` 1.57.29
+4. `ANDROID_VR` 1.61.29
+5. `ANDROID` 19.09.37
+6. `ANDROID_VR` 1.61.48
+7. `ANDROID_VR` 1.60.19
+8. `ANDROID_VR` 1.43.32
 
-For each rung it POSTs `youtubei/v1/player?prettyPrint=false` with the
-rung's client identity (`User-Agent`, `X-YouTube-Client-Name`/`Version`,
-`X-Origin`/`Referer: https://music.youtube.com`), then scans
-`streamingData.adaptiveFormats` for `audio/*` entries with a **plain
-`url` field**. Entries carrying `signatureCipher`/`cipher` are dropped,
-never deciphered; non-https URLs are skipped — the host only serves
-https destinations.
+For each rung it POSTs `youtubei/v1/player?key=<public InnerTube
+key>&prettyPrint=false` with the rung's client identity (`User-Agent`,
+`X-YouTube-Client-Name`/`Version`, `X-Goog-Api-Format-Version: 2`) and
+`context.user: {}` — the same request shape the official native clients
+send (no Origin/Referer; web clients carry those instead). It then
+scans `streamingData.adaptiveFormats` for `audio/*` entries with a
+**plain `url` field**. Entries carrying `signatureCipher`/`cipher` are
+dropped, never deciphered; non-https URLs are skipped — the host only
+serves https destinations.
 
 ## KV visitors and backoff
 

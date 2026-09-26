@@ -1325,9 +1325,12 @@ mod tests {
         ) {
             (Some("101"), Some("1.02")) => 0,
             (Some("5"), Some("20.10.4")) => 1,
-            (Some("28"), Some("1.61.48")) => 2,
-            (Some("28"), Some("1.60.19")) => 3,
-            (Some("28"), Some("1.43.32")) => 4,
+            (Some("28"), Some("1.57.29")) => 2,
+            (Some("28"), Some("1.61.29")) => 3,
+            (Some("3"), Some("19.09.37")) => 4,
+            (Some("28"), Some("1.61.48")) => 5,
+            (Some("28"), Some("1.60.19")) => 6,
+            (Some("28"), Some("1.43.32")) => 7,
             other => panic!("unexpected rung headers {other:?} in {out}"),
         }
     }
@@ -1384,7 +1387,7 @@ mod tests {
         let out = begin(&mut h);
         assert_eq!(
             url_of(&out),
-            "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+            "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false"
         );
         let out = feed(&mut h, &out, SABR);
         assert_eq!(rung_of(&out), 1);
@@ -1394,7 +1397,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         assert_eq!(out["result"]["mime"], "audio/mp4");
         assert_eq!(out["result"]["bitrate_kbps"], 130);
         assert_eq!(out["result"]["itag"], 140);
@@ -1409,7 +1412,7 @@ mod tests {
     fn last_rung_success_reports_client() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for rung in 1..=4usize {
+        for rung in 1..=7usize {
             out = feed(&mut h, &out, SABR);
             assert_eq!(rung_of(&out), rung);
         }
@@ -1682,7 +1685,7 @@ mod tests {
     fn probe_429_reports_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 429, "");
@@ -1697,7 +1700,7 @@ mod tests {
     fn probe_5xx_is_transport() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 503, "");
@@ -1728,7 +1731,7 @@ mod tests {
     fn all_capped_fails_streams_capped() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
@@ -1790,17 +1793,13 @@ mod tests {
         let mut h = Harness::new();
         let out = begin(&mut h);
         assert_eq!(out["payload"]["method"], "POST");
-        assert_eq!(
-            header_of(&out, "X-Origin").as_deref(),
-            Some("https://music.youtube.com")
-        );
-        assert_eq!(
-            header_of(&out, "Referer").as_deref(),
-            Some("https://music.youtube.com")
-        );
+        // Native identities send no web-origin headers and use api
+        // format version 2.
+        assert!(header_of(&out, "X-Origin").is_none());
+        assert!(header_of(&out, "Referer").is_none());
         assert_eq!(
             header_of(&out, "X-Goog-Api-Format-Version").as_deref(),
-            Some("1")
+            Some("2")
         );
         assert!(header_of(&out, "Origin").is_none());
         let body = String::from_utf8(
@@ -1811,6 +1810,8 @@ mod tests {
         assert!(body.contains("\"videoId\":\"vid12345678\""));
         assert!(body.contains("\"contentCheckOk\":true"));
         assert!(body.contains("\"clientName\":\"VISIONOS\""));
+        // The anonymous-user object rides every native request.
+        assert!(body.contains("\"user\":{}"));
         // The bare pass carries no attestation — the shared token only
         // enters `serviceIntegrityDimensions` on the bot-replay pass.
         assert!(!body.contains("serviceIntegrityDimensions"));
@@ -2005,7 +2006,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         assert_eq!(h.pot_calls, 1);
     }
 
@@ -2027,7 +2028,7 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        assert_eq!(out["result"]["client"], "ANDROID_VR@1.61.48");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         assert_eq!(h.pot_calls, 1);
     }
 
@@ -2276,7 +2277,7 @@ mod tests {
     fn all_sabr_fails_unsupported_sabr() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, SABR);
         }
         assert_eq!(
@@ -2289,7 +2290,7 @@ mod tests {
     fn all_ciphered_fails_unsupported_ciphered() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, CIPHERED);
         }
         assert_eq!(
@@ -2307,7 +2308,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, BOT);
-        for _ in 0..4 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, SABR);
         }
         // The single bare bot-check does not end the pass, so the
@@ -2324,7 +2325,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         out = h.answer(&out, 500, "{}");
-        for _ in 0..4 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, SABR);
         }
         assert_eq!(
@@ -2339,7 +2340,7 @@ mod tests {
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, UNPLAYABLE);
         out = h.answer(&out, 429, "{}");
-        for _ in 0..3 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
@@ -2352,7 +2353,7 @@ mod tests {
     fn unavailable_ladder_fails_no_result() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
@@ -2396,7 +2397,7 @@ mod tests {
     fn host_rate_limit_on_every_rung_fails_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = h.answer_host_error(&out, "rate-limit");
         }
         assert_eq!(
@@ -2438,7 +2439,7 @@ mod tests {
         // Every rung answering the wrong video -> honest no-result.
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, &wrong);
         }
         assert_eq!(
@@ -2520,6 +2521,9 @@ mod tests {
         for rung in [
             "VISIONOS",
             "IOS",
+            "ANDROID_VR@1.57.29",
+            "ANDROID_VR@1.61.29",
+            "ANDROID",
             "ANDROID_VR@1.61.48",
             "ANDROID_VR@1.60.19",
             "ANDROID_VR@1.43.32",
@@ -2580,7 +2584,7 @@ mod tests {
         // rung 0: 429 stages a backoff; the rest of the ladder serves
         // unplayable -> `fail` discards the staged write by contract.
         let mut out = h.answer(&out, 429, "{}");
-        for _ in 0..4 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(fail_kind(&out).0, "rate-limit");
@@ -2604,7 +2608,7 @@ mod tests {
     fn pinned_resolve_preserves_transport_failures() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = h.answer_host_error(&out, "transient");
         }
         assert_eq!(fail_kind(&out).0, "transient");
@@ -2616,15 +2620,15 @@ mod tests {
             (BOT, 2, "transient"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
-                5,
+                8,
                 "auth-required",
             ),
-            (SABR, 5, "unsupported"),
-            (CIPHERED, 5, "unsupported"),
-            (UNPLAYABLE, 5, "no-result"),
+            (SABR, 8, "unsupported"),
+            (CIPHERED, 8, "unsupported"),
+            (UNPLAYABLE, 8, "no-result"),
             (
                 r#"{"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"itag":140,"mimeType":"audio/mp4","url":"http://example.test/audio"}]}}"#,
-                5,
+                8,
                 "no-result",
             ),
         ] {
@@ -2641,7 +2645,7 @@ mod tests {
     fn pin_itag_missing_everywhere_is_expired_resource() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 774 }));
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, OK);
             if out["type"] == "host_request" && out["payload"]["method"] == "GET" {
                 panic!("a missing pin must never reach the probe");
@@ -2755,15 +2759,15 @@ mod tests {
     fn pin_seen_then_capped_is_not_pinned_unavailable() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
-        // rung 0 lacks itag 251 -> advances; rungs 1-4 provide it but
+        // rung 0 lacks itag 251 -> advances; rungs 1-7 provide it but
         // every probe refuses -> capped weather, not a missing resource.
         out = feed(&mut h, &out, &ok_without_itag(251));
         assert_eq!(rung_of(&out), 1);
-        for rung in 1..5usize {
+        for rung in 1..8usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            if rung < 4 {
+            if rung < 7 {
                 assert_eq!(rung_of(&out), rung + 1);
             }
         }
@@ -2778,7 +2782,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
         // No rung carries itag 251 -> the requested pin is unavailable.
-        for _ in 0..5 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, &ok_without_itag(251));
         }
         assert_eq!(
