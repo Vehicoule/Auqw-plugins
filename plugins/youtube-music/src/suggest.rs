@@ -42,7 +42,9 @@ fn parse_suggest_payload(payload: &Value) -> Result<SuggestPayload, GuestError> 
     let limit = match obj.get("limit") {
         None | Some(Value::Null) => 10,
         Some(Value::Number(n)) => match n.as_u64() {
-            Some(v) if v >= 1 => (v as usize).min(MAX_SUGGESTIONS),
+            // Clamp in u64 before narrowing: on wasm32 `as usize`
+            // truncates first and a huge limit would wrap to zero.
+            Some(v) if v >= 1 => v.min(MAX_SUGGESTIONS as u64) as usize,
             _ => return Err(bad_payload("limit must be a positive integer")),
         },
         _ => return Err(bad_payload("limit must be a positive integer")),
@@ -140,9 +142,10 @@ pub async fn suggest(payload: &Value) -> Result<Value, GuestError> {
             )
         })?;
     let mut out: Vec<String> = Vec::new();
-    // Scan bound: a pathological renderer list is bounded regardless
-    // of how many rows skip or dedupe.
-    for item in contents.iter().take(MAX_SUGGESTIONS * 4) {
+    // Walk the whole section: skipped rows (history, dupes, blanks)
+    // must not hide later completions — the response body is already
+    // bounded at the transport boundary.
+    for item in contents {
         let renderer = match item
             .get("searchSuggestionRenderer")
             .and_then(Value::as_object)
