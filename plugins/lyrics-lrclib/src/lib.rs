@@ -336,10 +336,30 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
             }
             TierKind::Search => {
                 search_records = parse::parse_search(&body)?;
-                match parse::pick(&search_records, &q.title, q.artist.as_deref()) {
-                    Some(r) => r,
-                    None => continue,
+                // A search answers a whole candidate list, not one
+                // record: walk them evidence-first (name strength,
+                // then duration within the drift bound) and take the
+                // first whose content serves the flavor. Picking a
+                // single row used to discard siblings carrying synced
+                // lyrics — and to serve a wrong-edit record the app
+                // then had to reject on drift.
+                for candidate in parse::ranked(
+                    &search_records,
+                    &q.title,
+                    q.artist.as_deref(),
+                    q.duration_ms,
+                ) {
+                    if first_matched.is_null() {
+                        first_matched = candidate.matched();
+                    }
+                    let is_match = parse::names_query(candidate, &q.title, q.artist.as_deref());
+                    if let Some(result) =
+                        record_result(candidate, flavor, &candidate.matched(), is_match)
+                    {
+                        return Ok(result);
+                    }
                 }
+                continue;
             }
         };
         if first_matched.is_null() {
