@@ -120,163 +120,627 @@ fn next_body(p: &RadioPayload) -> Value {
 // are skipped at tokenize time rather than materialized.
 //
 // Tolerance mirrors the old `get(k).and_then(as_*)` chains exactly:
-// every field parses through a visitor that collapses a wrong-typed
-// value to absent (draining unexpected maps/sequences so the stream
-// stays aligned), and every list element that is not an object drops
-// out — a malformed row is skipped, never fatal to the page.
+// every field parses through a wrapper that collapses a wrong-typed
+// value to absent, every list element that is not an object drops out,
+// and a repeated key overwrites — `Value` kept the last occurrence, so
+// these visitors do too.
 
-/// `as_str`: a string decodes, anything else — scalars, objects, arrays
-/// — is absent. Sequences and maps are drained to keep the parser
-/// aligned for the next field.
-fn opt_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    struct V;
-    impl<'de> Visitor<'de> for V {
-        type Value = Option<String>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a string")
-        }
-        fn visit_str<E>(self, v: &str) -> Result<Option<String>, E> {
-            Ok(Some(v.to_owned()))
-        }
-        fn visit_string<E>(self, v: String) -> Result<Option<String>, E> {
-            Ok(Some(v))
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<String>, A::Error> {
-            while s.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Option<String>, A::Error> {
-            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_bool<E>(self, _v: bool) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_i64<E>(self, _v: i64) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_u64<E>(self, _v: u64) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_f64<E>(self, _v: f64) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_char<E>(self, _v: char) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_bytes<E>(self, _v: &[u8]) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_byte_buf<E>(self, _v: Vec<u8>) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_unit<E>(self) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_none<E>(self) -> Result<Option<String>, E> {
-            Ok(None)
-        }
-        fn visit_some<D2: serde::Deserializer<'de>>(
-            self,
-            d: D2,
-        ) -> Result<Option<String>, D2::Error> {
-            d.deserialize_any(self)
+/// Old `best_artwork` walk bounds: 64 levels, 10 000 nodes. The scan
+/// frames (`ArtworkScan`, `ThumbSet`, `ThumbNode`) share the same
+/// budget, kept in thread locals because the recursion goes through
+/// serde's `Deserialize` chain and cannot carry state.
+mod scan_depth {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+        static NODES: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// One recursion level; the returned guard unwinds it on drop.
+    /// `None` once the depth cap is hit — the caller drains the rest
+    /// of that value without descending.
+    pub(super) fn enter() -> Option<ScanGuard> {
+        DEPTH.with(|d| {
+            if d.get() == 0 {
+                NODES.with(|n| n.set(0));
+            }
+            if d.get() >= 64 {
+                None
+            } else {
+                d.set(d.get() + 1);
+                Some(ScanGuard)
+            }
+        })
+    }
+
+    /// One visited key/element; `false` once the node cap is hit.
+    pub(super) fn node() -> bool {
+        NODES.with(|n| {
+            if n.get() >= 10_000 {
+                false
+            } else {
+                n.set(n.get() + 1);
+                true
+            }
+        })
+    }
+
+    pub(super) struct ScanGuard;
+
+    impl Drop for ScanGuard {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         }
     }
-    d.deserialize_any(V)
 }
 
-/// `as_u64` on a lazily read field.
-fn opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    struct V;
-    impl<'de> Visitor<'de> for V {
-        type Value = Option<u64>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a u64")
+/// Drain the rest of a map, scanning each value for artwork —
+/// a wrong-shaped field still contributes its `thumbnails`, like the
+/// old whole-subtree walk.
+fn drain_scan_map<'de, A: MapAccess<'de>>(m: &mut A) -> Result<Option<(u64, Thumb)>, A::Error> {
+    let mut best = None;
+    loop {
+        if !scan_depth::node() {
+            drain_skip_map(m)?;
+            break;
         }
-        fn visit_u64<E>(self, v: u64) -> Result<Option<u64>, E> {
-            Ok(Some(v))
-        }
-        fn visit_i64<E>(self, v: i64) -> Result<Option<u64>, E> {
-            Ok(u64::try_from(v).ok())
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<u64>, A::Error> {
-            while s.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Option<u64>, A::Error> {
-            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_bool<E>(self, _v: bool) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_f64<E>(self, _v: f64) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_str<E>(self, _v: &str) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_unit<E>(self) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_none<E>(self) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Option<u64>, D2::Error> {
-            d.deserialize_any(self)
+        let Some(k) = m.next_key::<&str>()? else {
+            break;
+        };
+        if k == "thumbnails" {
+            merge_art(&mut best, m.next_value::<ThumbSet>()?.0);
+        } else {
+            merge_art(&mut best, m.next_value::<ArtworkScan>()?.0);
         }
     }
-    d.deserialize_any(V)
+    Ok(best)
 }
 
-/// `as_object` + shape parse: a map becomes `Some(T)`, anything else is
-/// absent. `T`'s own fields are all opt_*, so a struct parse only fails
-/// on malformed JSON — which the upfront DOM parse would reject too.
-fn opt_obj<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct V<T>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
-        type Value = Option<T>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an object")
+/// Drain the rest of a sequence, scanning each element for artwork.
+fn drain_scan_seq<'de, A: SeqAccess<'de>>(s: &mut A) -> Result<Option<(u64, Thumb)>, A::Error> {
+    let mut best = None;
+    loop {
+        if !scan_depth::node() {
+            drain_skip_seq(s)?;
+            break;
         }
-        fn visit_map<A: MapAccess<'de>>(self, acc: A) -> Result<Option<T>, A::Error> {
-            T::deserialize(serde::de::value::MapAccessDeserializer::new(acc)).map(Some)
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<T>, A::Error> {
-            while s.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_bool<E>(self, _v: bool) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_i64<E>(self, _v: i64) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_u64<E>(self, _v: u64) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_f64<E>(self, _v: f64) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_str<E>(self, _v: &str) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_unit<E>(self) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_none<E>(self) -> Result<Option<T>, E> {
-            Ok(None)
-        }
-        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Option<T>, D2::Error> {
-            d.deserialize_any(self)
+        match s.next_element::<ArtworkScan>()? {
+            Some(ArtworkScan(a)) => merge_art(&mut best, a),
+            None => break,
         }
     }
-    d.deserialize_any(V(PhantomData))
+    Ok(best)
+}
+
+/// Drain without scanning — envelope fields never carried artwork.
+fn drain_skip_map<'de, A: MapAccess<'de>>(m: &mut A) -> Result<(), A::Error> {
+    while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+fn drain_skip_seq<'de, A: SeqAccess<'de>>(s: &mut A) -> Result<(), A::Error> {
+    while s.next_element::<IgnoredAny>()?.is_some() {}
+    Ok(())
+}
+
+/// `as_str` as a `next_value` target: a string decodes, anything else
+/// is absent — and a map/seq's subtree is still scanned for artwork.
+/// `Deref` makes it read as `Option<String>` at use sites.
+#[derive(Default)]
+struct OptStr {
+    v: Option<String>,
+    art: Option<(u64, Thumb)>,
+}
+
+impl Deref for OptStr {
+    type Target = Option<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.v
+    }
+}
+
+impl ArtCarrier for OptStr {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        self.art.clone()
+    }
+}
+
+impl<'de> Deserialize<'de> for OptStr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptStr;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<OptStr, E> {
+                Ok(OptStr {
+                    v: Some(v.to_owned()),
+                    art: None,
+                })
+            }
+            fn visit_string<E>(self, v: String) -> Result<OptStr, E> {
+                Ok(OptStr {
+                    v: Some(v),
+                    art: None,
+                })
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<OptStr, A::Error> {
+                let art = drain_scan_seq(&mut s)?;
+                Ok(OptStr { v: None, art })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<OptStr, A::Error> {
+                let art = drain_scan_map(&mut m)?;
+                Ok(OptStr { v: None, art })
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<OptStr, E> {
+                Ok(OptStr { v: None, art: None })
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<OptStr, E> {
+                Ok(OptStr { v: None, art: None })
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<OptStr, E> {
+                Ok(OptStr { v: None, art: None })
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<OptStr, E> {
+                Ok(OptStr { v: None, art: None })
+            }
+            fn visit_unit<E>(self) -> Result<OptStr, E> {
+                Ok(OptStr { v: None, art: None })
+            }
+            fn visit_none<E>(self) -> Result<OptStr, E> {
+                Ok(OptStr { v: None, art: None })
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<OptStr, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `as_u64` as a `next_value` target.
+#[derive(Default)]
+struct OptU64 {
+    v: Option<u64>,
+    art: Option<(u64, Thumb)>,
+}
+
+impl Deref for OptU64 {
+    type Target = Option<u64>;
+    fn deref(&self) -> &Self::Target {
+        &self.v
+    }
+}
+
+impl ArtCarrier for OptU64 {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        self.art.clone()
+    }
+}
+
+impl<'de> Deserialize<'de> for OptU64 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = OptU64;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a u64")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<OptU64, E> {
+                Ok(OptU64 {
+                    v: Some(v),
+                    art: None,
+                })
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<OptU64, E> {
+                Ok(OptU64 {
+                    v: u64::try_from(v).ok(),
+                    art: None,
+                })
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<OptU64, A::Error> {
+                let art = drain_scan_seq(&mut s)?;
+                Ok(OptU64 { v: None, art })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<OptU64, A::Error> {
+                let art = drain_scan_map(&mut m)?;
+                Ok(OptU64 { v: None, art })
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<OptU64, E> {
+                Ok(OptU64 { v: None, art: None })
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<OptU64, E> {
+                Ok(OptU64 { v: None, art: None })
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<OptU64, E> {
+                Ok(OptU64 { v: None, art: None })
+            }
+            fn visit_unit<E>(self) -> Result<OptU64, E> {
+                Ok(OptU64 { v: None, art: None })
+            }
+            fn visit_none<E>(self) -> Result<OptU64, E> {
+                Ok(OptU64 { v: None, art: None })
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<OptU64, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// `as_object` + shape parse as a `next_value` target: a map becomes
+/// `Some(T)`, anything else is absent. A wrong-shaped subtree is still
+/// scanned for artwork; a `T` that fails mid-map drains its remaining
+/// entries the same way.
+struct OptObj<T> {
+    v: Option<T>,
+    art: Option<(u64, Thumb)>,
+}
+
+impl<T> Default for OptObj<T> {
+    fn default() -> Self {
+        OptObj { v: None, art: None }
+    }
+}
+
+impl<T> Deref for OptObj<T> {
+    type Target = Option<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.v
+    }
+}
+
+impl<T: HasArt> ArtCarrier for OptObj<T> {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        let mut best = self.art.clone();
+        if let Some(t) = &self.v {
+            merge_art(&mut best, t.art_out());
+        }
+        best
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptObj<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = OptObj<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut acc: A) -> Result<OptObj<T>, A::Error> {
+                match T::deserialize(serde::de::value::MapAccessDeserializer::new(&mut acc)) {
+                    Ok(t) => Ok(OptObj {
+                        v: Some(t),
+                        art: None,
+                    }),
+                    Err(_) => {
+                        let art = drain_scan_map(&mut acc)?;
+                        Ok(OptObj { v: None, art })
+                    }
+                }
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<OptObj<T>, A::Error> {
+                let art = drain_scan_seq(&mut s)?;
+                Ok(OptObj { v: None, art })
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_unit<E>(self) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_none<E>(self) -> Result<OptObj<T>, E> {
+                Ok(OptObj { v: None, art: None })
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<OptObj<T>, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// `as_array` + the per-element skip as a `next_value` target: a
+/// non-array field is empty (its subtree still scanned for art) and
+/// each element tolerates any JSON shape.
+struct OptVec<T> {
+    v: Vec<T>,
+    art: Option<(u64, Thumb)>,
+}
+
+impl<T> Default for OptVec<T> {
+    fn default() -> Self {
+        OptVec {
+            v: Vec::new(),
+            art: None,
+        }
+    }
+}
+
+impl<T> Deref for OptVec<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.v
+    }
+}
+
+impl<T: HasArt> ArtCarrier for OptVec<T> {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        let mut best = self.art.clone();
+        for t in &self.v {
+            merge_art(&mut best, t.art_out());
+        }
+        best
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = OptVec<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an array")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<OptVec<T>, A::Error> {
+                let mut out = Vec::new();
+                let mut art = None;
+                while let Some(Tolerant(t, a)) = s.next_element::<Tolerant<T>>()? {
+                    merge_art(&mut art, a);
+                    if let Some(t) = t {
+                        out.push(t);
+                    }
+                }
+                Ok(OptVec { v: out, art })
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<OptVec<T>, A::Error> {
+                let art = drain_scan_map(&mut m)?;
+                Ok(OptVec { v: Vec::new(), art })
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_unit<E>(self) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_none<E>(self) -> Result<OptVec<T>, E> {
+                Ok(OptVec {
+                    v: Vec::new(),
+                    art: None,
+                })
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<OptVec<T>, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// An array element that may be any JSON value, carrying any artwork
+/// found while draining a failed `T`.
+struct Tolerant<T>(Option<T>, Option<(u64, Thumb)>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Tolerant<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = Tolerant<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut acc: A) -> Result<Tolerant<T>, A::Error> {
+                match T::deserialize(serde::de::value::MapAccessDeserializer::new(&mut acc)) {
+                    Ok(t) => Ok(Tolerant(Some(t), None)),
+                    Err(_) => {
+                        // Element-level rot: drain the rest of the map
+                        // (scanning for art) so the parent array stays
+                        // aligned, then drop the element — a dead row,
+                        // not a dead page.
+                        let art = drain_scan_map(&mut acc)?;
+                        Ok(Tolerant(None, art))
+                    }
+                }
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Tolerant<T>, A::Error> {
+                let art = drain_scan_seq(&mut s)?;
+                Ok(Tolerant(None, art))
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::BoolDeserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::I64Deserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::U64Deserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_f64<E>(self, v: f64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::F64Deserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(serde::de::value::StringDeserializer::<
+                        serde::de::value::Error,
+                    >::new(v))
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_unit<E>(self) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::UnitDeserializer::<serde::de::value::Error>::new(),
+                    )
+                    .ok(),
+                    None,
+                ))
+            }
+            fn visit_none<E>(self) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None, None))
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<Tolerant<T>, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// `as_array` keeping every slot as `Option<T>` — callers that join
+/// elements need positions, not just survivors.
+struct OptVecOpt<T>(Vec<Option<T>>);
+
+impl<T> Default for OptVecOpt<T> {
+    fn default() -> Self {
+        OptVecOpt(Vec::new())
+    }
+}
+
+impl<T> Deref for OptVecOpt<T> {
+    type Target = Vec<Option<T>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptVecOpt<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = OptVecOpt<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an array")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<OptVecOpt<T>, A::Error> {
+                let mut out = Vec::new();
+                while let Some(Tolerant(t, _)) = s.next_element::<Tolerant<T>>()? {
+                    out.push(t);
+                }
+                Ok(OptVecOpt(out))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<OptVecOpt<T>, A::Error> {
+                drain_skip_map(&mut m)?;
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_unit<E>(self) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_none<E>(self) -> Result<OptVecOpt<T>, E> {
+                Ok(OptVecOpt(Vec::new()))
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<OptVecOpt<T>, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
 }
 
 /// A field whose presence — not validity — drives behavior: `Absent`
@@ -295,82 +759,9 @@ impl<'de> Deserialize<'de> for Presence {
     }
 }
 
-/// `opt_obj` as a type, for `MapAccess::next_value` targets.
-struct OptObj<T>(Option<T>);
-
-impl<T> Default for OptObj<T> {
-    fn default() -> Self {
-        OptObj(None)
-    }
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptObj<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        opt_obj(d).map(OptObj)
-    }
-}
-
-impl<T> Deref for OptObj<T> {
-    type Target = Option<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// `opt_str` as a type, for `MapAccess::next_value` targets. `Deref`
-/// makes it read as `Option<String>` at use sites.
-#[derive(Default)]
-struct OptStr(Option<String>);
-
-impl<'de> Deserialize<'de> for OptStr {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        opt_str(d).map(OptStr)
-    }
-}
-
-impl Deref for OptStr {
-    type Target = Option<String>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// `opt_u64` as a type.
-#[derive(Default)]
-struct OptU64(Option<u64>);
-
-impl<'de> Deserialize<'de> for OptU64 {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        opt_u64(d).map(OptU64)
-    }
-}
-
-impl Deref for OptU64 {
-    type Target = Option<u64>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// `opt_vec` as a type.
-struct OptVec<T>(Vec<T>);
-
-impl<T> Default for OptVec<T> {
-    fn default() -> Self {
-        OptVec(Vec::new())
-    }
-}
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptVec<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        opt_vec(d).map(OptVec)
-    }
-}
-
-impl<T> Deref for OptVec<T> {
-    type Target = Vec<T>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl ArtCarrier for Presence {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        None
     }
 }
 
@@ -384,39 +775,50 @@ trait ArtCarrier {
     fn art_out(&self) -> Option<(u64, Thumb)>;
 }
 
-impl<T: HasArt> ArtCarrier for OptObj<T> {
-    fn art_out(&self) -> Option<(u64, Thumb)> {
-        self.0.as_ref().and_then(|t| t.art_out())
-    }
-}
-
-impl<T: HasArt> ArtCarrier for OptVec<T> {
-    fn art_out(&self) -> Option<(u64, Thumb)> {
-        let mut best = None;
-        for t in &self.0 {
-            merge_art(&mut best, t.art_out());
+/// `Deserialize` for an envelope object between the body and the row:
+/// named keys claim tolerant wrappers, a repeated key overwrites
+/// (`Value` kept the last occurrence), unknown keys are skipped.
+macro_rules! lenient_obj {
+    ($name:ident { $( $field:ident : $key:literal => $dec:ty ),* $(,)? }) => {
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = $name;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str(concat!(stringify!($name), " object"))
+                    }
+                    fn visit_map<A: MapAccess<'de>>(
+                        self,
+                        mut m: A,
+                    ) -> Result<$name, A::Error> {
+                        $( let mut $field = <$dec>::default(); )*
+                        while let Some(k) = m.next_key::<&str>()? {
+                            match k {
+                                $( $key => $field = m.next_value::<$dec>()?, )*
+                                _ => {
+                                    m.next_value::<IgnoredAny>()?;
+                                }
+                            }
+                        }
+                        Ok($name { $($field),* })
+                    }
+                }
+                d.deserialize_any(V)
+            }
         }
-        best
-    }
-}
-
-/// `art` merge for a `+art` field — a plain decode type carries none.
-macro_rules! bubble_art {
-    ($art:ident, $field:ident) => {};
-    ($art:ident, $field:ident, art) => {
-        merge_art(&mut $art, ArtCarrier::art_out(&$field))
     };
 }
 
 /// `Deserialize` for an object inside the row renderer: named keys
-/// claim typed fields through tolerant wrappers, a `thumbnails` key
+/// claim typed fields (last wins on a repeat), a `thumbnails` key
 /// collects candidates, and every other key is walked for nested art —
 /// the old whole-renderer `best_artwork` walk in a single pass, no DOM.
-/// Fields marked `+art` bubble their subtree's best thumbnail upward.
-/// The generated type gains an `art: Option<(u64, Thumb)>` field and a
-/// `HasArt` impl so a parent can collect it.
+/// Every field bubbles its subtree's best thumbnail upward through
+/// `ArtCarrier`. The generated type gains an `art` field and a `HasArt`
+/// impl so a parent can collect it.
 macro_rules! scanned_obj {
-    ($name:ident { $( $field:ident : $key:literal => $(+ $artflag:tt)? $dec:ty ),* $(,)? }) => {
+    ($name:ident { $( $field:ident : $key:literal => $dec:ty ),* $(,)? }) => {
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 struct V;
@@ -438,7 +840,7 @@ macro_rules! scanned_obj {
                                 }
                                 $( $key => {
                                     $field = m.next_value::<$dec>()?;
-                                    bubble_art!(art, $field $(, $artflag)?);
+                                    merge_art(&mut art, $field.art_out());
                                 } )*
                                 _ => merge_art(&mut art, m.next_value::<ArtworkScan>()?.0),
                             }
@@ -457,365 +859,161 @@ macro_rules! scanned_obj {
     };
 }
 
-/// An array element that may be any JSON value: a map parses as `T`,
-/// anything else is consumed and dropped — the old `as_array` +
-/// per-element `as_object` skip.
-struct Tolerant<T>(Option<T>);
-
-impl<'de, T: Deserialize<'de>> Deserialize<'de> for Tolerant<T> {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        struct V<T>(PhantomData<T>);
-        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
-            type Value = Tolerant<T>;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("any value")
-            }
-            fn visit_map<A: MapAccess<'de>>(self, mut acc: A) -> Result<Tolerant<T>, A::Error> {
-                match T::deserialize(serde::de::value::MapAccessDeserializer::new(&mut acc)) {
-                    Ok(t) => Ok(Tolerant(Some(t))),
-                    Err(_) => {
-                        // Element-level rot (e.g. a scalar field type
-                        // T cannot tolerate): drain the rest of the
-                        // map so the parent array stays aligned, then
-                        // drop the element — a dead row, not a dead
-                        // page.
-                        while acc.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-                        Ok(Tolerant(None))
-                    }
-                }
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Tolerant<T>, A::Error> {
-                while s.next_element::<IgnoredAny>()?.is_some() {}
-                Ok(Tolerant(None))
-            }
-            fn visit_bool<E>(self, v: bool) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(
-                        serde::de::value::BoolDeserializer::<serde::de::value::Error>::new(v),
-                    )
-                    .ok(),
-                ))
-            }
-            fn visit_i64<E>(self, v: i64) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(
-                        serde::de::value::I64Deserializer::<serde::de::value::Error>::new(v),
-                    )
-                    .ok(),
-                ))
-            }
-            fn visit_u64<E>(self, v: u64) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(
-                        serde::de::value::U64Deserializer::<serde::de::value::Error>::new(v),
-                    )
-                    .ok(),
-                ))
-            }
-            fn visit_f64<E>(self, v: f64) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(
-                        serde::de::value::F64Deserializer::<serde::de::value::Error>::new(v),
-                    )
-                    .ok(),
-                ))
-            }
-            fn visit_str<E>(self, v: &str) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(
-                        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(v),
-                    )
-                    .ok(),
-                ))
-            }
-            fn visit_string<E>(self, v: String) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(serde::de::value::StringDeserializer::<
-                        serde::de::value::Error,
-                    >::new(v))
-                    .ok(),
-                ))
-            }
-            fn visit_unit<E>(self) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(
-                    T::deserialize(
-                        serde::de::value::UnitDeserializer::<serde::de::value::Error>::new(),
-                    )
-                    .ok(),
-                ))
-            }
-            fn visit_none<E>(self) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
-            }
-            fn visit_some<D2: serde::Deserializer<'de>>(
-                self,
-                d: D2,
-            ) -> Result<Tolerant<T>, D2::Error> {
-                d.deserialize_any(self)
-            }
-        }
-        d.deserialize_any(V(PhantomData))
-    }
-}
-
-/// `as_array` + the per-element skip: a non-array field is empty, and
-/// each element tolerates any JSON shape.
-fn opt_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct V<T>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
-        type Value = Vec<T>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an array")
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut acc: A) -> Result<Vec<T>, A::Error> {
-            let mut out = Vec::new();
-            while let Some(Tolerant(t)) = acc.next_element::<Tolerant<T>>()? {
-                if let Some(t) = t {
-                    out.push(t);
-                }
-            }
-            Ok(out)
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Vec<T>, A::Error> {
-            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            Ok(Vec::new())
-        }
-        fn visit_bool<E>(self, _v: bool) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_i64<E>(self, _v: i64) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_u64<E>(self, _v: u64) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_f64<E>(self, _v: f64) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_str<E>(self, _v: &str) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_unit<E>(self) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_none<E>(self) -> Result<Vec<T>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Vec<T>, D2::Error> {
-            d.deserialize_any(self)
-        }
-    }
-    d.deserialize_any(V(PhantomData))
-}
-
-/// `opt_vec` keeping every slot as `Option<T>` — callers that join
-/// elements need positions, not just survivors.
-fn opt_vec_opt<'de, D, T>(d: D) -> Result<Vec<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct V<T>(PhantomData<T>);
-    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
-        type Value = Vec<Option<T>>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("an array")
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut acc: A) -> Result<Vec<Option<T>>, A::Error> {
-            let mut out = Vec::new();
-            while let Some(Tolerant(t)) = acc.next_element::<Tolerant<T>>()? {
-                out.push(t);
-            }
-            Ok(out)
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Vec<Option<T>>, A::Error> {
-            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            Ok(Vec::new())
-        }
-        fn visit_bool<E>(self, _v: bool) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_i64<E>(self, _v: i64) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_u64<E>(self, _v: u64) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_f64<E>(self, _v: f64) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_str<E>(self, _v: &str) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_unit<E>(self) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_none<E>(self) -> Result<Vec<Option<T>>, E> {
-            Ok(Vec::new())
-        }
-        fn visit_some<D2: serde::Deserializer<'de>>(
-            self,
-            d: D2,
-        ) -> Result<Vec<Option<T>>, D2::Error> {
-            d.deserialize_any(self)
-        }
-    }
-    d.deserialize_any(V(PhantomData))
-}
-
-#[derive(Deserialize)]
 struct NextBody {
-    #[serde(rename = "playabilityStatus", default, deserialize_with = "opt_obj")]
-    playability: Option<NextPlayability>,
-    #[serde(rename = "responseContext", default, deserialize_with = "opt_obj")]
-    response_context: Option<NextContext>,
-    #[serde(default, deserialize_with = "opt_obj")]
-    contents: Option<NextContents>,
-    #[serde(rename = "continuationContents", default, deserialize_with = "opt_obj")]
-    continuation_contents: Option<NextContinuation>,
+    playability: OptObj<NextPlayability>,
+    response_context: OptObj<NextContext>,
+    contents: OptObj<NextContents>,
+    continuation_contents: OptObj<NextContinuation>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(NextBody {
+    playability: "playabilityStatus" => OptObj<NextPlayability>,
+    response_context: "responseContext" => OptObj<NextContext>,
+    contents: "contents" => OptObj<NextContents>,
+    continuation_contents: "continuationContents" => OptObj<NextContinuation>,
+});
+
 struct NextPlayability {
-    #[serde(default, deserialize_with = "opt_str")]
-    status: Option<String>,
-    #[serde(default, deserialize_with = "opt_str")]
-    reason: Option<String>,
+    status: OptStr,
+    reason: OptStr,
     // Positions preserved: the old blob appended one space per
     // element, non-strings included, so a dropped entry still
     // separates its neighbours (`["not a",42,"bot"]` stays
     // "not a  bot").
-    #[serde(default, deserialize_with = "opt_vec_opt")]
-    messages: Vec<Option<String>>,
+    messages: OptVecOpt<String>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(NextPlayability {
+    status: "status" => OptStr,
+    reason: "reason" => OptStr,
+    messages: "messages" => OptVecOpt<String>,
+});
+
 struct NextContext {
-    #[serde(rename = "visitorData", default, deserialize_with = "opt_str")]
-    visitor_data: Option<String>,
+    visitor_data: OptStr,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(NextContext {
+    visitor_data: "visitorData" => OptStr,
+});
+
 struct NextContents {
-    #[serde(
-        rename = "singleColumnMusicWatchNextResultsRenderer",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    single_column: Option<SingleColumn>,
+    single_column: OptObj<SingleColumn>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(NextContents {
+    single_column: "singleColumnMusicWatchNextResultsRenderer" => OptObj<SingleColumn>,
+});
+
 struct SingleColumn {
-    #[serde(rename = "tabbedRenderer", default, deserialize_with = "opt_obj")]
-    tabbed: Option<Tabbed>,
+    tabbed: OptObj<Tabbed>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(SingleColumn {
+    tabbed: "tabbedRenderer" => OptObj<Tabbed>,
+});
+
 struct Tabbed {
-    #[serde(
-        rename = "watchNextTabbedResultsRenderer",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    watch_next: Option<WatchNext>,
+    watch_next: OptObj<WatchNext>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(Tabbed {
+    watch_next: "watchNextTabbedResultsRenderer" => OptObj<WatchNext>,
+});
+
 struct WatchNext {
-    #[serde(default, deserialize_with = "opt_vec")]
-    tabs: Vec<WatchTab>,
+    tabs: OptVec<WatchTab>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(WatchNext {
+    tabs: "tabs" => OptVec<WatchTab>,
+});
+
 struct WatchTab {
-    #[serde(rename = "tabRenderer", default, deserialize_with = "opt_obj")]
-    renderer: Option<TabRenderer>,
+    renderer: OptObj<TabRenderer>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(WatchTab {
+    renderer: "tabRenderer" => OptObj<TabRenderer>,
+});
+
 struct TabRenderer {
-    #[serde(default, deserialize_with = "opt_obj")]
-    content: Option<TabContent>,
+    content: OptObj<TabContent>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(TabRenderer {
+    content: "content" => OptObj<TabContent>,
+});
+
 struct TabContent {
-    #[serde(rename = "musicQueueRenderer", default, deserialize_with = "opt_obj")]
-    queue: Option<QueueRenderer>,
+    queue: OptObj<QueueRenderer>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(TabContent {
+    queue: "musicQueueRenderer" => OptObj<QueueRenderer>,
+});
+
 struct QueueRenderer {
-    #[serde(default, deserialize_with = "opt_obj")]
-    content: Option<QueueContent>,
+    content: OptObj<QueueContent>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(QueueRenderer {
+    content: "content" => OptObj<QueueContent>,
+});
+
 struct QueueContent {
-    #[serde(
-        rename = "playlistPanelRenderer",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    panel: Option<Panel>,
+    panel: OptObj<Panel>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(QueueContent {
+    panel: "playlistPanelRenderer" => OptObj<Panel>,
+});
+
 struct NextContinuation {
-    #[serde(
-        rename = "playlistPanelContinuation",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    panel: Option<Panel>,
+    panel: OptObj<Panel>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(NextContinuation {
+    panel: "playlistPanelContinuation" => OptObj<Panel>,
+});
+
 struct Panel {
-    #[serde(rename = "playlistId", default, deserialize_with = "opt_str")]
-    playlist_id: Option<String>,
-    #[serde(default, deserialize_with = "opt_vec")]
-    contents: Vec<RowEntry>,
-    #[serde(default, deserialize_with = "opt_vec")]
-    continuations: Vec<ContinuationWrap>,
+    playlist_id: OptStr,
+    contents: OptVec<RowEntry>,
+    continuations: OptVec<ContinuationWrap>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(Panel {
+    playlist_id: "playlistId" => OptStr,
+    contents: "contents" => OptVec<RowEntry>,
+    continuations: "continuations" => OptVec<ContinuationWrap>,
+});
+
 struct RowEntry {
-    #[serde(
-        rename = "playlistPanelVideoRenderer",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    video: Option<PanelRow>,
-    #[serde(
-        rename = "playlistPanelVideoWrapperRenderer",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    wrapper: Option<RowWrapper>,
+    video: OptObj<PanelRow>,
+    wrapper: OptObj<RowWrapper>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(RowEntry {
+    video: "playlistPanelVideoRenderer" => OptObj<PanelRow>,
+    wrapper: "playlistPanelVideoWrapperRenderer" => OptObj<RowWrapper>,
+});
+
 struct RowWrapper {
-    #[serde(rename = "primaryRenderer", default, deserialize_with = "opt_obj")]
-    primary: Option<PrimaryRenderer>,
+    primary: OptObj<PrimaryRenderer>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(RowWrapper {
+    primary: "primaryRenderer" => OptObj<PrimaryRenderer>,
+});
+
 struct PrimaryRenderer {
-    #[serde(
-        rename = "playlistPanelVideoRenderer",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    video: Option<PanelRow>,
+    video: OptObj<PanelRow>,
 }
+
+lenient_obj!(PrimaryRenderer {
+    video: "playlistPanelVideoRenderer" => OptObj<PanelRow>,
+});
 
 /// The queue row's renderer — decoded via `scanned_obj!` like every
 /// object inside it: typed keys claim their fields, `thumbnails` keys
@@ -838,11 +1036,11 @@ struct PanelRow {
 
 scanned_obj!(PanelRow {
     video_id: "videoId" => Presence,
-    navigation: "navigationEndpoint" => +art OptObj<WatchNav>,
-    title: "title" => +art OptObj<TextRuns>,
-    long_byline: "longBylineText" => +art OptObj<TextRuns>,
-    short_byline: "shortBylineText" => +art OptObj<TextRuns>,
-    length: "lengthText" => +art OptObj<TextRuns>,
+    navigation: "navigationEndpoint" => OptObj<WatchNav>,
+    title: "title" => OptObj<TextRuns>,
+    long_byline: "longBylineText" => OptObj<TextRuns>,
+    short_byline: "shortBylineText" => OptObj<TextRuns>,
+    length: "lengthText" => OptObj<TextRuns>,
 });
 
 /// A `thumbnails` candidate — url plus optional dims.
@@ -873,9 +1071,20 @@ impl<'de> Deserialize<'de> for ThumbSet {
                 f.write_str("a thumbnails array")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbSet, A::Error> {
+                let Some(_guard) = scan_depth::enter() else {
+                    drain_skip_seq(&mut s)?;
+                    return Ok(ThumbSet(None));
+                };
                 let mut best = None;
-                while let Some(ThumbNode(node)) = s.next_element::<ThumbNode>()? {
-                    merge_art(&mut best, node);
+                loop {
+                    if !scan_depth::node() {
+                        drain_skip_seq(&mut s)?;
+                        break;
+                    }
+                    match s.next_element::<ThumbNode>()? {
+                        Some(ThumbNode(node)) => merge_art(&mut best, node),
+                        None => break,
+                    }
                 }
                 Ok(ThumbSet(best))
             }
@@ -932,26 +1141,58 @@ impl<'de> Deserialize<'de> for ThumbNode {
                 f.write_str("a thumbnail object")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ThumbNode, A::Error> {
-                let mut url = None;
-                let mut width = None;
-                let mut height = None;
+                let Some(_guard) = scan_depth::enter() else {
+                    drain_skip_map(&mut m)?;
+                    return Ok(ThumbNode(None));
+                };
+                let mut url = OptStr::default();
+                let mut width = OptU64::default();
+                let mut height = OptU64::default();
                 let mut art = None;
-                while let Some(k) = m.next_key::<&str>()? {
+                loop {
+                    if !scan_depth::node() {
+                        drain_skip_map(&mut m)?;
+                        break;
+                    }
+                    let Some(k) = m.next_key::<&str>()? else {
+                        break;
+                    };
                     match k {
-                        "url" => url = m.next_value::<OptStr>()?.0,
-                        "width" => width = m.next_value::<OptU64>()?.0,
-                        "height" => height = m.next_value::<OptU64>()?.0,
+                        "url" => url = m.next_value::<OptStr>()?,
+                        "width" => width = m.next_value::<OptU64>()?,
+                        "height" => height = m.next_value::<OptU64>()?,
                         "thumbnails" => merge_art(&mut art, m.next_value::<ThumbSet>()?.0),
                         _ => merge_art(&mut art, m.next_value::<ArtworkScan>()?.0),
                     }
                 }
-                offer_art(&mut art, Thumb { url, width, height });
+                merge_art(&mut art, ArtCarrier::art_out(&url));
+                merge_art(&mut art, ArtCarrier::art_out(&width));
+                merge_art(&mut art, ArtCarrier::art_out(&height));
+                offer_art(
+                    &mut art,
+                    Thumb {
+                        url: url.v.clone(),
+                        width: width.v,
+                        height: height.v,
+                    },
+                );
                 Ok(ThumbNode(art))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbNode, A::Error> {
+                let Some(_guard) = scan_depth::enter() else {
+                    drain_skip_seq(&mut s)?;
+                    return Ok(ThumbNode(None));
+                };
                 let mut best = None;
-                while let Some(ArtworkScan(inner)) = s.next_element::<ArtworkScan>()? {
-                    merge_art(&mut best, inner);
+                loop {
+                    if !scan_depth::node() {
+                        drain_skip_seq(&mut s)?;
+                        break;
+                    }
+                    match s.next_element::<ArtworkScan>()? {
+                        Some(ArtworkScan(inner)) => merge_art(&mut best, inner),
+                        None => break,
+                    }
                 }
                 Ok(ThumbNode(best))
             }
@@ -1034,8 +1275,19 @@ impl<'de> Deserialize<'de> for ArtworkScan {
                 f.write_str("any value")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ArtworkScan, A::Error> {
+                let Some(_guard) = scan_depth::enter() else {
+                    drain_skip_map(&mut m)?;
+                    return Ok(ArtworkScan(None));
+                };
                 let mut best = None;
-                while let Some(k) = m.next_key::<&str>()? {
+                loop {
+                    if !scan_depth::node() {
+                        drain_skip_map(&mut m)?;
+                        break;
+                    }
+                    let Some(k) = m.next_key::<&str>()? else {
+                        break;
+                    };
                     if k == "thumbnails" {
                         merge_art(&mut best, m.next_value::<ThumbSet>()?.0);
                     } else {
@@ -1045,9 +1297,20 @@ impl<'de> Deserialize<'de> for ArtworkScan {
                 Ok(ArtworkScan(best))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ArtworkScan, A::Error> {
+                let Some(_guard) = scan_depth::enter() else {
+                    drain_skip_seq(&mut s)?;
+                    return Ok(ArtworkScan(None));
+                };
                 let mut best = None;
-                while let Some(ArtworkScan(inner)) = s.next_element::<ArtworkScan>()? {
-                    merge_art(&mut best, inner);
+                loop {
+                    if !scan_depth::node() {
+                        drain_skip_seq(&mut s)?;
+                        break;
+                    }
+                    match s.next_element::<ArtworkScan>()? {
+                        Some(ArtworkScan(inner)) => merge_art(&mut best, inner),
+                        None => break,
+                    }
                 }
                 Ok(ArtworkScan(best))
             }
@@ -1092,7 +1355,7 @@ struct WatchNav {
 }
 
 scanned_obj!(WatchNav {
-    watch: "watchEndpoint" => +art OptObj<WatchEndpoint>,
+    watch: "watchEndpoint" => OptObj<WatchEndpoint>,
 });
 
 struct WatchEndpoint {
@@ -1111,7 +1374,7 @@ struct TextRuns {
 }
 
 scanned_obj!(TextRuns {
-    runs: "runs" => +art OptVec<BylineRun>,
+    runs: "runs" => OptVec<BylineRun>,
     simple: "simpleText" => OptStr,
 });
 
@@ -1123,7 +1386,7 @@ struct BylineRun {
 
 scanned_obj!(BylineRun {
     text: "text" => OptStr,
-    navigation: "navigationEndpoint" => +art OptObj<BrowseNav>,
+    navigation: "navigationEndpoint" => OptObj<BrowseNav>,
 });
 
 struct BrowseNav {
@@ -1132,7 +1395,7 @@ struct BrowseNav {
 }
 
 scanned_obj!(BrowseNav {
-    browse: "browseEndpoint" => +art OptObj<BrowseEndpoint>,
+    browse: "browseEndpoint" => OptObj<BrowseEndpoint>,
 });
 
 struct BrowseEndpoint {
@@ -1143,7 +1406,7 @@ struct BrowseEndpoint {
 
 scanned_obj!(BrowseEndpoint {
     id: "browseId" => OptStr,
-    context_configs: "browseEndpointContextSupportedConfigs" => +art OptObj<BrowseConfigs>,
+    context_configs: "browseEndpointContextSupportedConfigs" => OptObj<BrowseConfigs>,
 });
 
 struct BrowseConfigs {
@@ -1152,7 +1415,7 @@ struct BrowseConfigs {
 }
 
 scanned_obj!(BrowseConfigs {
-    music: "browseEndpointContextMusicConfig" => +art OptObj<BrowseMusic>,
+    music: "browseEndpointContextMusicConfig" => OptObj<BrowseMusic>,
 });
 
 struct BrowseMusic {
@@ -1164,23 +1427,23 @@ scanned_obj!(BrowseMusic {
     page_type: "pageType" => OptStr,
 });
 
-#[derive(Deserialize)]
 struct ContinuationWrap {
-    #[serde(
-        rename = "nextRadioContinuationData",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    radio: Option<ContinuationData>,
-    #[serde(rename = "nextContinuationData", default, deserialize_with = "opt_obj")]
-    next: Option<ContinuationData>,
+    radio: OptObj<ContinuationData>,
+    next: OptObj<ContinuationData>,
 }
 
-#[derive(Deserialize)]
+lenient_obj!(ContinuationWrap {
+    radio: "nextRadioContinuationData" => OptObj<ContinuationData>,
+    next: "nextContinuationData" => OptObj<ContinuationData>,
+});
+
 struct ContinuationData {
-    #[serde(default, deserialize_with = "opt_str")]
-    continuation: Option<String>,
+    continuation: OptStr,
 }
+
+lenient_obj!(ContinuationData {
+    continuation: "continuation" => OptStr,
+});
 
 /// The watch surface's queue panel for a seed response: the first tab
 /// carrying a `musicQueueRenderer` — the Up-next tab's automix list.
@@ -1366,7 +1629,7 @@ fn panel_item(r: &PanelRow, video_id: &str) -> Option<Value> {
 fn panel_items(panel: &Panel) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
-    for entry in &panel.contents {
+    for entry in panel.contents.iter() {
         let Some(r) = panel_row(entry) else {
             continue;
         };
@@ -1413,7 +1676,7 @@ fn next_playability(status: Option<&NextPlayability>) -> Playability {
     }
     let reason = status.reason.as_deref().unwrap_or("");
     let mut blob = reason.to_lowercase();
-    for message in &status.messages {
+    for message in status.messages.iter() {
         blob.push(' ');
         blob.push_str(&message.as_deref().unwrap_or("").to_lowercase());
     }
@@ -2104,6 +2367,56 @@ mod tests {
         let art = row_artwork(row);
         assert_eq!(art.len(), 1);
         assert_eq!(art[0]["url"], "https://example.com/nav.jpg");
+    }
+
+    #[test]
+    fn repeated_envelope_key_keeps_last_value() {
+        // `Value` retained the last occurrence of a repeated key; the
+        // visitors overwrite the same way instead of erroring.
+        let body: NextBody = serde_json::from_str(
+            r#"{"contents":null,"contents":{"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer": {"watchNextTabbedResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"musicQueueRenderer": {"content": {"playlistPanelRenderer": {"contents": [{"playlistPanelVideoRenderer": {"videoId": "dQw4w9WgXcQ", "title": {"simpleText": "Song"}}}]}}}}}}]}}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("body parses: {e}"));
+        let panel = seed_panel(&body).unwrap_or_else(|e| panic!("panel found: {e}"));
+        assert_eq!(panel.contents.len(), 1);
+    }
+
+    #[test]
+    fn wrong_shape_runs_still_yields_artwork() {
+        // `runs` as an object is drained tolerantly — but the old walk
+        // found thumbnails inside it, so the scan must too.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song","runs":{"thumbnails":[{"url":"https://example.com/r.jpg","width":80,"height":80}]}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert!(row.title.as_ref().is_none_or(|t| t.runs.is_empty()));
+        let art = row_artwork(row);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0]["url"], "https://example.com/r.jpg");
+    }
+
+    #[test]
+    fn artwork_scan_respects_old_depth_bound() {
+        // The old walk stopped at 64 levels — thumbnails buried deeper
+        // must not be collected, and the row still survives.
+        let mut v = String::from(r#"{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"x":"#);
+        for _ in 0..70 {
+            v.push_str(r#"{"a":"#);
+        }
+        v.push_str(
+            r#"{"thumbnails":[{"url":"https://example.com/deep.jpg","width":10,"height":10}]}"#,
+        );
+        for _ in 0..70 {
+            v.push('}');
+        }
+        v.push('}');
+        let entry: RowEntry =
+            serde_json::from_str(&format!(r#"{{"playlistPanelVideoRenderer":{v}}}"#))
+                .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
+        assert!(row_artwork(row).is_empty());
     }
 
     #[test]
