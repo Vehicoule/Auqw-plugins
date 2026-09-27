@@ -1,7 +1,7 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:684b82e5cf218a20d830665d6b48ebefaf891dce8472bc18af0a6048a0f4cff6",
+    "digest": "sha256:2b1834efc5d7afc56f34e1063ab538ab6ec92bd7d9108476c9fcaedb1732c2ae",
     "path": "dist/youtube-music.wasm"
   },
   "capabilities": [
