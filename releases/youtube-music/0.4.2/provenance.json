@@ -2,9 +2,9 @@
   "plugin": "youtube-music",
   "version": "0.4.2",
   "abi_version": "0.3.0",
-  "wasm_sha256": "sha256:66336bf8e74782235428c2928df7d49531efe690a202b6fd22a80127ac0beff9",
-  "manifest_sha256": "sha256:fb37e844bfde428a74a781b266c273ffeb783cad7d6baa4006c7952d06b68262",
-  "signed_at": "2026-09-27T01:30:24.512Z",
+  "wasm_sha256": "sha256:0769b80e3cf87f3ff5ea7153641a19fff7f10e550b3d6fdcfeddf9a73da744e1",
+  "manifest_sha256": "sha256:54af70c887603dce639f6f78bcfe0e2109d5744f919df34bd08178f9803d9efc",
+  "signed_at": "2026-09-27T01:32:21.828Z",
   "key_id": "42d8cac606f16c04",
   "toolchain": {
     "node": "v24.19.0",
