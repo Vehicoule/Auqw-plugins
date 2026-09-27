@@ -29,7 +29,7 @@ It walks an eight-rung, version-pinned client ladder, in order:
 2. `ANDROID_VR` 1.57.29
 3. `IOS` 20.10.4
 4. `ANDROID_VR` 1.61.29
-5. `ANDROID` 19.09.37
+5. `ANDROID` 20.19.36
 6. `ANDROID_VR` 1.61.48
 7. `ANDROID_VR` 1.60.19
 8. `ANDROID_VR` 1.43.32
