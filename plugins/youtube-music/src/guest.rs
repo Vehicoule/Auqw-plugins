@@ -436,6 +436,71 @@ fn truncated_bot_check(body: &[u8]) -> bool {
     collapsed.contains("not a bot") || collapsed.contains("unusual traffic")
 }
 
+/// The outcome a non-2xx player response books for its rung. A
+/// flagged IP's wall arrives as a bare 403 — Google's abuse edge
+/// answers with an HTML "automated queries" interstitial, never a JSON
+/// body. That is the bot wall in transport form: the attested replay
+/// is its remedy, so it books exactly like a body-classified BotCheck
+/// (position, backoff, replay). A 403 that does carry a JSON envelope
+/// is classified by its playabilityStatus — a bot-check inside is
+/// still a wall; anything else is an API-level refusal for that
+/// client, not the edge. A body shaped like JSON that fails to parse
+/// (a truncated refusal) books Transport — unless its surviving prefix
+/// still carries a bot-check marker, which is the wall truncated, not
+/// a refusal. Only a non-JSON body books Bot outright.
+fn refusal_outcome(resp: &HttpResponse) -> RungOutcome {
+    if resp.status == 403 {
+        // A UTF-8 BOM precedes some stacks' JSON emitters — strip it
+        // or a valid envelope looks non-JSON and books Bot on shape
+        // alone.
+        let body = resp
+            .body
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(&resp.body);
+        let looks_json = body
+            .iter()
+            .find(|b| !b.is_ascii_whitespace())
+            .is_some_and(|b| *b == b'{' || *b == b'[');
+        match (
+            looks_json,
+            serde_json::from_slice::<Value>(body)
+                .ok()
+                .map(|b| classify_playability(&b).0),
+        ) {
+            (false, _) | (_, Some(Playability::BotCheck)) => RungOutcome::Bot,
+            (_, Some(Playability::SignInRequired)) => RungOutcome::SignIn,
+            (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
+            (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
+            (true, None) => {
+                if truncated_bot_check(body) {
+                    RungOutcome::Bot
+                } else {
+                    RungOutcome::Transport
+                }
+            }
+            (_, Some(Playability::Ok)) => RungOutcome::Transport,
+        }
+    } else if resp.status == 429 {
+        RungOutcome::RateLimited
+    } else {
+        RungOutcome::Transport
+    }
+}
+
+/// Is this response the bot wall — in either of its two shapes: a
+/// non-2xx refusal (`refusal_outcome`) or a 2xx JSON envelope whose
+/// `playabilityStatus` is a bot-check? Used to decide whether a
+/// replayed visitor is worth dropping for a bare re-ask.
+fn walled_by_bot(resp: &HttpResponse) -> bool {
+    if (200..300).contains(&resp.status) {
+        serde_json::from_slice::<Value>(&resp.body)
+            .ok()
+            .is_some_and(|b| classify_playability(&b).0 == Playability::BotCheck)
+    } else {
+        refusal_outcome(resp) == RungOutcome::Bot
+    }
+}
+
 /// The backoff reason + window staged for a rung outcome; `None` for
 /// deterministic content answers that are not weather.
 fn backoff_for(outcome: RungOutcome) -> Option<(&'static str, u64)> {
@@ -474,8 +539,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     let mut pot: Option<String> = None;
     // The freshest visitorData seen this invocation — replayed on later
     // rungs ahead of their persisted KV value, matching the Slice 0
-    // cross-rung propagation.
+    // cross-rung propagation — plus the KV key it was harvested under,
+    // so dropping a burned fresh value can erase its staged write too.
     let mut fresh_visitor: Option<String> = None;
+    let mut fresh_visitor_key: Option<String> = None;
     // The session-trust token rides every rung until a 401 proves it
     // dead — then the remaining ladder runs bare rather than failing
     // authenticated requests repeatedly.
@@ -489,7 +556,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // call and keeps today's terminal behavior.
     for pass in 0..2u8 {
         let attested = pass == 1;
-        for (i, rung) in LADDER.iter().enumerate() {
+        'rung: for (i, rung) in LADDER.iter().enumerate() {
             // Pass 2 replays only rungs attestation can lift — a
             // non-attestable client's bot-check is permanent (its wall
             // needs DroidGuard, which a BotGuard mint never produces),
@@ -517,41 +584,27 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 }
             }
 
-            let mut resp = match http_request(player_request(
-                rung,
-                &p.video_id,
-                rung_visitor.as_deref(),
-                if attested { pot.as_deref() } else { None },
-                access_token.as_deref(),
-            ))
-            .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    let outcome = terminal_or_transport(e)?;
-                    if let Some((reason, ms)) = backoff_for(outcome) {
-                        stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
-                    }
-                    record(&mut outcomes, attested, i, &bot_positions, outcome);
-                    continue;
-                }
-            };
-            // A 401 against a request that carried the token proves the
-            // token dead, not the rung: drop it for the rest of the
-            // ladder and re-ask this rung bare once before recording an
-            // outcome — `take` makes the re-ask single-shot, and the
-            // retried response flows through the same status handling
-            // below, so a bare 401 is then the rung's own refusal.
-            if resp.status == 401 && access_token.take().is_some() {
-                resp = match http_request(player_request(
+            // The rung's sends live in one loop because two one-shot
+            // re-asks can stack: a 401 against a carried trust token
+            // drops it and re-asks bare (`take` makes it single-shot —
+            // a bare 401 falls through as the rung's own refusal), and
+            // a bot wall on a request that replayed a visitor re-asks
+            // once without it — replayed state is itself suspect on a
+            // wall, and nothing else can heal a poisoned persisted
+            // visitor: a failed resolve rolls its staged writes back,
+            // so the value would wall this rung on every later resolve
+            // too, and the attested pass replays the same one.
+            let mut dropped_visitor = false;
+            let resp = 'request: loop {
+                let sent = http_request(player_request(
                     rung,
                     &p.video_id,
                     rung_visitor.as_deref(),
                     if attested { pot.as_deref() } else { None },
-                    None,
+                    access_token.as_deref(),
                 ))
-                .await
-                {
+                .await;
+                let r = match sent {
                     Ok(r) => r,
                     Err(e) => {
                         let outcome = terminal_or_transport(e)?;
@@ -559,61 +612,44 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                         }
                         record(&mut outcomes, attested, i, &bot_positions, outcome);
-                        continue;
+                        continue 'rung;
                     }
                 };
-            }
-            if !(200..300).contains(&resp.status) {
-                // A flagged IP's wall arrives as a bare 403 — Google's
-                // abuse edge answers with an HTML "automated queries"
-                // interstitial, never a JSON body. That is the bot
-                // wall in transport form: the attested replay is its
-                // remedy, so it books exactly like a body-classified
-                // BotCheck (position, backoff, replay). A 403 that
-                // does carry a JSON envelope is classified by its
-                // playabilityStatus — a bot-check inside is still a
-                // wall; anything else is an API-level refusal for that
-                // client, not the edge. A body shaped like JSON that
-                // fails to parse (a truncated refusal) books Transport
-                // — unless its surviving prefix still carries a
-                // bot-check marker, which is the wall truncated, not a
-                // refusal. Only a non-JSON body books Bot outright.
-                let outcome = if resp.status == 403 {
-                    // A UTF-8 BOM precedes some stacks' JSON emitters —
-                    // strip it or a valid envelope looks non-JSON and
-                    // books Bot on shape alone.
-                    let body = resp
-                        .body
-                        .strip_prefix(b"\xEF\xBB\xBF")
-                        .unwrap_or(&resp.body);
-                    let looks_json = body
-                        .iter()
-                        .find(|b| !b.is_ascii_whitespace())
-                        .is_some_and(|b| *b == b'{' || *b == b'[');
-                    match (
-                        looks_json,
-                        serde_json::from_slice::<Value>(body)
-                            .ok()
-                            .map(|b| classify_playability(&b).0),
-                    ) {
-                        (false, _) | (_, Some(Playability::BotCheck)) => RungOutcome::Bot,
-                        (_, Some(Playability::SignInRequired)) => RungOutcome::SignIn,
-                        (_, Some(Playability::AgeRestricted)) => RungOutcome::Age,
-                        (_, Some(Playability::Unavailable)) => RungOutcome::Unavailable,
-                        (true, None) => {
-                            if truncated_bot_check(body) {
-                                RungOutcome::Bot
-                            } else {
-                                RungOutcome::Transport
+                if r.status == 401 && access_token.take().is_some() {
+                    continue 'request;
+                }
+                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&r) {
+                    dropped_visitor = true;
+                    // Drop the suspect state everywhere it can persist —
+                    // all deletions are staged and commit on `done`, so
+                    // the poisoned value is gone for later resolves
+                    // instead of replayed and dropped again every time:
+                    // * this rung's KV slot, whichever value was sent —
+                    //   when a fresh visitor shadowed it the stored value
+                    //   went untested, but a rung that walls under any
+                    //   replayed state can't trust what it would replay
+                    //   next;
+                    // * the fresh cross-rung value's home slot when it
+                    //   was the one sent (fresh shadows KV, so a set
+                    //   `fresh` is always the replayed one) — otherwise a
+                    //   committed resolve would re-persist the burned
+                    //   token under its source rung's key and the next
+                    //   invocation would replay it there.
+                    kv_set(&visitor_key, None).await?;
+                    if fresh_visitor.take().is_some() {
+                        if let Some(home) = fresh_visitor_key.take() {
+                            if home != visitor_key {
+                                kv_set(&home, None).await?;
                             }
                         }
-                        (_, Some(Playability::Ok)) => RungOutcome::Transport,
                     }
-                } else if resp.status == 429 {
-                    RungOutcome::RateLimited
-                } else {
-                    RungOutcome::Transport
-                };
+                    rung_visitor = None;
+                    continue 'request;
+                }
+                break 'request r;
+            };
+            if !(200..300).contains(&resp.status) {
+                let outcome = refusal_outcome(&resp);
                 // A 401 that carried the token was already re-asked
                 // bare above — every refusal reaching here is the
                 // rung's own and stages its backoff.
@@ -652,6 +688,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     kv_set(&visitor_key, Some(visitor.as_bytes())).await?;
                     rung_visitor = Some(visitor.clone());
                     fresh_visitor = Some(visitor);
+                    fresh_visitor_key = Some(visitor_key.clone());
                 } else {
                     // A malformed visitorData is dropped before it can reach
                     // a header, a KV value, or the PO-token binding.
@@ -2221,10 +2258,16 @@ mod tests {
         // rungs still leaves the Oculus pin reachable.
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        out = feed(&mut h, &out, SABR); // VISIONOS
+        out = feed(&mut h, &out, SABR); // VISIONOS — harvests a fresh visitor
         out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29 — no budget spend
-        out = feed(&mut h, &out, SABR); // IOS
+                                       // The wall fired while replaying the fresh visitor: the rung is
+                                       // re-asked once bare before the outcome is recorded.
+        assert_eq!(rung_of(&out), 1);
+        assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None);
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29 bare — no budget spend
+        out = feed(&mut h, &out, SABR); // IOS — re-harvests the visitor
         out = feed(&mut h, &out, BOT); // ANDROID_VR@1.61.29 — no budget spend
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.61.29 bare — no budget spend
         out = feed(&mut h, &out, UNPLAYABLE); // ANDROID
         assert_eq!(rung_of(&out), 5);
         let out = feed(&mut h, &out, OK);
@@ -2273,6 +2316,9 @@ mod tests {
         let first = begin(&mut h);
         let mut out = feed(&mut h, &first, BOT);
         out = feed(&mut h, &out, SABR);
+        out = feed(&mut h, &out, BOT);
+        // The rung-2 wall replayed the fresh visitor SABR harvested —
+        // it is re-asked once bare before the outcome is recorded.
         out = feed(&mut h, &out, BOT);
         for _ in 0..5 {
             out = feed(&mut h, &out, SABR);
@@ -2569,6 +2615,98 @@ mod tests {
             header_of(&out, "X-Goog-Visitor-Id").as_deref(),
             Some("Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D")
         );
+    }
+
+    #[test]
+    fn walled_replayed_visitor_reasks_bare_once_and_heals() {
+        // A persisted visitor is suspect when the rung walls: re-ask
+        // once without it, and stage the KV delete so a poisoned value
+        // is gone once the resolve commits.
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/VISIONOS".into(), b"persisted-visitor".to_vec());
+        let out = begin(&mut h);
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some("persisted-visitor")
+        );
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        // Same rung re-asked bare — not advanced.
+        assert_eq!(rung_of(&out), 0);
+        assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None);
+        // The bare re-ask serves: fresh visitor heals the KV slot on
+        // commit; a later invocation replays the healed value.
+        let out = feed(&mut h, &out, SABR);
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            h.committed.get("visitor/VISIONOS").map(Vec::as_slice),
+            Some(b"Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D".as_slice())
+        );
+    }
+
+    #[test]
+    fn visitor_wall_reask_is_single_shot() {
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/VISIONOS".into(), b"persisted-visitor".to_vec());
+        let mut out = begin(&mut h);
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        assert_eq!(rung_of(&out), 0);
+        assert!(header_of(&out, "X-Goog-Visitor-Id").is_none());
+        // Still walled bare: the rung's outcome records and the ladder
+        // advances — no second re-ask.
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn walled_fresh_visitor_clears_cross_rung_propagation() {
+        // SABR's response visitor rides rung 1; when the wall fires the
+        // fresh value is dropped entirely — the re-ask and every later
+        // rung send no visitor — and its staged write is erased, so a
+        // committed resolve cannot re-persist the burned token under its
+        // source rung's key. Rung 1's own stored visitor went untested
+        // under the shadow but is dropped too: a wall under replayed
+        // state can't trust what the rung would replay next.
+        let mut h = Harness::new();
+        h.committed.insert(
+            "visitor/ANDROID_VR@1.57.29".into(),
+            b"shadowed-stored".to_vec(),
+        );
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, SABR);
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some("Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D")
+        );
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        assert_eq!(rung_of(&out), 1);
+        assert!(header_of(&out, "X-Goog-Visitor-Id").is_none());
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        assert_eq!(rung_of(&out), 2);
+        assert!(header_of(&out, "X-Goog-Visitor-Id").is_none());
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // Both suspect slots healed: the shadowed stored visitor and the
+        // fresh value's staged write under VISIONOS's key.
+        assert!(!h.committed.contains_key("visitor/ANDROID_VR@1.57.29"));
+        assert!(!h.committed.contains_key("visitor/VISIONOS"));
+    }
+
+    #[test]
+    fn bare_wall_never_reasks() {
+        // No replayed visitor -> a wall is the rung's own verdict and
+        // the ladder advances without a re-ask.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        assert_eq!(rung_of(&out), 1);
     }
 
     #[test]

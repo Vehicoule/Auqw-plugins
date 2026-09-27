@@ -53,7 +53,13 @@ Each rung has a stable KV key (`VISIONOS`, `IOS`,
   rung returned, replayed as `X-Goog-Visitor-Id`. A fresher visitor
   minted earlier in the same invocation is replayed ahead of the
   persisted one; non-UTF-8/empty values are ignored with a sanitized
-  warning.
+  warning. Replayed state is suspect on a wall: a rung whose bot-check
+  fired while carrying a visitor is re-asked once bare and the replayed
+  value is dropped, with both slots it could persist under staged for
+  deletion — the walled rung's own `visitor/<rung-key>` entry (replayed
+  or merely shadowed) and, when the sent value was the fresh cross-rung
+  one, the entry it was harvested under — so a poisoned visitor can't
+  wall a rung on every later resolve.
 - `backoff/<video-id>/<rung-key>` — `{until_ms, reason}` JSON. A rung
   whose backoff is still in force is skipped (no player call) but its
   reason still participates in the final failure taxonomy — a stored
