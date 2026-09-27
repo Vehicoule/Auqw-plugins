@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::candidates::{
-    duration_ms_of, is_furniture, web_remix_context, web_remix_request, VISITOR_KEY,
+    best_artwork, duration_ms_of, is_furniture, web_remix_context, web_remix_request, VISITOR_KEY,
 };
 use crate::guest::{bad_payload, failed, is_video_id, load_visitor, payload_keys, warn};
 use crate::parse::{has_whole_word_age, visitor_token, Playability};
@@ -185,50 +185,6 @@ fn opt_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::
     d.deserialize_any(V)
 }
 
-/// `as_u64` on a lazily read field.
-fn opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
-    struct V;
-    impl<'de> Visitor<'de> for V {
-        type Value = Option<u64>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a u64")
-        }
-        fn visit_u64<E>(self, v: u64) -> Result<Option<u64>, E> {
-            Ok(Some(v))
-        }
-        fn visit_i64<E>(self, v: i64) -> Result<Option<u64>, E> {
-            Ok(u64::try_from(v).ok())
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<u64>, A::Error> {
-            while s.next_element::<IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Option<u64>, A::Error> {
-            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            Ok(None)
-        }
-        fn visit_bool<E>(self, _v: bool) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_f64<E>(self, _v: f64) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_str<E>(self, _v: &str) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_unit<E>(self) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_none<E>(self) -> Result<Option<u64>, E> {
-            Ok(None)
-        }
-        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Option<u64>, D2::Error> {
-            d.deserialize_any(self)
-        }
-    }
-    d.deserialize_any(V)
-}
-
 /// `as_object` + shape parse: a map becomes `Some(T)`, anything else is
 /// absent. `T`'s own fields are all opt_*, so a struct parse only fails
 /// on malformed JSON — which the upfront DOM parse would reject too.
@@ -278,6 +234,20 @@ where
     d.deserialize_any(V(PhantomData))
 }
 
+/// A field whose presence — not validity — drives behavior: `Absent`
+/// only when the key is missing, `Present` for every supplied value
+/// including `null`.
+#[derive(Default)]
+enum Presence {
+    #[default]
+    Absent,
+    Present(Value),
+}
+
+fn presence_value<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Presence, D::Error> {
+    Value::deserialize(d).map(Presence::Present)
+}
+
 /// An array element that may be any JSON value: a map parses as `T`,
 /// anything else is consumed and dropped — the old `as_array` +
 /// per-element `as_object` skip.
@@ -309,23 +279,61 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Tolerant<T> {
                 while s.next_element::<IgnoredAny>()?.is_some() {}
                 Ok(Tolerant(None))
             }
-            fn visit_bool<E>(self, _v: bool) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
+            fn visit_bool<E>(self, v: bool) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::BoolDeserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                ))
             }
-            fn visit_i64<E>(self, _v: i64) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
+            fn visit_i64<E>(self, v: i64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::I64Deserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                ))
             }
-            fn visit_u64<E>(self, _v: u64) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
+            fn visit_u64<E>(self, v: u64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::U64Deserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                ))
             }
-            fn visit_f64<E>(self, _v: f64) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
+            fn visit_f64<E>(self, v: f64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::F64Deserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                ))
             }
-            fn visit_str<E>(self, _v: &str) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
+            fn visit_str<E>(self, v: &str) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(v),
+                    )
+                    .ok(),
+                ))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(
+                    T::deserialize(serde::de::value::StringDeserializer::<
+                        serde::de::value::Error,
+                    >::new(v))
+                    .ok(),
+                ))
             }
             fn visit_unit<E>(self) -> Result<Tolerant<T>, E> {
-                Ok(Tolerant(None))
+                Ok(Tolerant(
+                    T::deserialize(
+                        serde::de::value::UnitDeserializer::<serde::de::value::Error>::new(),
+                    )
+                    .ok(),
+                ))
             }
             fn visit_none<E>(self) -> Result<Tolerant<T>, E> {
                 Ok(Tolerant(None))
@@ -544,10 +552,11 @@ struct PrimaryRenderer {
 #[derive(Deserialize)]
 struct PanelRow {
     // Presence, not validity, decides whether the navigation endpoint
-    // is consulted — so this stays an untyped `Value`: `{"videoId":42}`
-    // rejects the row exactly like `get().and_then(as_str)` did.
-    #[serde(rename = "videoId", default)]
-    video_id: Option<Value>,
+    // is consulted — `{"videoId":42}` and `{"videoId":null}` both
+    // reject the row exactly like `get().and_then(as_str)` did, so the
+    // field records presence separately from the value.
+    #[serde(rename = "videoId", default, deserialize_with = "presence_value")]
+    video_id: Presence,
     #[serde(rename = "navigationEndpoint", default, deserialize_with = "opt_obj")]
     navigation: Option<WatchNav>,
     #[serde(default, deserialize_with = "opt_obj")]
@@ -558,8 +567,12 @@ struct PanelRow {
     short_byline: Option<TextRuns>,
     #[serde(rename = "lengthText", default, deserialize_with = "opt_obj")]
     length: Option<TextRuns>,
-    #[serde(default, deserialize_with = "opt_obj")]
-    thumbnail: Option<ThumbList>,
+    // The whole `thumbnail` node as a small `Value` subtree — upstream
+    // nests artwork one more level (`thumbnail.musicThumbnailRenderer.
+    // thumbnail.thumbnails`), and `best_artwork` deep-walks it for any
+    // `thumbnails` array like the old whole-renderer walk did.
+    #[serde(default)]
+    thumbnail: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -622,22 +635,6 @@ struct BrowseConfigs {
 struct BrowseMusic {
     #[serde(rename = "pageType", default, deserialize_with = "opt_str")]
     page_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ThumbList {
-    #[serde(default, deserialize_with = "opt_vec")]
-    thumbnails: Vec<Thumb>,
-}
-
-#[derive(Deserialize)]
-struct Thumb {
-    #[serde(default, deserialize_with = "opt_str")]
-    url: Option<String>,
-    #[serde(default, deserialize_with = "opt_u64")]
-    width: Option<u64>,
-    #[serde(default, deserialize_with = "opt_u64")]
-    height: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -712,8 +709,8 @@ fn panel_row(entry: &RowEntry) -> Option<&PanelRow> {
 /// unusable `videoId` rejects the row without consulting the endpoint.
 fn panel_video_id(r: &PanelRow) -> Option<&str> {
     let id = match &r.video_id {
-        Some(v) => v.as_str(),
-        None => r
+        Presence::Present(v) => v.as_str(),
+        Presence::Absent => r
             .navigation
             .as_ref()
             .and_then(|n| n.watch.as_ref())
@@ -748,38 +745,15 @@ fn run_page_type(b: Option<&BrowseEndpoint>) -> Option<&str> {
         .and_then(|m| m.page_type.as_deref())
 }
 
-/// Largest HTTPS thumbnail of the row by width×height — panel rows
-/// carry their artwork at `thumbnail.thumbnails`; walking every nested
-/// subtree for stray `thumbnails` keys is what made the row parse cost
-/// scale with renderer weight.
+/// Largest HTTPS thumbnail anywhere in the row's `thumbnail` subtree —
+/// `best_artwork`'s deep walk over a bounded node instead of the whole
+/// renderer, which is what made the row parse cost scale with weight.
 fn row_artwork(r: &PanelRow) -> Vec<Value> {
-    let mut best: Option<(u64, &Thumb)> = None;
-    for t in r
-        .thumbnail
+    r.thumbnail
         .as_ref()
-        .map(|l| l.thumbnails.iter())
-        .unwrap_or_default()
-    {
-        let Some(url) = t.url.as_deref() else {
-            continue;
-        };
-        if !url.starts_with("https://") || url.len() > 2048 {
-            continue;
-        }
-        let area = t.width.unwrap_or(0).saturating_mul(t.height.unwrap_or(0));
-        if best.as_ref().is_none_or(|(a, _)| area > *a) {
-            best = Some((area, t));
-        }
-    }
-    best.map(|(_, t)| {
-        json!({
-            "url": t.url.as_deref().unwrap_or(""),
-            "width": t.width.filter(|w| *w > 0),
-            "height": t.height.filter(|h| *h > 0),
-        })
-    })
-    .into_iter()
-    .collect()
+        .and_then(best_artwork)
+        .into_iter()
+        .collect()
 }
 
 /// Map one `playlistPanelVideoRenderer` to a `trackMetadata` item;
@@ -904,7 +878,7 @@ fn next_playability(status: Option<&NextPlayability>) -> Playability {
     if status_str == "OK" || status_str.is_empty() {
         return Playability::Ok;
     }
-    let reason = status.reason.as_deref().unwrap_or(status_str);
+    let reason = status.reason.as_deref().unwrap_or("");
     let mut blob = reason.to_lowercase();
     for message in &status.messages {
         blob.push(' ');
@@ -1487,6 +1461,58 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["title"], "Song");
         assert_eq!(next_continuation(panel).as_deref(), Some("NEXT"));
+    }
+
+    #[test]
+    fn playability_reads_message_only_text() {
+        // The blob is reason + messages — a wall explained only in
+        // `messages` still classifies, and a bare non-OK status is
+        // `Unavailable`, not auth-required.
+        for (body, want) in [
+            (
+                r#"{"playabilityStatus":{"status":"UNPLAYABLE","messages":["Sign in to confirm you're not a bot"]}}"#,
+                Playability::BotCheck,
+            ),
+            (
+                r#"{"playabilityStatus":{"status":"ERROR","messages":[5,"content is age restricted",{"x":1}]}}"#,
+                Playability::AgeRestricted,
+            ),
+            (
+                r#"{"playabilityStatus":{"status":"AGE_RESTRICTED"}}"#,
+                Playability::Unavailable,
+            ),
+        ] {
+            let b: NextBody =
+                serde_json::from_str(body).unwrap_or_else(|e| panic!("body parses: {e}"));
+            assert_eq!(next_playability(b.playability.as_ref()), want, "{body}");
+        }
+    }
+
+    #[test]
+    fn null_video_id_rejects_row_without_endpoint_fallback() {
+        // A present `videoId` short-circuits the endpoint even when it
+        // is null — `get().and_then(as_str)` semantics.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":null,"navigationEndpoint":{"watchEndpoint":{"videoId":"dQw4w9WgXcQ"}},"title":{"simpleText":"Song"}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert_eq!(panel_video_id(row), None);
+    }
+
+    #[test]
+    fn nested_thumbnail_renderer_supplies_artwork() {
+        // `thumbnail.musicThumbnailRenderer.thumbnail.thumbnails` is
+        // the real upstream shape — artwork is found under any
+        // `thumbnails` key inside the row's thumbnail subtree.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"thumbnail":{"musicThumbnailRenderer":{"thumbnail":{"thumbnails":[{"url":"https://example.com/a.jpg","width":226,"height":226}]}}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        let art = row_artwork(row);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0]["url"], "https://example.com/a.jpg");
     }
 
     #[test]
