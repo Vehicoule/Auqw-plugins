@@ -8,7 +8,7 @@
 //! (`continuation: null`).
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -186,7 +186,7 @@ mod scan_depth {
 /// old whole-subtree walk.
 fn drain_scan_map<'de, A: MapAccess<'de>>(m: &mut A) -> Result<Option<(u64, Thumb)>, A::Error> {
     // Per-key, last-wins, merged sorted — the DOM's map semantics.
-    let mut per_key: BTreeMap<Cow<str>, Option<(u64, Thumb)>> = BTreeMap::new();
+    let mut entries = Vec::new();
     loop {
         if !scan_depth::node() {
             drain_skip_map(m)?;
@@ -196,16 +196,12 @@ fn drain_scan_map<'de, A: MapAccess<'de>>(m: &mut A) -> Result<Option<(u64, Thum
             break;
         };
         if k == "thumbnails" {
-            per_key.insert(k, m.next_value::<ThumbSet>()?.0);
+            note_key(&mut entries, k, m.next_value::<ThumbSet>()?.0);
         } else {
-            per_key.insert(k, m.next_value::<ArtworkScan>()?.0);
+            note_key(&mut entries, k, m.next_value::<ArtworkScan>()?.0);
         }
     }
-    let mut best = None;
-    for (_, a) in per_key {
-        merge_art(&mut best, a);
-    }
-    Ok(best)
+    Ok(merge_keyed(entries))
 }
 
 /// Drain the rest of a sequence, scanning each element for artwork.
@@ -222,6 +218,44 @@ fn drain_scan_seq<'de, A: SeqAccess<'de>>(s: &mut A) -> Result<Option<(u64, Thum
         }
     }
     Ok(best)
+}
+
+/// Scanned map entries: each key with the best art found under it.
+/// Sparse — only art-bearing keys (and later repeats that must wipe
+/// one) are recorded; absent entries contribute nothing anyway.
+type KeyedArt<'de> = Vec<(Cow<'de, str>, Option<(u64, Thumb)>)>;
+
+/// Record a key's scan result when it can change the outcome: real
+/// art, or a repeat of a key that already yielded some (a last-wins
+/// wipe). Artless first-seen keys are skipped — no entry, no alloc.
+fn note_key<'de>(entries: &mut KeyedArt<'de>, k: Cow<'de, str>, a: Option<(u64, Thumb)>) {
+    if a.is_some() || entries.iter().any(|(pk, _)| *pk == k) {
+        entries.push((k, a));
+    }
+}
+
+/// The same with each entry's occurrence index for last-wins order.
+type IndexedKeyedArt<'de> = Vec<(usize, Cow<'de, str>, Option<(u64, Thumb)>)>;
+
+/// Resolve collected `(key, art)` pairs the way the DOM did: a
+/// repeated key keeps its last value's art, and distinct keys merge in
+/// sorted order. Vec + one sort instead of a `BTreeMap` insert per key
+/// — the map version cost ~70 M fuel on a live `next` body.
+fn merge_keyed(entries: KeyedArt<'_>) -> Option<(u64, Thumb)> {
+    let mut e: IndexedKeyedArt<'_> = entries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (k, a))| (i, k, a))
+        .collect();
+    // Key ascending, occurrence index descending — the first entry of
+    // each equal-key run is the last occurrence.
+    e.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
+    e.dedup_by(|cur, prev| cur.1 == prev.1);
+    let mut best = None;
+    for (_, _, a) in e {
+        merge_art(&mut best, a);
+    }
+    best
 }
 
 /// Drain without scanning — envelope fields never carried artwork.
@@ -755,24 +789,89 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptVecOpt<T> {
 }
 
 /// A field whose presence — not validity — drives behavior: `Absent`
-/// only when the key is missing, `Present` for every supplied value
-/// including `null`.
+/// only when the key is missing. `Present` keeps the value's contents
+/// when it is a string (`None` for objects, arrays, `null`, …) — the
+/// `Value`-shape check without building a DOM — plus whatever art a
+/// wrong-shaped subtree carried.
 #[derive(Default)]
 enum Presence {
     #[default]
     Absent,
-    Present(Value),
+    Present(Option<String>, Option<(u64, Thumb)>),
+}
+
+impl Presence {
+    /// `Value::as_str`: `Some` only for a present string.
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Presence::Absent => None,
+            Presence::Present(v, _) => v.as_deref(),
+        }
+    }
+
+    /// `Map::get().is_some()`: the key was supplied, whatever its shape.
+    fn is_present(&self) -> bool {
+        matches!(self, Presence::Present(..))
+    }
 }
 
 impl<'de> Deserialize<'de> for Presence {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Value::deserialize(d).map(Presence::Present)
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Presence;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Presence, E> {
+                Ok(Presence::Present(Some(v.to_owned()), None))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Presence, E> {
+                Ok(Presence::Present(Some(v), None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Presence, A::Error> {
+                let art = drain_scan_map(&mut m)?;
+                Ok(Presence::Present(None, art))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Presence, A::Error> {
+                let art = drain_scan_seq(&mut s)?;
+                Ok(Presence::Present(None, art))
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<Presence, E> {
+                Ok(Presence::Present(None, None))
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<Presence, E> {
+                Ok(Presence::Present(None, None))
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<Presence, E> {
+                Ok(Presence::Present(None, None))
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<Presence, E> {
+                Ok(Presence::Present(None, None))
+            }
+            fn visit_unit<E>(self) -> Result<Presence, E> {
+                Ok(Presence::Present(None, None))
+            }
+            fn visit_none<E>(self) -> Result<Presence, E> {
+                Ok(Presence::Present(None, None))
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<Presence, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V)
     }
 }
 
 impl ArtCarrier for Presence {
     fn art_out(&self) -> Option<(u64, Thumb)> {
-        None
+        match self {
+            Presence::Absent => None,
+            Presence::Present(_, art) => art.clone(),
+        }
     }
 }
 
@@ -851,37 +950,49 @@ macro_rules! scanned_obj {
                         mut m: A,
                     ) -> Result<$name, A::Error> {
                         row_reset!($($flag)?);
-                        let mut per_key: BTreeMap<Cow<str>, Option<(u64, Thumb)>> =
-                            BTreeMap::new();
+                        let mut entries = Vec::new();
                         $( let mut $field = <$dec>::default(); )*
                         loop {
-                            if !scan_depth::node() {
-                                drain_skip_map(&mut m)?;
-                                break;
-                            }
+                            // Keys keep decoding past the art budget —
+                            // the DOM always parsed them; only scans stop.
+                            let scan = scan_depth::node();
                             let Some(k) = m.next_key::<Cow<str>>()? else { break };
                             match k.as_ref() {
                                 "thumbnails" => {
-                                    per_key
-                                        .insert(k, m.next_value::<ThumbSet>()?.0);
+                                    if scan {
+                                        note_key(
+                                            &mut entries,
+                                            k,
+                                            m.next_value::<ThumbSet>()?.0,
+                                        );
+                                    } else {
+                                        m.next_value::<IgnoredAny>()?;
+                                        note_key(&mut entries, k, None);
+                                    }
                                 }
                                 $( $key => {
                                     $field = m.next_value::<$dec>()?;
-                                    per_key.insert(
+                                    note_key(
+                                        &mut entries,
                                         Cow::Borrowed($key),
                                         $field.art_out(),
                                     );
                                 } )*
                                 _ => {
-                                    per_key
-                                        .insert(k, m.next_value::<ArtworkScan>()?.0);
+                                    if scan {
+                                        note_key(
+                                            &mut entries,
+                                            k,
+                                            m.next_value::<ArtworkScan>()?.0,
+                                        );
+                                    } else {
+                                        m.next_value::<IgnoredAny>()?;
+                                        note_key(&mut entries, k, None);
+                                    }
                                 }
                             }
                         }
-                        let mut art = None;
-                        for (_, a) in per_key {
-                            merge_art(&mut art, a);
-                        }
+                        let art = merge_keyed(entries);
                         Ok($name { $($field,)* art })
                     }
                 }
@@ -1185,7 +1296,7 @@ impl<'de> Deserialize<'de> for ThumbNode {
                 let mut url = OptStr::default();
                 let mut width = OptU64::default();
                 let mut height = OptU64::default();
-                let mut inner: BTreeMap<Cow<str>, Option<(u64, Thumb)>> = BTreeMap::new();
+                let mut inner = Vec::new();
                 loop {
                     if !scan_depth::node() {
                         drain_skip_map(&mut m)?;
@@ -1199,18 +1310,18 @@ impl<'de> Deserialize<'de> for ThumbNode {
                         "width" => width = m.next_value::<OptU64>()?,
                         "height" => height = m.next_value::<OptU64>()?,
                         "thumbnails" => {
-                            inner.insert(k, m.next_value::<ThumbSet>()?.0);
+                            note_key(&mut inner, k, m.next_value::<ThumbSet>()?.0);
                         }
                         _ => {
-                            inner.insert(k, m.next_value::<ArtworkScan>()?.0);
+                            note_key(&mut inner, k, m.next_value::<ArtworkScan>()?.0);
                         }
                     }
                 }
                 // Wrong-shaped claims still contribute scanned art at
                 // their key position, matching the sorted DOM walk.
-                inner.insert(Cow::Borrowed("url"), url.art_out());
-                inner.insert(Cow::Borrowed("width"), width.art_out());
-                inner.insert(Cow::Borrowed("height"), height.art_out());
+                note_key(&mut inner, Cow::Borrowed("url"), url.art_out());
+                note_key(&mut inner, Cow::Borrowed("width"), width.art_out());
+                note_key(&mut inner, Cow::Borrowed("height"), height.art_out());
                 // The old walk offered the element itself before
                 // descending into it — on equal area the outer
                 // candidate wins the tie.
@@ -1223,11 +1334,7 @@ impl<'de> Deserialize<'de> for ThumbNode {
                         height: height.v,
                     },
                 );
-                let mut nested = None;
-                for (_, a) in inner {
-                    merge_art(&mut nested, a);
-                }
-                merge_art(&mut art, nested);
+                merge_art(&mut art, merge_keyed(inner));
                 Ok(ThumbNode(art))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbNode, A::Error> {
@@ -1331,22 +1438,22 @@ impl<'de> Deserialize<'de> for ArtworkScan {
                     drain_skip_map(&mut m)?;
                     return Ok(ArtworkScan(None));
                 };
-                let mut best = None;
+                let mut entries = Vec::new();
                 loop {
                     if !scan_depth::node() {
                         drain_skip_map(&mut m)?;
                         break;
                     }
-                    let Some(k) = m.next_key::<&str>()? else {
+                    let Some(k) = m.next_key::<Cow<str>>()? else {
                         break;
                     };
                     if k == "thumbnails" {
-                        merge_art(&mut best, m.next_value::<ThumbSet>()?.0);
+                        note_key(&mut entries, k, m.next_value::<ThumbSet>()?.0);
                     } else {
-                        merge_art(&mut best, m.next_value::<ArtworkScan>()?.0);
+                        note_key(&mut entries, k, m.next_value::<ArtworkScan>()?.0);
                     }
                 }
-                Ok(ArtworkScan(best))
+                Ok(ArtworkScan(merge_keyed(entries)))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ArtworkScan, A::Error> {
                 let Some(_guard) = scan_depth::enter() else {
@@ -1550,13 +1657,13 @@ fn panel_row(entry: &RowEntry) -> Option<&PanelRow> {
 /// endpoint's — same short-circuit as the Value form: a present but
 /// unusable `videoId` rejects the row without consulting the endpoint.
 fn panel_video_id(r: &PanelRow) -> Option<&str> {
-    let id = match &r.video_id {
-        Presence::Present(v) => v.as_str(),
-        Presence::Absent => r
-            .navigation
+    let id = if r.video_id.is_present() {
+        r.video_id.as_str()
+    } else {
+        r.navigation
             .as_ref()
             .and_then(|n| n.watch.as_ref())
-            .and_then(|w| w.video_id.as_deref()),
+            .and_then(|w| w.video_id.as_deref())
     };
     id.filter(|s| is_video_id(s))
 }
@@ -2550,6 +2657,42 @@ mod tests {
         let art = row_artwork(r2);
         assert_eq!(art.len(), 1);
         assert_eq!(art[0]["url"], "https://example.com/fresh.jpg");
+    }
+
+    #[test]
+    fn escaped_key_inside_unknown_subtree_keeps_row() {
+        // An escaped key nested inside an unknown field decodes owned —
+        // the row's claims survive the scan of that subtree.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"overlay":{"\u0061rt":1}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn exhausted_art_budget_still_claims_required_fields() {
+        // The node cap bounds the artwork walk, never the field claims:
+        // metadata keys after the cap still decode, art is empty.
+        let mut fat = String::new();
+        for i in 0..10_005 {
+            if i > 0 {
+                fat.push(',');
+            }
+            fat.push_str(&format!(r#""k{i}":1"#));
+        }
+        let entry: RowEntry = serde_json::from_str(&format!(
+            r#"{{"playlistPanelVideoRenderer":{{"fat":{{{fat}}},"videoId":"dQw4w9WgXcQ","title":{{"simpleText":"Song"}},"thumbnails":[{{"url":"https://example.com/late.jpg","width":10,"height":10}}]}}}}"#
+        ))
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row survives the cap"));
+        assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
+        assert_eq!(
+            row.title.as_ref().and_then(|t| t.simple.as_deref()),
+            Some("Song")
+        );
+        assert!(row_artwork(row).is_empty());
     }
 
     #[test]
