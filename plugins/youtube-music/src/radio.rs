@@ -7,7 +7,8 @@
 //! without a `continuations` block is the honest terminal state
 //! (`continuation: null`).
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -137,14 +138,19 @@ mod scan_depth {
         static NODES: Cell<u32> = const { Cell::new(0) };
     }
 
+    /// A fresh budget for one renderer — called once when a `PanelRow`
+    /// decode begins, so sibling fields share the walk's node count
+    /// like the old `best_artwork` run did.
+    pub(super) fn reset() {
+        DEPTH.with(|d| d.set(0));
+        NODES.with(|n| n.set(0));
+    }
+
     /// One recursion level; the returned guard unwinds it on drop.
     /// `None` once the depth cap is hit — the caller drains the rest
     /// of that value without descending.
     pub(super) fn enter() -> Option<ScanGuard> {
         DEPTH.with(|d| {
-            if d.get() == 0 {
-                NODES.with(|n| n.set(0));
-            }
             if d.get() >= 64 {
                 None
             } else {
@@ -179,20 +185,25 @@ mod scan_depth {
 /// a wrong-shaped field still contributes its `thumbnails`, like the
 /// old whole-subtree walk.
 fn drain_scan_map<'de, A: MapAccess<'de>>(m: &mut A) -> Result<Option<(u64, Thumb)>, A::Error> {
-    let mut best = None;
+    // Per-key, last-wins, merged sorted — the DOM's map semantics.
+    let mut per_key: BTreeMap<Cow<str>, Option<(u64, Thumb)>> = BTreeMap::new();
     loop {
         if !scan_depth::node() {
             drain_skip_map(m)?;
             break;
         }
-        let Some(k) = m.next_key::<&str>()? else {
+        let Some(k) = m.next_key::<Cow<str>>()? else {
             break;
         };
         if k == "thumbnails" {
-            merge_art(&mut best, m.next_value::<ThumbSet>()?.0);
+            per_key.insert(k, m.next_value::<ThumbSet>()?.0);
         } else {
-            merge_art(&mut best, m.next_value::<ArtworkScan>()?.0);
+            per_key.insert(k, m.next_value::<ArtworkScan>()?.0);
         }
+    }
+    let mut best = None;
+    for (_, a) in per_key {
+        merge_art(&mut best, a);
     }
     Ok(best)
 }
@@ -793,8 +804,8 @@ macro_rules! lenient_obj {
                         mut m: A,
                     ) -> Result<$name, A::Error> {
                         $( let mut $field = <$dec>::default(); )*
-                        while let Some(k) = m.next_key::<&str>()? {
-                            match k {
+                        while let Some(k) = m.next_key::<Cow<str>>()? {
+                            match k.as_ref() {
                                 $( $key => $field = m.next_value::<$dec>()?, )*
                                 _ => {
                                     m.next_value::<IgnoredAny>()?;
@@ -810,15 +821,23 @@ macro_rules! lenient_obj {
     };
 }
 
+/// Emits `scan_depth::reset()` when the caller flags a row boundary.
+macro_rules! row_reset {
+    () => {};
+    (row) => {
+        scan_depth::reset();
+    };
+}
+
 /// `Deserialize` for an object inside the row renderer: named keys
-/// claim typed fields (last wins on a repeat), a `thumbnails` key
-/// collects candidates, and every other key is walked for nested art —
-/// the old whole-renderer `best_artwork` walk in a single pass, no DOM.
-/// Every field bubbles its subtree's best thumbnail upward through
-/// `ArtCarrier`. The generated type gains an `art` field and a `HasArt`
-/// impl so a parent can collect it.
+/// claim typed fields, a `thumbnails` key collects candidates, and
+/// every other key is walked for nested art — the old whole-renderer
+/// `best_artwork` walk in a single pass, no DOM. Art is kept per key
+/// and merged in sorted-key order last-wins, exactly like the `Value`
+/// DOM the old walk ran over. `@row` marks the renderer root so the
+/// shared depth/node budget resets once per row.
 macro_rules! scanned_obj {
-    ($name:ident { $( $field:ident : $key:literal => $dec:ty ),* $(,)? }) => {
+    ($name:ident $(@ $flag:ident)? { $( $field:ident : $key:literal => $dec:ty ),* $(,)? }) => {
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 struct V;
@@ -831,19 +850,37 @@ macro_rules! scanned_obj {
                         self,
                         mut m: A,
                     ) -> Result<$name, A::Error> {
-                        let mut art = None;
+                        row_reset!($($flag)?);
+                        let mut per_key: BTreeMap<Cow<str>, Option<(u64, Thumb)>> =
+                            BTreeMap::new();
                         $( let mut $field = <$dec>::default(); )*
-                        while let Some(k) = m.next_key::<&str>()? {
-                            match k {
+                        loop {
+                            if !scan_depth::node() {
+                                drain_skip_map(&mut m)?;
+                                break;
+                            }
+                            let Some(k) = m.next_key::<Cow<str>>()? else { break };
+                            match k.as_ref() {
                                 "thumbnails" => {
-                                    merge_art(&mut art, m.next_value::<ThumbSet>()?.0)
+                                    per_key
+                                        .insert(k, m.next_value::<ThumbSet>()?.0);
                                 }
                                 $( $key => {
                                     $field = m.next_value::<$dec>()?;
-                                    merge_art(&mut art, $field.art_out());
+                                    per_key.insert(
+                                        Cow::Borrowed($key),
+                                        $field.art_out(),
+                                    );
                                 } )*
-                                _ => merge_art(&mut art, m.next_value::<ArtworkScan>()?.0),
+                                _ => {
+                                    per_key
+                                        .insert(k, m.next_value::<ArtworkScan>()?.0);
+                                }
                             }
+                        }
+                        let mut art = None;
+                        for (_, a) in per_key {
+                            merge_art(&mut art, a);
                         }
                         Ok($name { $($field,)* art })
                     }
@@ -1034,7 +1071,7 @@ struct PanelRow {
     art: Option<(u64, Thumb)>,
 }
 
-scanned_obj!(PanelRow {
+scanned_obj!(PanelRow @row {
     video_id: "videoId" => Presence,
     navigation: "navigationEndpoint" => OptObj<WatchNav>,
     title: "title" => OptObj<TextRuns>,
@@ -1148,26 +1185,36 @@ impl<'de> Deserialize<'de> for ThumbNode {
                 let mut url = OptStr::default();
                 let mut width = OptU64::default();
                 let mut height = OptU64::default();
-                let mut art = None;
+                let mut inner: BTreeMap<Cow<str>, Option<(u64, Thumb)>> = BTreeMap::new();
                 loop {
                     if !scan_depth::node() {
                         drain_skip_map(&mut m)?;
                         break;
                     }
-                    let Some(k) = m.next_key::<&str>()? else {
+                    let Some(k) = m.next_key::<Cow<str>>()? else {
                         break;
                     };
-                    match k {
+                    match k.as_ref() {
                         "url" => url = m.next_value::<OptStr>()?,
                         "width" => width = m.next_value::<OptU64>()?,
                         "height" => height = m.next_value::<OptU64>()?,
-                        "thumbnails" => merge_art(&mut art, m.next_value::<ThumbSet>()?.0),
-                        _ => merge_art(&mut art, m.next_value::<ArtworkScan>()?.0),
+                        "thumbnails" => {
+                            inner.insert(k, m.next_value::<ThumbSet>()?.0);
+                        }
+                        _ => {
+                            inner.insert(k, m.next_value::<ArtworkScan>()?.0);
+                        }
                     }
                 }
-                merge_art(&mut art, ArtCarrier::art_out(&url));
-                merge_art(&mut art, ArtCarrier::art_out(&width));
-                merge_art(&mut art, ArtCarrier::art_out(&height));
+                // Wrong-shaped claims still contribute scanned art at
+                // their key position, matching the sorted DOM walk.
+                inner.insert(Cow::Borrowed("url"), url.art_out());
+                inner.insert(Cow::Borrowed("width"), width.art_out());
+                inner.insert(Cow::Borrowed("height"), height.art_out());
+                // The old walk offered the element itself before
+                // descending into it — on equal area the outer
+                // candidate wins the tie.
+                let mut art = None;
                 offer_art(
                     &mut art,
                     Thumb {
@@ -1176,6 +1223,11 @@ impl<'de> Deserialize<'de> for ThumbNode {
                         height: height.v,
                     },
                 );
+                let mut nested = None;
+                for (_, a) in inner {
+                    merge_art(&mut nested, a);
+                }
+                merge_art(&mut art, nested);
                 Ok(ThumbNode(art))
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbNode, A::Error> {
@@ -2417,6 +2469,87 @@ mod tests {
         let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
         assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
         assert!(row_artwork(row).is_empty());
+    }
+
+    #[test]
+    fn escaped_object_keys_do_not_reject_the_page() {
+        // A `\u` escape in a key yields an owned string — the DOM had
+        // owned keys, so decoding must tolerate them too.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"vid\u0065oId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"\u0065xtra":1}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
+    }
+
+    #[test]
+    fn overwritten_field_drops_its_artwork() {
+        // Last-wins applies to artwork too: art found under the first
+        // `title` is discarded with that value.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Bad","thumbnails":[{"url":"https://example.com/a.jpg","width":500,"height":500}]},"title":{"simpleText":"Song"}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert_eq!(
+            row.title.as_ref().and_then(|t| t.simple.as_deref()),
+            Some("Song")
+        );
+        assert!(row_artwork(row).is_empty());
+    }
+
+    #[test]
+    fn equal_area_ties_match_sorted_key_walk() {
+        // Sorted-key traversal offered `a` before `z`, and an element
+        // before its own descendants — both ties keep the earlier one.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"z":{"thumbnails":[{"url":"https://example.com/z.jpg","width":100,"height":100}]},"a":{"thumbnails":[{"url":"https://example.com/outer.jpg","width":100,"height":100,"nested":{"thumbnails":[{"url":"https://example.com/inner.jpg","width":100,"height":100}]}}]}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        let art = row_artwork(row);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0]["url"], "https://example.com/outer.jpg");
+    }
+
+    #[test]
+    fn node_budget_is_shared_across_siblings_and_resets_per_row() {
+        // Two fat siblings exhaust one renderer's node budget; the next
+        // row gets a fresh walk.
+        let mut x = String::from(r#""x":{"#);
+        for i in 0..5000 {
+            if i > 0 {
+                x.push(',');
+            }
+            x.push_str(&format!(r#""k{i}":1"#));
+        }
+        x.push_str(r#"},"y":{"#);
+        for i in 0..5000 {
+            if i > 0 {
+                x.push(',');
+            }
+            x.push_str(&format!(r#""k{i}":1"#));
+        }
+        // x+y burn the budget; `z`'s thumbnails arrive after the cap.
+        x.push_str(r#"},"z":{"thumbnails":[{"url":"https://example.com/late.jpg","width":10,"height":10}]}"#);
+        let r1: RowEntry = serde_json::from_str(&format!(
+            "{{\"playlistPanelVideoRenderer\":{{\"videoId\":\"r1\",\"title\":{{\"simpleText\":\"A\"}},{x}}}}}"
+        ))
+        .unwrap_or_else(|e| panic!("row parses: {e}"));
+        let r1 = panel_row(&r1).unwrap_or_else(|| panic!("row 1 present"));
+        assert!(row_artwork(r1).is_empty());
+
+        // The next row decodes with a fresh budget — `reset` runs at
+        // the `PanelRow` boundary.
+        let r2: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"r2","title":{"simpleText":"B"},"ok":{"thumbnails":[{"url":"https://example.com/fresh.jpg","width":10,"height":10}]}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("row parses: {e}"));
+        let r2 = panel_row(&r2).unwrap_or_else(|| panic!("row 2 present"));
+        let art = row_artwork(r2);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0]["url"], "https://example.com/fresh.jpg");
     }
 
     #[test]
