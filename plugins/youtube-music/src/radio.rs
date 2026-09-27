@@ -130,6 +130,14 @@ fn next_body(p: &RadioPayload) -> Value {
 /// frames (`ArtworkScan`, `ThumbSet`, `ThumbNode`) share the same
 /// budget, kept in thread locals because the recursion goes through
 /// serde's `Deserialize` chain and cannot carry state.
+///
+/// One deliberate divergence: the DOM spent its node budget in *sorted*
+/// key order; this scan spends it in document order — sorted-order
+/// exhaustion is unrecoverable without buffering each map's values,
+/// which is the DOM cost this parse exists to remove. Below the cap
+/// output is identical (the sorted `merge_keyed` reproduces DOM merge
+/// order); past it, artwork is dropped in document order while
+/// metadata keeps decoding. Fuel remains the outer bound either way.
 mod scan_depth {
     use std::cell::Cell;
 
@@ -2693,6 +2701,31 @@ mod tests {
             Some("Song")
         );
         assert!(row_artwork(row).is_empty());
+    }
+
+    #[test]
+    fn artwork_before_the_cap_still_lands() {
+        // Bounded scans run in document order (the old DOM walked sorted
+        // keys — that ordering is unrecoverable without buffering, which
+        // is the DOM cost this parse removed). Art seen before the cap
+        // is kept; only what comes after loses it.
+        let mut fat = String::new();
+        for i in 0..10_005 {
+            if i > 0 {
+                fat.push(',');
+            }
+            fat.push_str(&format!(r#""k{i}":1"#));
+        }
+        let entry: RowEntry = serde_json::from_str(&format!(
+            r#"{{"playlistPanelVideoRenderer":{{"videoId":"dQw4w9WgXcQ","title":{{"simpleText":"Song"}},"thumbnails":[{{"url":"https://example.com/early.jpg","width":10,"height":10}}],"fat":{{{fat}}}}}}}"#
+        ))
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row survives"));
+        assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
+        assert_eq!(
+            row_artwork(row)[0].get("url"),
+            Some(&json!("https://example.com/early.jpg"))
+        );
     }
 
     #[test]
