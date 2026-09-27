@@ -8,8 +8,11 @@
 //! (`continuation: null`).
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::marker::PhantomData;
 
 use auqw_guest_sdk::{http_request, kv_set, GuestError};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -106,298 +109,552 @@ fn next_body(p: &RadioPayload) -> Value {
     }
 }
 
-// ---- Typed `next` view --------------------------------------------------
+// ---- Tolerant `next` view -----------------------------------------------
 //
-// The page is deserialized into narrow structs so unknown subtrees are
-// skipped at tokenize time rather than materialized as a `Value` DOM.
-// A full DOM of a ~600 KB body + the old per-row subtree clone walked
-// ~340 M fuel — a whisker under the 200 M per-entry cap per step and
-// over it on marginally larger variants (the mobile `budget-exceeded:
-// fuel` failure). Keeping radio's parse inside typed shapes keeps the
-// honest-behavior surface identical at a fraction of the budget.
+// A ~600 KB `next` body parsed into a `serde_json::Value` DOM costs
+// ~340 M fuel — a whisker under the 200 M per-entry cap, and over it on
+// marginally larger variants (the mobile `budget-exceeded: fuel`
+// failure). The page is deserialized in a single pass into narrow
+// structs whose fields all tolerate wrong shapes, so unknown subtrees
+// are skipped at tokenize time rather than materialized.
+//
+// Tolerance mirrors the old `get(k).and_then(as_*)` chains exactly:
+// every field parses through a visitor that collapses a wrong-typed
+// value to absent (draining unexpected maps/sequences so the stream
+// stays aligned), and every list element that is not an object drops
+// out — a malformed row is skipped, never fatal to the page.
+
+/// `as_str`: a string decodes, anything else — scalars, objects, arrays
+/// — is absent. Sequences and maps are drained to keep the parser
+/// aligned for the next field.
+fn opt_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string")
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Option<String>, E> {
+            Ok(Some(v.to_owned()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Option<String>, E> {
+            Ok(Some(v))
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<String>, A::Error> {
+            while s.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Option<String>, A::Error> {
+            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_bool<E>(self, _v: bool) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _v: i64) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _v: u64) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _v: f64) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_char<E>(self, _v: char) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_bytes<E>(self, _v: &[u8]) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_byte_buf<E>(self, _v: Vec<u8>) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Option<String>, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> Result<Option<String>, D2::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// `as_u64` on a lazily read field.
+fn opt_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Option<u64>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a u64")
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Option<u64>, E> {
+            Ok(Some(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Option<u64>, E> {
+            Ok(u64::try_from(v).ok())
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<u64>, A::Error> {
+            while s.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Option<u64>, A::Error> {
+            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_bool<E>(self, _v: bool) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _v: f64) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+        fn visit_str<E>(self, _v: &str) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Option<u64>, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Option<u64>, D2::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// `as_object` + shape parse: a map becomes `Some(T)`, anything else is
+/// absent. `T`'s own fields are all opt_*, so a struct parse only fails
+/// on malformed JSON — which the upfront DOM parse would reject too.
+fn opt_obj<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct V<T>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+        type Value = Option<T>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an object")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, acc: A) -> Result<Option<T>, A::Error> {
+            T::deserialize(serde::de::value::MapAccessDeserializer::new(acc)).map(Some)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Option<T>, A::Error> {
+            while s.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_bool<E>(self, _v: bool) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _v: i64) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _v: u64) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _v: f64) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_str<E>(self, _v: &str) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Option<T>, E> {
+            Ok(None)
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Option<T>, D2::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    d.deserialize_any(V(PhantomData))
+}
+
+/// An array element that may be any JSON value: a map parses as `T`,
+/// anything else is consumed and dropped — the old `as_array` +
+/// per-element `as_object` skip.
+struct Tolerant<T>(Option<T>);
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Tolerant<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = Tolerant<T>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("any value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut acc: A) -> Result<Tolerant<T>, A::Error> {
+                match T::deserialize(serde::de::value::MapAccessDeserializer::new(&mut acc)) {
+                    Ok(t) => Ok(Tolerant(Some(t))),
+                    Err(_) => {
+                        // Element-level rot (e.g. a scalar field type
+                        // T cannot tolerate): drain the rest of the
+                        // map so the parent array stays aligned, then
+                        // drop the element — a dead row, not a dead
+                        // page.
+                        while acc.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                        Ok(Tolerant(None))
+                    }
+                }
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<Tolerant<T>, A::Error> {
+                while s.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Tolerant(None))
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_unit<E>(self) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_none<E>(self) -> Result<Tolerant<T>, E> {
+                Ok(Tolerant(None))
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<Tolerant<T>, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V(PhantomData))
+    }
+}
+
+/// `as_array` + the per-element skip: a non-array field is empty, and
+/// each element tolerates any JSON shape.
+fn opt_vec<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct V<T>(PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+        type Value = Vec<T>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("an array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut acc: A) -> Result<Vec<T>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(Tolerant(t)) = acc.next_element::<Tolerant<T>>()? {
+                if let Some(t) = t {
+                    out.push(t);
+                }
+            }
+            Ok(out)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Vec<T>, A::Error> {
+            while m.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(Vec::new())
+        }
+        fn visit_bool<E>(self, _v: bool) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_i64<E>(self, _v: i64) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_u64<E>(self, _v: u64) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_f64<E>(self, _v: f64) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_str<E>(self, _v: &str) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_unit<E>(self) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_none<E>(self) -> Result<Vec<T>, E> {
+            Ok(Vec::new())
+        }
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Vec<T>, D2::Error> {
+            d.deserialize_any(self)
+        }
+    }
+    d.deserialize_any(V(PhantomData))
+}
 
 #[derive(Deserialize)]
 struct NextBody {
-    #[serde(rename = "playabilityStatus", default)]
+    #[serde(rename = "playabilityStatus", default, deserialize_with = "opt_obj")]
     playability: Option<NextPlayability>,
-    #[serde(rename = "responseContext", default)]
+    #[serde(rename = "responseContext", default, deserialize_with = "opt_obj")]
     response_context: Option<NextContext>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_obj")]
     contents: Option<NextContents>,
-    #[serde(rename = "continuationContents", default)]
+    #[serde(rename = "continuationContents", default, deserialize_with = "opt_obj")]
     continuation_contents: Option<NextContinuation>,
 }
 
 #[derive(Deserialize)]
 struct NextPlayability {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_str")]
     status: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_str")]
     reason: Option<String>,
-    #[serde(default)]
-    messages: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "opt_vec")]
+    messages: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct NextContext {
-    #[serde(rename = "visitorData", default)]
+    #[serde(rename = "visitorData", default, deserialize_with = "opt_str")]
     visitor_data: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct NextContents {
-    #[serde(rename = "singleColumnMusicWatchNextResultsRenderer", default)]
+    #[serde(
+        rename = "singleColumnMusicWatchNextResultsRenderer",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     single_column: Option<SingleColumn>,
 }
 
 #[derive(Deserialize)]
 struct SingleColumn {
-    #[serde(rename = "tabbedRenderer", default)]
+    #[serde(rename = "tabbedRenderer", default, deserialize_with = "opt_obj")]
     tabbed: Option<Tabbed>,
 }
 
 #[derive(Deserialize)]
 struct Tabbed {
-    #[serde(rename = "watchNextTabbedResultsRenderer", default)]
+    #[serde(
+        rename = "watchNextTabbedResultsRenderer",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     watch_next: Option<WatchNext>,
 }
 
 #[derive(Deserialize)]
 struct WatchNext {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_vec")]
     tabs: Vec<WatchTab>,
 }
 
 #[derive(Deserialize)]
 struct WatchTab {
-    #[serde(rename = "tabRenderer", default)]
+    #[serde(rename = "tabRenderer", default, deserialize_with = "opt_obj")]
     renderer: Option<TabRenderer>,
 }
 
 #[derive(Deserialize)]
 struct TabRenderer {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_obj")]
     content: Option<TabContent>,
 }
 
 #[derive(Deserialize)]
 struct TabContent {
-    #[serde(rename = "musicQueueRenderer", default)]
+    #[serde(rename = "musicQueueRenderer", default, deserialize_with = "opt_obj")]
     queue: Option<QueueRenderer>,
 }
 
 #[derive(Deserialize)]
 struct QueueRenderer {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_obj")]
     content: Option<QueueContent>,
 }
 
 #[derive(Deserialize)]
 struct QueueContent {
-    #[serde(rename = "playlistPanelRenderer", default)]
+    #[serde(
+        rename = "playlistPanelRenderer",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     panel: Option<Panel>,
 }
 
 #[derive(Deserialize)]
 struct NextContinuation {
-    #[serde(rename = "playlistPanelContinuation", default)]
+    #[serde(
+        rename = "playlistPanelContinuation",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     panel: Option<Panel>,
 }
 
 #[derive(Deserialize)]
 struct Panel {
-    #[serde(rename = "playlistId", default)]
+    #[serde(rename = "playlistId", default, deserialize_with = "opt_str")]
     playlist_id: Option<String>,
-    #[serde(default)]
-    contents: Vec<PanelEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_vec")]
+    contents: Vec<RowEntry>,
+    #[serde(default, deserialize_with = "opt_vec")]
     continuations: Vec<ContinuationWrap>,
-}
-
-/// One `contents` entry — a queue row when it carries a video
-/// renderer, anything else (headers, separators, malformed values) is
-/// skipped exactly like the `Value` lookup chains did. Custom visitor:
-/// non-map entries are dropped without buffering a DOM, and real rows
-/// deserialize straight into `RowEntry` instead of serde's untagged
-/// content buffer.
-enum PanelEntry {
-    // Boxed: clippy::large_enum_variant — RowEntry is ~10x the
-    // Ignored discriminant.
-    Row(Box<RowEntry>),
-    Ignored,
-}
-
-impl<'de> Deserialize<'de> for PanelEntry {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct EntryVisitor;
-        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
-            type Value = PanelEntry;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a playlistPanelRenderer contents entry")
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                RowEntry::deserialize(serde::de::value::MapAccessDeserializer::new(map))
-                    .map(|r| PanelEntry::Row(Box::new(r)))
-            }
-
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-                Ok(PanelEntry::Ignored)
-            }
-
-            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(PanelEntry::Ignored)
-            }
-            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
-                Ok(PanelEntry::Ignored)
-            }
-            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
-                Ok(PanelEntry::Ignored)
-            }
-            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
-                Ok(PanelEntry::Ignored)
-            }
-            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
-                Ok(PanelEntry::Ignored)
-            }
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(PanelEntry::Ignored)
-            }
-        }
-        deserializer.deserialize_any(EntryVisitor)
-    }
 }
 
 #[derive(Deserialize)]
 struct RowEntry {
-    #[serde(rename = "playlistPanelVideoRenderer", default)]
+    #[serde(
+        rename = "playlistPanelVideoRenderer",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     video: Option<PanelRow>,
-    #[serde(rename = "playlistPanelVideoWrapperRenderer", default)]
+    #[serde(
+        rename = "playlistPanelVideoWrapperRenderer",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     wrapper: Option<RowWrapper>,
 }
 
 #[derive(Deserialize)]
 struct RowWrapper {
-    #[serde(rename = "primaryRenderer", default)]
+    #[serde(rename = "primaryRenderer", default, deserialize_with = "opt_obj")]
     primary: Option<PrimaryRenderer>,
 }
 
 #[derive(Deserialize)]
 struct PrimaryRenderer {
-    #[serde(rename = "playlistPanelVideoRenderer", default)]
+    #[serde(
+        rename = "playlistPanelVideoRenderer",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     video: Option<PanelRow>,
 }
 
 #[derive(Deserialize)]
 struct PanelRow {
+    // Presence, not validity, decides whether the navigation endpoint
+    // is consulted — so this stays an untyped `Value`: `{"videoId":42}`
+    // rejects the row exactly like `get().and_then(as_str)` did.
     #[serde(rename = "videoId", default)]
-    video_id: Option<String>,
-    #[serde(rename = "navigationEndpoint", default)]
+    video_id: Option<Value>,
+    #[serde(rename = "navigationEndpoint", default, deserialize_with = "opt_obj")]
     navigation: Option<WatchNav>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_obj")]
     title: Option<TextRuns>,
-    #[serde(rename = "longBylineText", default)]
+    #[serde(rename = "longBylineText", default, deserialize_with = "opt_obj")]
     long_byline: Option<TextRuns>,
-    #[serde(rename = "shortBylineText", default)]
+    #[serde(rename = "shortBylineText", default, deserialize_with = "opt_obj")]
     short_byline: Option<TextRuns>,
-    #[serde(rename = "lengthText", default)]
+    #[serde(rename = "lengthText", default, deserialize_with = "opt_obj")]
     length: Option<TextRuns>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_obj")]
     thumbnail: Option<ThumbList>,
 }
 
 #[derive(Deserialize)]
 struct WatchNav {
-    #[serde(rename = "watchEndpoint", default)]
+    #[serde(rename = "watchEndpoint", default, deserialize_with = "opt_obj")]
     watch: Option<WatchEndpoint>,
 }
 
 #[derive(Deserialize)]
 struct WatchEndpoint {
-    #[serde(rename = "videoId", default)]
+    #[serde(rename = "videoId", default, deserialize_with = "opt_str")]
     video_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TextRuns {
-    #[serde(default)]
-    runs: Option<Vec<BylineRun>>,
-    #[serde(rename = "simpleText", default)]
+    #[serde(default, deserialize_with = "opt_vec")]
+    runs: Vec<BylineRun>,
+    #[serde(rename = "simpleText", default, deserialize_with = "opt_str")]
     simple: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct BylineRun {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_str")]
     text: Option<String>,
-    #[serde(rename = "navigationEndpoint", default)]
+    #[serde(rename = "navigationEndpoint", default, deserialize_with = "opt_obj")]
     navigation: Option<BrowseNav>,
 }
 
 #[derive(Deserialize)]
 struct BrowseNav {
-    #[serde(rename = "browseEndpoint", default)]
+    #[serde(rename = "browseEndpoint", default, deserialize_with = "opt_obj")]
     browse: Option<BrowseEndpoint>,
 }
 
 #[derive(Deserialize)]
 struct BrowseEndpoint {
-    #[serde(rename = "browseId", default)]
+    #[serde(rename = "browseId", default, deserialize_with = "opt_str")]
     id: Option<String>,
-    #[serde(rename = "browseEndpointContextSupportedConfigs", default)]
+    #[serde(
+        rename = "browseEndpointContextSupportedConfigs",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     context_configs: Option<BrowseConfigs>,
 }
 
 #[derive(Deserialize)]
 struct BrowseConfigs {
-    #[serde(rename = "browseEndpointContextMusicConfig", default)]
+    #[serde(
+        rename = "browseEndpointContextMusicConfig",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     music: Option<BrowseMusic>,
 }
 
 #[derive(Deserialize)]
 struct BrowseMusic {
-    #[serde(rename = "pageType", default)]
+    #[serde(rename = "pageType", default, deserialize_with = "opt_str")]
     page_type: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ThumbList {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_vec")]
     thumbnails: Vec<Thumb>,
 }
 
 #[derive(Deserialize)]
 struct Thumb {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_str")]
     url: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_u64")]
     width: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_u64")]
     height: Option<u64>,
 }
 
 #[derive(Deserialize)]
 struct ContinuationWrap {
-    #[serde(rename = "nextRadioContinuationData", default)]
+    #[serde(
+        rename = "nextRadioContinuationData",
+        default,
+        deserialize_with = "opt_obj"
+    )]
     radio: Option<ContinuationData>,
-    #[serde(rename = "nextContinuationData", default)]
+    #[serde(rename = "nextContinuationData", default, deserialize_with = "opt_obj")]
     next: Option<ContinuationData>,
 }
 
 #[derive(Deserialize)]
 struct ContinuationData {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "opt_str")]
     continuation: Option<String>,
 }
 
@@ -444,56 +701,49 @@ fn continuation_panel(body: &NextBody) -> Result<&Panel, GuestError> {
 /// primary video inside a `playlistPanelVideoWrapperRenderer` — the
 /// wrapper's secondary renderer is decoration, never a queue entry.
 fn panel_row(entry: &RowEntry) -> Option<&PanelRow> {
-    if let Some(r) = entry.video.as_ref() {
-        return Some(r);
-    }
     entry
-        .wrapper
+        .video
         .as_ref()
-        .and_then(|w| w.primary.as_ref())
-        .and_then(|p| p.video.as_ref())
+        .or_else(|| entry.wrapper.as_ref()?.primary.as_ref()?.video.as_ref())
 }
 
 /// The row's video id: the renderer's own `videoId`, else its watch
-/// endpoint's — same short-circuit as the Value form (a present but
-/// invalid `videoId` rejects the row even when the endpoint's is
-/// valid).
-fn panel_video_id(r: &PanelRow) -> Option<String> {
-    r.video_id
-        .as_deref()
-        .or_else(|| {
-            r.navigation
-                .as_ref()
-                .and_then(|n| n.watch.as_ref())
-                .and_then(|w| w.video_id.as_deref())
-        })
-        .filter(|s| is_video_id(s))
-        .map(str::to_string)
+/// endpoint's — same short-circuit as the Value form: a present but
+/// unusable `videoId` rejects the row without consulting the endpoint.
+fn panel_video_id(r: &PanelRow) -> Option<&str> {
+    let id = match &r.video_id {
+        Some(v) => v.as_str(),
+        None => r
+            .navigation
+            .as_ref()
+            .and_then(|n| n.watch.as_ref())
+            .and_then(|w| w.video_id.as_deref()),
+    };
+    id.filter(|s| is_video_id(s))
 }
 
 /// A byline/text node's string: the `runs` join when it carries text,
 /// else `simpleText` — `runs_text`'s contract verbatim.
 fn text_string(t: &TextRuns) -> Option<String> {
-    if let Some(runs) = t.runs.as_ref() {
-        let joined: String = runs.iter().filter_map(|r| r.text.as_deref()).collect();
-        let t = joined.trim();
-        if !t.is_empty() {
-            return Some(t.to_string());
-        }
+    let joined: String = t.runs.iter().filter_map(|r| r.text.as_deref()).collect();
+    if !joined.trim().is_empty() {
+        return Some(joined.trim().to_string());
     }
     t.simple
         .as_deref()
-        .map(str::trim)
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+}
+
+/// The run's `browseEndpoint` when it is an object — object presence is
+/// the gate for artist/album attribution, like `browse()`'s `as_object`.
+fn run_browse(run: &BylineRun) -> Option<&BrowseEndpoint> {
+    run.navigation.as_ref().and_then(|n| n.browse.as_ref())
 }
 
 /// The run's browse endpoint page type.
-fn run_page_type(run: &BylineRun) -> Option<&str> {
-    run.navigation
-        .as_ref()
-        .and_then(|n| n.browse.as_ref())
-        .and_then(|b| b.context_configs.as_ref())
+fn run_page_type(b: Option<&BrowseEndpoint>) -> Option<&str> {
+    b.and_then(|b| b.context_configs.as_ref())
         .and_then(|c| c.music.as_ref())
         .and_then(|m| m.page_type.as_deref())
 }
@@ -504,16 +754,21 @@ fn run_page_type(run: &BylineRun) -> Option<&str> {
 /// scale with renderer weight.
 fn row_artwork(r: &PanelRow) -> Vec<Value> {
     let mut best: Option<(u64, &Thumb)> = None;
-    if let Some(thumbs) = r.thumbnail.as_ref() {
-        for t in &thumbs.thumbnails {
-            let url = t.url.as_deref().unwrap_or("");
-            if !url.starts_with("https://") || url.len() > 2048 {
-                continue;
-            }
-            let area = t.width.unwrap_or(0).saturating_mul(t.height.unwrap_or(0));
-            if best.is_none_or(|(a, _)| area > a) {
-                best = Some((area, t));
-            }
+    for t in r
+        .thumbnail
+        .as_ref()
+        .map(|l| l.thumbnails.iter())
+        .unwrap_or_default()
+    {
+        let Some(url) = t.url.as_deref() else {
+            continue;
+        };
+        if !url.starts_with("https://") || url.len() > 2048 {
+            continue;
+        }
+        let area = t.width.unwrap_or(0).saturating_mul(t.height.unwrap_or(0));
+        if best.as_ref().is_none_or(|(a, _)| area > *a) {
+            best = Some((area, t));
         }
     }
     best.map(|(_, t)| {
@@ -529,7 +784,7 @@ fn row_artwork(r: &PanelRow) -> Vec<Value> {
 
 /// Map one `playlistPanelVideoRenderer` to a `trackMetadata` item;
 /// rows without a contract-legal title are not items.
-fn panel_item(r: &PanelRow, video_id: String) -> Option<Value> {
+fn panel_item(r: &PanelRow, video_id: &str) -> Option<Value> {
     let title = r.title.as_ref().and_then(text_string)?;
     // `trackMetadata.title` caps at 512 scalars — drop the row rather
     // than emit a contract-invalid result.
@@ -550,19 +805,19 @@ fn panel_item(r: &PanelRow, video_id: String) -> Option<Value> {
     for run in [r.long_byline.as_ref(), r.short_byline.as_ref()]
         .into_iter()
         .flatten()
-        .flat_map(|t| t.runs.as_deref().unwrap_or(&[]))
+        .flat_map(|t| t.runs.iter())
     {
-        let Some(text) = run.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(text) = run.text.as_deref() else {
             continue;
         };
-        let browse_id = run
-            .navigation
-            .as_ref()
-            .and_then(|n| n.browse.as_ref())
-            .and_then(|b| b.id.as_deref());
-        let page_type = run_page_type(run);
-        if browse_id.is_some() {
-            if artist.is_none() && browse_id.is_some_and(|id| id.starts_with("UC")) {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let browse = run_browse(run);
+        let page_type = run_page_type(browse);
+        if let Some(b) = browse {
+            if artist.is_none() && b.id.as_deref().is_some_and(|id| id.starts_with("UC")) {
                 artist = Some(text.to_string());
             }
             if artist.is_none() && page_type == Some("MUSIC_PAGE_TYPE_ARTIST") {
@@ -605,20 +860,17 @@ fn panel_items(panel: &Panel) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
     for entry in &panel.contents {
-        let PanelEntry::Row(entry) = entry else {
-            continue;
-        };
-        let Some(r) = panel_row(entry.as_ref()) else {
+        let Some(r) = panel_row(entry) else {
             continue;
         };
         let Some(video_id) = panel_video_id(r) else {
             continue;
         };
-        if seen.contains(&video_id) {
+        if seen.contains(video_id) {
             continue;
         }
-        if let Some(item) = panel_item(r, video_id.clone()) {
-            seen.insert(video_id);
+        if let Some(item) = panel_item(r, video_id) {
+            seen.insert(video_id.to_string());
             items.push(item);
         }
     }
@@ -631,32 +883,32 @@ fn panel_items(panel: &Panel) -> Vec<Value> {
 /// is the honest terminal page.
 fn next_continuation(panel: &Panel) -> Option<String> {
     panel.continuations.iter().find_map(|c| {
-        [&c.radio, &c.next].iter().find_map(|d| {
-            d.as_ref()
-                .and_then(|d| d.continuation.as_deref())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        })
+        [c.radio.as_ref(), c.next.as_ref()]
+            .into_iter()
+            .find_map(|d| {
+                d.and_then(|d| d.continuation.as_deref())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
     })
 }
 
 /// `playabilityStatus` over the typed view — the same bucket order as
 /// `classify_playability`: OK-or-absent wins, then the reason+messages
 /// blob decides bot-check vs age vs sign-in vs unavailable.
-fn next_playability(p: Option<&NextPlayability>) -> Playability {
-    let status_str = p.and_then(|s| s.status.as_deref()).unwrap_or("");
+fn next_playability(status: Option<&NextPlayability>) -> Playability {
+    let Some(status) = status else {
+        return Playability::Ok;
+    };
+    let status_str = status.status.as_deref().unwrap_or("");
     if status_str == "OK" || status_str.is_empty() {
         return Playability::Ok;
     }
-    let mut blob = p
-        .and_then(|s| s.reason.as_deref())
-        .unwrap_or("")
-        .to_lowercase();
-    if let Some(messages) = p.and_then(|s| s.messages.as_ref()) {
-        for message in messages {
-            blob.push(' ');
-            blob.push_str(&message.to_lowercase());
-        }
+    let reason = status.reason.as_deref().unwrap_or(status_str);
+    let mut blob = reason.to_lowercase();
+    for message in &status.messages {
+        blob.push(' ');
+        blob.push_str(&message.to_lowercase());
     }
     if blob.contains("not a bot") || blob.contains("unusual traffic") {
         return Playability::BotCheck;
@@ -665,6 +917,9 @@ fn next_playability(p: Option<&NextPlayability>) -> Playability {
         return Playability::AgeRestricted;
     }
     if blob.contains("sign in") || status_str == "LOGIN_REQUIRED" {
+        // `LOGIN_REQUIRED` is the canonical sign-in status even with no
+        // reason text — but bot-check reasons under it were caught
+        // above, so this arm only fires on a real sign-in wall.
         return Playability::SignInRequired;
     }
     Playability::Unavailable
@@ -1216,6 +1471,22 @@ mod tests {
         assert_eq!(header_of(&out, "Authorization"), None);
         let out = h.answer(&out, 200, SEED);
         assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn malformed_panel_entries_skip_not_abort() {
+        // A wrong-typed renderer value or a non-object contents entry is
+        // a dead row, not a dead page — siblings and the continuation
+        // survive exactly like the Value lookup chains.
+        let body: NextBody = serde_json::from_str(
+            r#"{"contents": {"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer": {"watchNextTabbedResultsRenderer": {"tabs": [{"tabRenderer": {"content": {"musicQueueRenderer": {"content": {"playlistPanelRenderer": {"playlistId": "RDAMVMdQw4w9WgXcQ", "contents": [{"playlistPanelVideoRenderer": 42}, "not-an-object", {"playlistPanelVideoWrapperRenderer": {"primaryRenderer": 5}}, {"playlistPanelVideoRenderer": {"videoId": "dQw4w9WgXcQ", "title": {"simpleText": "Song"}}}], "continuations": [{"nextRadioContinuationData": {"continuation": "NEXT"}}]}}}}}}]}}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("body is not the typed view: {e}"));
+        let panel = seed_panel(&body).unwrap_or_else(|e| panic!("panel missing: {e}"));
+        let items = panel_items(panel);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["title"], "Song");
+        assert_eq!(next_continuation(panel).as_deref(), Some("NEXT"));
     }
 
     #[test]
