@@ -136,8 +136,8 @@ pub const LADDER: &[Rung] = &[
         name: "ANDROID",
         attestable: false,
         client_name_id: "3",
-        client_version: "19.09.37",
-        user_agent: "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip",
+        client_version: "20.19.36",
+        user_agent: "com.google.android.youtube/20.19.36 (Linux; U; Android 11) gzip",
         context: || {
             json!({
                 "androidSdkVersion": 30,
