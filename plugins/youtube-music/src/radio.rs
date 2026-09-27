@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
+use std::ops::Deref;
 
 use auqw_guest_sdk::{http_request, kv_set, GuestError};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -297,10 +298,163 @@ impl<'de> Deserialize<'de> for Presence {
 /// `opt_obj` as a type, for `MapAccess::next_value` targets.
 struct OptObj<T>(Option<T>);
 
+impl<T> Default for OptObj<T> {
+    fn default() -> Self {
+        OptObj(None)
+    }
+}
+
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptObj<T> {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         opt_obj(d).map(OptObj)
     }
+}
+
+impl<T> Deref for OptObj<T> {
+    type Target = Option<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// `opt_str` as a type, for `MapAccess::next_value` targets. `Deref`
+/// makes it read as `Option<String>` at use sites.
+#[derive(Default)]
+struct OptStr(Option<String>);
+
+impl<'de> Deserialize<'de> for OptStr {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        opt_str(d).map(OptStr)
+    }
+}
+
+impl Deref for OptStr {
+    type Target = Option<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// `opt_u64` as a type.
+#[derive(Default)]
+struct OptU64(Option<u64>);
+
+impl<'de> Deserialize<'de> for OptU64 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        opt_u64(d).map(OptU64)
+    }
+}
+
+impl Deref for OptU64 {
+    type Target = Option<u64>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// `opt_vec` as a type.
+struct OptVec<T>(Vec<T>);
+
+impl<T> Default for OptVec<T> {
+    fn default() -> Self {
+        OptVec(Vec::new())
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for OptVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        opt_vec(d).map(OptVec)
+    }
+}
+
+impl<T> Deref for OptVec<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// A decoded subtree that found artwork while scanning unknown keys.
+trait HasArt {
+    fn art_out(&self) -> Option<(u64, Thumb)>;
+}
+
+/// A field-level decode wrapper whose parsed subtree may carry art.
+trait ArtCarrier {
+    fn art_out(&self) -> Option<(u64, Thumb)>;
+}
+
+impl<T: HasArt> ArtCarrier for OptObj<T> {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        self.0.as_ref().and_then(|t| t.art_out())
+    }
+}
+
+impl<T: HasArt> ArtCarrier for OptVec<T> {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        let mut best = None;
+        for t in &self.0 {
+            merge_art(&mut best, t.art_out());
+        }
+        best
+    }
+}
+
+/// `art` merge for a `+art` field — a plain decode type carries none.
+macro_rules! bubble_art {
+    ($art:ident, $field:ident) => {};
+    ($art:ident, $field:ident, art) => {
+        merge_art(&mut $art, ArtCarrier::art_out(&$field))
+    };
+}
+
+/// `Deserialize` for an object inside the row renderer: named keys
+/// claim typed fields through tolerant wrappers, a `thumbnails` key
+/// collects candidates, and every other key is walked for nested art —
+/// the old whole-renderer `best_artwork` walk in a single pass, no DOM.
+/// Fields marked `+art` bubble their subtree's best thumbnail upward.
+/// The generated type gains an `art: Option<(u64, Thumb)>` field and a
+/// `HasArt` impl so a parent can collect it.
+macro_rules! scanned_obj {
+    ($name:ident { $( $field:ident : $key:literal => $(+ $artflag:tt)? $dec:ty ),* $(,)? }) => {
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl<'de> Visitor<'de> for V {
+                    type Value = $name;
+                    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                        f.write_str(concat!(stringify!($name), " object"))
+                    }
+                    fn visit_map<A: MapAccess<'de>>(
+                        self,
+                        mut m: A,
+                    ) -> Result<$name, A::Error> {
+                        let mut art = None;
+                        $( let mut $field = <$dec>::default(); )*
+                        while let Some(k) = m.next_key::<&str>()? {
+                            match k {
+                                "thumbnails" => {
+                                    merge_art(&mut art, m.next_value::<ThumbSet>()?.0)
+                                }
+                                $( $key => {
+                                    $field = m.next_value::<$dec>()?;
+                                    bubble_art!(art, $field $(, $artflag)?);
+                                } )*
+                                _ => merge_art(&mut art, m.next_value::<ArtworkScan>()?.0),
+                            }
+                        }
+                        Ok($name { $($field,)* art })
+                    }
+                }
+                d.deserialize_any(V)
+            }
+        }
+        impl HasArt for $name {
+            fn art_out(&self) -> Option<(u64, Thumb)> {
+                self.art.clone()
+            }
+        }
+    };
 }
 
 /// An array element that may be any JSON value: a map parses as `T`,
@@ -663,80 +817,190 @@ struct PrimaryRenderer {
     video: Option<PanelRow>,
 }
 
-/// The queue row's renderer. Decoded by hand rather than derived: the
-/// typed fields claim their keys, and every *other* key of the renderer
-/// map is walked by `ArtworkScan` — restoring the old whole-renderer
-/// artwork contract (art under `overlay`, `thumbnail`,
-/// `musicThumbnailRenderer`, …) with zero DOM.
+/// The queue row's renderer — decoded via `scanned_obj!` like every
+/// object inside it: typed keys claim their fields, `thumbnails` keys
+/// collect candidates, and every other key is walked for nested
+/// artwork. Together these reproduce the old whole-renderer
+/// `best_artwork` walk exactly, in one pass, with no `Value` DOM.
 struct PanelRow {
     /// `Absent` only when the key is missing — present-but-invalid
     /// (`null`, `42`) rejects the row without consulting the watch
     /// endpoint, like `get().and_then(as_str)`.
     video_id: Presence,
-    navigation: Option<WatchNav>,
-    title: Option<TextRuns>,
-    long_byline: Option<TextRuns>,
-    short_byline: Option<TextRuns>,
-    length: Option<TextRuns>,
-    /// Largest valid thumbnail anywhere in the row, `(area, thumb)`.
+    navigation: OptObj<WatchNav>,
+    title: OptObj<TextRuns>,
+    long_byline: OptObj<TextRuns>,
+    short_byline: OptObj<TextRuns>,
+    length: OptObj<TextRuns>,
+    /// Largest valid thumbnail found anywhere in the renderer subtree.
     art: Option<(u64, Thumb)>,
 }
 
-impl<'de> Deserialize<'de> for PanelRow {
+scanned_obj!(PanelRow {
+    video_id: "videoId" => Presence,
+    navigation: "navigationEndpoint" => +art OptObj<WatchNav>,
+    title: "title" => +art OptObj<TextRuns>,
+    long_byline: "longBylineText" => +art OptObj<TextRuns>,
+    short_byline: "shortBylineText" => +art OptObj<TextRuns>,
+    length: "lengthText" => +art OptObj<TextRuns>,
+});
+
+/// A `thumbnails` candidate — url plus optional dims.
+#[derive(Clone)]
+struct Thumb {
+    url: Option<String>,
+    width: Option<u64>,
+    height: Option<u64>,
+}
+
+/// The value under a `thumbnails` key: an array collects candidates
+/// (each element may itself carry nested `thumbnails`); a non-array
+/// value is still walked — the old traversal recursed into it.
+struct ThumbSet(Option<(u64, Thumb)>);
+
+impl ArtCarrier for ThumbSet {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        self.0.clone()
+    }
+}
+
+impl<'de> Deserialize<'de> for ThumbSet {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = PanelRow;
+            type Value = ThumbSet;
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a panel row object")
+                f.write_str("a thumbnails array")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<PanelRow, A::Error> {
-                let mut r = PanelRow {
-                    video_id: Presence::Absent,
-                    navigation: None,
-                    title: None,
-                    long_byline: None,
-                    short_byline: None,
-                    length: None,
-                    art: None,
-                };
-                while let Some(k) = m.next_key::<&str>()? {
-                    match k {
-                        "videoId" => r.video_id = m.next_value::<Presence>()?,
-                        "navigationEndpoint" => {
-                            r.navigation = m.next_value::<OptObj<WatchNav>>()?.0
-                        }
-                        "title" => r.title = m.next_value::<OptObj<TextRuns>>()?.0,
-                        "longBylineText" => r.long_byline = m.next_value::<OptObj<TextRuns>>()?.0,
-                        "shortBylineText" => r.short_byline = m.next_value::<OptObj<TextRuns>>()?.0,
-                        "lengthText" => r.length = m.next_value::<OptObj<TextRuns>>()?.0,
-                        _ => merge_art(&mut r.art, m.next_value::<ArtworkScan>()?.0),
-                    }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbSet, A::Error> {
+                let mut best = None;
+                while let Some(ThumbNode(node)) = s.next_element::<ThumbNode>()? {
+                    merge_art(&mut best, node);
                 }
-                Ok(r)
+                Ok(ThumbSet(best))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, m: A) -> Result<ThumbSet, A::Error> {
+                ArtworkScan::deserialize(serde::de::value::MapAccessDeserializer::new(m))
+                    .map(|s| ThumbSet(s.0))
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_string<E>(self, _v: String) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_unit<E>(self) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_none<E>(self) -> Result<ThumbSet, E> {
+                Ok(ThumbSet(None))
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<ThumbSet, D2::Error> {
+                d.deserialize_any(self)
             }
         }
         d.deserialize_any(V)
     }
 }
 
-/// A `thumbnails` array element — url plus optional dims.
-#[derive(Deserialize)]
-struct Thumb {
-    #[serde(default, deserialize_with = "opt_str")]
-    url: Option<String>,
-    #[serde(default, deserialize_with = "opt_u64")]
-    width: Option<u64>,
-    #[serde(default, deserialize_with = "opt_u64")]
-    height: Option<u64>,
+/// One element of a `thumbnails` array: `url`/`width`/`height` make it
+/// a candidate, and its remaining keys — including nested
+/// `thumbnails` — are still walked for deeper art.
+struct ThumbNode(Option<(u64, Thumb)>);
+
+impl<'de> Deserialize<'de> for ThumbNode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = ThumbNode;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a thumbnail object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ThumbNode, A::Error> {
+                let mut url = None;
+                let mut width = None;
+                let mut height = None;
+                let mut art = None;
+                while let Some(k) = m.next_key::<&str>()? {
+                    match k {
+                        "url" => url = m.next_value::<OptStr>()?.0,
+                        "width" => width = m.next_value::<OptU64>()?.0,
+                        "height" => height = m.next_value::<OptU64>()?.0,
+                        "thumbnails" => merge_art(&mut art, m.next_value::<ThumbSet>()?.0),
+                        _ => merge_art(&mut art, m.next_value::<ArtworkScan>()?.0),
+                    }
+                }
+                offer_art(&mut art, Thumb { url, width, height });
+                Ok(ThumbNode(art))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbNode, A::Error> {
+                let mut best = None;
+                while let Some(ArtworkScan(inner)) = s.next_element::<ArtworkScan>()? {
+                    merge_art(&mut best, inner);
+                }
+                Ok(ThumbNode(best))
+            }
+            fn visit_bool<E>(self, _v: bool) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_i64<E>(self, _v: i64) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_u64<E>(self, _v: u64) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_f64<E>(self, _v: f64) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_str<E>(self, _v: &str) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_string<E>(self, _v: String) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_unit<E>(self) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_none<E>(self) -> Result<ThumbNode, E> {
+                Ok(ThumbNode(None))
+            }
+            fn visit_some<D2: serde::Deserializer<'de>>(
+                self,
+                d: D2,
+            ) -> Result<ThumbNode, D2::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
-/// `best_artwork` as a zero-DOM recursive visitor: every value it is
-/// handed is walked once — maps recurse per key, `thumbnails` keys
-/// collect candidates — keeping the largest valid thumbnail
-/// (https+<=2048 URL, max width*height) exactly as the old
-/// whole-renderer walk did.
+/// `best_artwork` as a zero-DOM recursive visitor: each value is walked
+/// once — maps recurse per key, a `thumbnails` key collects candidates —
+/// keeping the largest valid thumbnail (https+<=2048 URL, max
+/// width*height) exactly as the old whole-renderer walk did.
 struct ArtworkScan(Option<(u64, Thumb)>);
+
+impl ArtCarrier for ArtworkScan {
+    fn art_out(&self) -> Option<(u64, Thumb)> {
+        self.0.clone()
+    }
+}
 
 /// One thumbnail candidate into the running best.
 fn offer_art(best: &mut Option<(u64, Thumb)>, t: Thumb) {
@@ -773,11 +1037,7 @@ impl<'de> Deserialize<'de> for ArtworkScan {
                 let mut best = None;
                 while let Some(k) = m.next_key::<&str>()? {
                     if k == "thumbnails" {
-                        for Tolerant(t) in m.next_value::<Vec<Tolerant<Thumb>>>()? {
-                            if let Some(t) = t {
-                                offer_art(&mut best, t);
-                            }
-                        }
+                        merge_art(&mut best, m.next_value::<ThumbSet>()?.0);
                     } else {
                         merge_art(&mut best, m.next_value::<ArtworkScan>()?.0);
                     }
@@ -826,67 +1086,83 @@ impl<'de> Deserialize<'de> for ArtworkScan {
     }
 }
 
-#[derive(Deserialize)]
 struct WatchNav {
-    #[serde(rename = "watchEndpoint", default, deserialize_with = "opt_obj")]
-    watch: Option<WatchEndpoint>,
+    watch: OptObj<WatchEndpoint>,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(WatchNav {
+    watch: "watchEndpoint" => +art OptObj<WatchEndpoint>,
+});
+
 struct WatchEndpoint {
-    #[serde(rename = "videoId", default, deserialize_with = "opt_str")]
-    video_id: Option<String>,
+    video_id: OptStr,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(WatchEndpoint {
+    video_id: "videoId" => OptStr,
+});
+
 struct TextRuns {
-    #[serde(default, deserialize_with = "opt_vec")]
-    runs: Vec<BylineRun>,
-    #[serde(rename = "simpleText", default, deserialize_with = "opt_str")]
-    simple: Option<String>,
+    runs: OptVec<BylineRun>,
+    simple: OptStr,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(TextRuns {
+    runs: "runs" => +art OptVec<BylineRun>,
+    simple: "simpleText" => OptStr,
+});
+
 struct BylineRun {
-    #[serde(default, deserialize_with = "opt_str")]
-    text: Option<String>,
-    #[serde(rename = "navigationEndpoint", default, deserialize_with = "opt_obj")]
-    navigation: Option<BrowseNav>,
+    text: OptStr,
+    navigation: OptObj<BrowseNav>,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(BylineRun {
+    text: "text" => OptStr,
+    navigation: "navigationEndpoint" => +art OptObj<BrowseNav>,
+});
+
 struct BrowseNav {
-    #[serde(rename = "browseEndpoint", default, deserialize_with = "opt_obj")]
-    browse: Option<BrowseEndpoint>,
+    browse: OptObj<BrowseEndpoint>,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(BrowseNav {
+    browse: "browseEndpoint" => +art OptObj<BrowseEndpoint>,
+});
+
 struct BrowseEndpoint {
-    #[serde(rename = "browseId", default, deserialize_with = "opt_str")]
-    id: Option<String>,
-    #[serde(
-        rename = "browseEndpointContextSupportedConfigs",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    context_configs: Option<BrowseConfigs>,
+    id: OptStr,
+    context_configs: OptObj<BrowseConfigs>,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(BrowseEndpoint {
+    id: "browseId" => OptStr,
+    context_configs: "browseEndpointContextSupportedConfigs" => +art OptObj<BrowseConfigs>,
+});
+
 struct BrowseConfigs {
-    #[serde(
-        rename = "browseEndpointContextMusicConfig",
-        default,
-        deserialize_with = "opt_obj"
-    )]
-    music: Option<BrowseMusic>,
+    music: OptObj<BrowseMusic>,
+    art: Option<(u64, Thumb)>,
 }
 
-#[derive(Deserialize)]
+scanned_obj!(BrowseConfigs {
+    music: "browseEndpointContextMusicConfig" => +art OptObj<BrowseMusic>,
+});
+
 struct BrowseMusic {
-    #[serde(rename = "pageType", default, deserialize_with = "opt_str")]
-    page_type: Option<String>,
+    page_type: OptStr,
+    art: Option<(u64, Thumb)>,
 }
+
+scanned_obj!(BrowseMusic {
+    page_type: "pageType" => OptStr,
+});
 
 #[derive(Deserialize)]
 struct ContinuationWrap {
@@ -1790,6 +2066,44 @@ mod tests {
         let art = row_artwork(row);
         assert_eq!(art.len(), 1);
         assert_eq!(art[0]["url"], "https://example.com/big.jpg");
+    }
+
+    #[test]
+    fn non_array_thumbnails_keeps_row_and_still_walks() {
+        // `thumbnails: null` is not artwork but never kills the row;
+        // a non-array `thumbnails` object is still walked deeper —
+        // both match the old traversal.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"overlay":{"thumbnails":null}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        assert_eq!(panel_video_id(row), Some("dQw4w9WgXcQ"));
+        assert!(row_artwork(row).is_empty());
+
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song"},"overlay":{"thumbnails":{"nested":{"thumbnails":[{"url":"https://example.com/n.jpg","width":120,"height":120}]}}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        let art = row_artwork(row);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0]["url"], "https://example.com/n.jpg");
+    }
+
+    #[test]
+    fn artwork_inside_typed_fields_is_found() {
+        // Typed fields still get scanned: `thumbnails` under `title`
+        // or `navigationEndpoint` supplied artwork in the old
+        // whole-renderer walk.
+        let entry: RowEntry = serde_json::from_str(
+            r#"{"playlistPanelVideoRenderer":{"videoId":"dQw4w9WgXcQ","title":{"simpleText":"Song","icon":{"thumbnails":[{"url":"https://example.com/icon.jpg","width":60,"height":60}]}},"navigationEndpoint":{"watchEndpoint":{"videoId":"dQw4w9WgXcQ"},"badge":{"thumbnails":[{"url":"https://example.com/nav.jpg","width":200,"height":200}]}}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("entry parses: {e}"));
+        let row = panel_row(&entry).unwrap_or_else(|| panic!("row present"));
+        let art = row_artwork(row);
+        assert_eq!(art.len(), 1);
+        assert_eq!(art[0]["url"], "https://example.com/nav.jpg");
     }
 
     #[test]
