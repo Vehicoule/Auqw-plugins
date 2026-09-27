@@ -107,7 +107,7 @@ fn playability_blob(status: &Value) -> String {
 
 /// Whole-word `age` — word-boundary match so "managed"/"damage" do not
 /// count as age restriction.
-fn has_whole_word_age(blob: &str) -> bool {
+pub(crate) fn has_whole_word_age(blob: &str) -> bool {
     let bytes = blob.as_bytes();
     blob.match_indices("age").any(|(index, _)| {
         let before_ok = index == 0 || !bytes[index - 1].is_ascii_alphanumeric();
