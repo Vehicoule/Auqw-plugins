@@ -341,7 +341,21 @@ fn unescape_json_unicode(s: &str) -> String {
                 }
             }
             match ok.then(|| char::from_u32(code)).flatten() {
-                Some(decoded) => out.push(decoded),
+                // Structural JSON stays escaped: a `\u0022` inside a
+                // string VALUE must never forge a `"status":"ok"`
+                // the closed-span veto then reads as real structure.
+                // Whitespace and letters still decode — that's what
+                // the phrase scan needs.
+                Some(decoded)
+                    if !matches!(decoded, '"' | '\\' | ':' | '{' | '}' | '[' | ']' | ',') =>
+                {
+                    out.push(decoded)
+                }
+                Some(decoded) => {
+                    out.push('\\');
+                    out.push('u');
+                    out.extend(format!("{:04x}", decoded as u32).chars());
+                }
                 None => {
                     out.push('\\');
                     out.push('u');
@@ -2172,6 +2186,15 @@ mod tests {
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "VISIONOS");
         assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn truncated_bot_check_does_not_decode_structural_escapes() {
+        // A `\u0022` inside a string VALUE must stay escaped — decoded
+        // it would forge a `"status":"ok"` and the closed-span veto
+        // would book a genuine wall as a transport failure.
+        let forged = "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\",\"x\":\"\\u0022status\\u0022:\\u0022ok\\u0022\"}}";
+        assert!(truncated_bot_check(forged.as_bytes()));
     }
 
     #[test]

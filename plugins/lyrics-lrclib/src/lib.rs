@@ -331,34 +331,44 @@ fn serve_or_defer(
     query_duration_ms: Option<u64>,
     deferred_matched: &mut Option<Value>,
     deferred_unrelated: &mut Option<Value>,
-) -> Option<Value> {
-    let result = record_result(rec, flavor, &rec.matched(), is_match)?;
+) -> (Option<Value>, bool) {
+    // The flag is whether the record carried usable content — the
+    // caller needs it to score the `absent` result's `matched`.
+    let Some(result) = record_result(rec, flavor, &rec.matched(), is_match) else {
+        return (None, false);
+    };
     let violates = matches!(
         (rec.duration_ms, query_duration_ms),
         (Some(got), Some(want)) if got.abs_diff(want) > parse::DRIFT_TOLERANCE_MS
     );
     match (is_match, violates) {
-        (true, false) => Some(result),
+        (true, false) => (Some(result), true),
         (true, true) => {
             if deferred_matched.is_none() {
                 *deferred_matched = Some(result);
             }
-            None
+            (None, true)
         }
         (false, _) => {
             if deferred_unrelated.is_none() {
                 *deferred_unrelated = Some(result);
             }
-            None
+            (None, true)
         }
     }
 }
 
 async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
     let q = parse_query(payload)?;
-    // The first usable record seen — its `matched` rides the `absent`
-    // result so the app can score a near-match that had no lyrics.
-    let mut first_matched = Value::Null;
+    // `matched` on an `absent` result is evidence about the queried
+    // track — an unrelated row's `matched` is meaningless. Rank order
+    // can't pick it: a non-violating unrelated row outranks a
+    // violating name-match, so track the first name-matching record's
+    // `matched` first, the first content-bearing record's second, and
+    // the first ranked row only as the nothing-else fallback.
+    let mut matched_named: Option<Value> = None;
+    let mut matched_content: Option<Value> = None;
+    let mut first_ranked = Value::Null;
     // Usable content that may not end the waterfall: a name match whose
     // duration contradicts the query (the app would reject it on drift)
     // and rows that do not name the query at all. Both answer only
@@ -392,39 +402,54 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
                     q.artist.as_deref(),
                     q.duration_ms,
                 ) {
-                    if first_matched.is_null() {
-                        first_matched = candidate.matched();
+                    if first_ranked.is_null() {
+                        first_ranked = candidate.matched();
                     }
                     let is_match = parse::names_query(candidate, &q.title, q.artist.as_deref());
-                    if let Some(result) = serve_or_defer(
+                    if is_match && matched_named.is_none() {
+                        matched_named = Some(candidate.matched());
+                    }
+                    let (result, usable) = serve_or_defer(
                         candidate,
                         flavor,
                         is_match,
                         q.duration_ms,
                         &mut deferred_matched,
                         &mut deferred,
-                    ) {
+                    );
+                    if usable && matched_content.is_none() {
+                        matched_content = Some(candidate.matched());
+                    }
+                    if let Some(result) = result {
                         return Ok(result);
                     }
                 }
                 continue;
             }
         };
-        if first_matched.is_null() {
-            first_matched = record.matched();
+        if first_ranked.is_null() {
+            first_ranked = record.matched();
         }
         let is_match = parse::names_query(record, &q.title, q.artist.as_deref());
-        if let Some(result) = serve_or_defer(
+        if is_match && matched_named.is_none() {
+            matched_named = Some(record.matched());
+        }
+        let (result, usable) = serve_or_defer(
             record,
             flavor,
             is_match,
             q.duration_ms,
             &mut deferred_matched,
             &mut deferred,
-        ) {
+        );
+        if usable && matched_content.is_none() {
+            matched_content = Some(record.matched());
+        }
+        if let Some(result) = result {
             return Ok(result);
         }
     }
+    let first_matched = matched_named.or(matched_content).unwrap_or(first_ranked);
     // Every tier exhausted without in-bound name-matching content: a
     // violating name match still beats an unrelated row (the app turns
     // it into an honest 'unavailable'); either beats `absent` itself.
