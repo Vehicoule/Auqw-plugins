@@ -22,10 +22,15 @@ jobs:
       - run: node --test tooling/sign.test.mjs
       # Remap local cargo and toolchain/sysroot paths so artifact digests
       # match manifest pins on any machine — the same export lives in
-      # tooling/build.sh.
+      # tooling/build.sh. Build each plugin in its own cargo invocation:
+      # a single multi-package build unifies features across plugins
+      # (e.g. serde/derive enabled by one guest changes siblings' bytes),
+      # so only per-plugin builds reproduce the pinned digests.
       - run: |
           export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot"
-          cargo build --target wasm32-unknown-unknown --release -p auqw-youtube-music -p auqw-itunes -p auqw-deezer -p auqw-lyrics-lrclib
+          for crate in auqw-youtube-music auqw-itunes auqw-deezer auqw-lyrics-lrclib; do
+            cargo build --target wasm32-unknown-unknown --release -p "$crate"
+          done
       - name: validate artifact
         run: |
           mkdir -p plugins/youtube-music/dist
