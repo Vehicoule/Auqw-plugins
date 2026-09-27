@@ -539,8 +539,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     let mut pot: Option<String> = None;
     // The freshest visitorData seen this invocation — replayed on later
     // rungs ahead of their persisted KV value, matching the Slice 0
-    // cross-rung propagation.
+    // cross-rung propagation — plus the KV key it was harvested under,
+    // so dropping a burned fresh value can erase its staged write too.
     let mut fresh_visitor: Option<String> = None;
+    let mut fresh_visitor_key: Option<String> = None;
     // The session-trust token rides every rung until a 401 proves it
     // dead — then the remaining ladder runs bare rather than failing
     // authenticated requests repeatedly.
@@ -618,15 +620,28 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 }
                 if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&r) {
                     dropped_visitor = true;
-                    // Drop the suspect state everywhere it can persist:
-                    // the fresh cross-rung value when it is the one
-                    // replayed (fresh shadows KV, so a set `fresh` is
-                    // always the sent one) and the rung's persisted KV
-                    // entry — a staged delete commits on `done`, so the
-                    // poisoned value is gone for later resolves instead
-                    // of being replayed and dropped again every time.
-                    if fresh_visitor.take().is_none() {
-                        kv_set(&visitor_key, None).await?;
+                    // Drop the suspect state everywhere it can persist —
+                    // all deletions are staged and commit on `done`, so
+                    // the poisoned value is gone for later resolves
+                    // instead of replayed and dropped again every time:
+                    // * this rung's KV slot, whichever value was sent —
+                    //   when a fresh visitor shadowed it the stored value
+                    //   went untested, but a rung that walls under any
+                    //   replayed state can't trust what it would replay
+                    //   next;
+                    // * the fresh cross-rung value's home slot when it
+                    //   was the one sent (fresh shadows KV, so a set
+                    //   `fresh` is always the replayed one) — otherwise a
+                    //   committed resolve would re-persist the burned
+                    //   token under its source rung's key and the next
+                    //   invocation would replay it there.
+                    kv_set(&visitor_key, None).await?;
+                    if fresh_visitor.take().is_some() {
+                        if let Some(home) = fresh_visitor_key.take() {
+                            if home != visitor_key {
+                                kv_set(&home, None).await?;
+                            }
+                        }
                     }
                     rung_visitor = None;
                     continue 'request;
@@ -673,6 +688,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     kv_set(&visitor_key, Some(visitor.as_bytes())).await?;
                     rung_visitor = Some(visitor.clone());
                     fresh_visitor = Some(visitor);
+                    fresh_visitor_key = Some(visitor_key.clone());
                 } else {
                     // A malformed visitorData is dropped before it can reach
                     // a header, a KV value, or the PO-token binding.
@@ -2651,8 +2667,16 @@ mod tests {
     fn walled_fresh_visitor_clears_cross_rung_propagation() {
         // SABR's response visitor rides rung 1; when the wall fires the
         // fresh value is dropped entirely — the re-ask and every later
-        // rung send no visitor.
+        // rung send no visitor — and its staged write is erased, so a
+        // committed resolve cannot re-persist the burned token under its
+        // source rung's key. Rung 1's own stored visitor went untested
+        // under the shadow but is dropped too: a wall under replayed
+        // state can't trust what the rung would replay next.
         let mut h = Harness::new();
+        h.committed.insert(
+            "visitor/ANDROID_VR@1.57.29".into(),
+            b"shadowed-stored".to_vec(),
+        );
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, SABR);
         assert_eq!(
@@ -2669,6 +2693,10 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
+        // Both suspect slots healed: the shadowed stored visitor and the
+        // fresh value's staged write under VISIONOS's key.
+        assert!(!h.committed.contains_key("visitor/ANDROID_VR@1.57.29"));
+        assert!(!h.committed.contains_key("visitor/VISIONOS"));
     }
 
     #[test]
