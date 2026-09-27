@@ -10,14 +10,14 @@
 use std::collections::BTreeSet;
 
 use auqw_guest_sdk::{http_request, kv_set, GuestError};
-use serde_json::{json, Map, Value};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::candidates::{
-    best_artwork, browse, duration_ms_of, is_furniture, page_type, run_text, runs_text,
-    web_remix_context, web_remix_request, VISITOR_KEY,
+    duration_ms_of, is_furniture, web_remix_context, web_remix_request, VISITOR_KEY,
 };
 use crate::guest::{bad_payload, failed, is_video_id, load_visitor, payload_keys, warn};
-use crate::parse::{classify_playability, visitor_data, visitor_token, Playability};
+use crate::parse::{has_whole_word_age, visitor_token, Playability};
 
 const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
@@ -106,33 +106,332 @@ fn next_body(p: &RadioPayload) -> Value {
     }
 }
 
+// ---- Typed `next` view --------------------------------------------------
+//
+// The page is deserialized into narrow structs so unknown subtrees are
+// skipped at tokenize time rather than materialized as a `Value` DOM.
+// A full DOM of a ~600 KB body + the old per-row subtree clone walked
+// ~340 M fuel — a whisker under the 200 M per-entry cap per step and
+// over it on marginally larger variants (the mobile `budget-exceeded:
+// fuel` failure). Keeping radio's parse inside typed shapes keeps the
+// honest-behavior surface identical at a fraction of the budget.
+
+#[derive(Deserialize)]
+struct NextBody {
+    #[serde(rename = "playabilityStatus", default)]
+    playability: Option<NextPlayability>,
+    #[serde(rename = "responseContext", default)]
+    response_context: Option<NextContext>,
+    #[serde(default)]
+    contents: Option<NextContents>,
+    #[serde(rename = "continuationContents", default)]
+    continuation_contents: Option<NextContinuation>,
+}
+
+#[derive(Deserialize)]
+struct NextPlayability {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    messages: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct NextContext {
+    #[serde(rename = "visitorData", default)]
+    visitor_data: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NextContents {
+    #[serde(rename = "singleColumnMusicWatchNextResultsRenderer", default)]
+    single_column: Option<SingleColumn>,
+}
+
+#[derive(Deserialize)]
+struct SingleColumn {
+    #[serde(rename = "tabbedRenderer", default)]
+    tabbed: Option<Tabbed>,
+}
+
+#[derive(Deserialize)]
+struct Tabbed {
+    #[serde(rename = "watchNextTabbedResultsRenderer", default)]
+    watch_next: Option<WatchNext>,
+}
+
+#[derive(Deserialize)]
+struct WatchNext {
+    #[serde(default)]
+    tabs: Vec<WatchTab>,
+}
+
+#[derive(Deserialize)]
+struct WatchTab {
+    #[serde(rename = "tabRenderer", default)]
+    renderer: Option<TabRenderer>,
+}
+
+#[derive(Deserialize)]
+struct TabRenderer {
+    #[serde(default)]
+    content: Option<TabContent>,
+}
+
+#[derive(Deserialize)]
+struct TabContent {
+    #[serde(rename = "musicQueueRenderer", default)]
+    queue: Option<QueueRenderer>,
+}
+
+#[derive(Deserialize)]
+struct QueueRenderer {
+    #[serde(default)]
+    content: Option<QueueContent>,
+}
+
+#[derive(Deserialize)]
+struct QueueContent {
+    #[serde(rename = "playlistPanelRenderer", default)]
+    panel: Option<Panel>,
+}
+
+#[derive(Deserialize)]
+struct NextContinuation {
+    #[serde(rename = "playlistPanelContinuation", default)]
+    panel: Option<Panel>,
+}
+
+#[derive(Deserialize)]
+struct Panel {
+    #[serde(rename = "playlistId", default)]
+    playlist_id: Option<String>,
+    #[serde(default)]
+    contents: Vec<PanelEntry>,
+    #[serde(default)]
+    continuations: Vec<ContinuationWrap>,
+}
+
+/// One `contents` entry — a queue row when it carries a video
+/// renderer, anything else (headers, separators, malformed values) is
+/// skipped exactly like the `Value` lookup chains did. Custom visitor:
+/// non-map entries are dropped without buffering a DOM, and real rows
+/// deserialize straight into `RowEntry` instead of serde's untagged
+/// content buffer.
+enum PanelEntry {
+    // Boxed: clippy::large_enum_variant — RowEntry is ~10x the
+    // Ignored discriminant.
+    Row(Box<RowEntry>),
+    Ignored,
+}
+
+impl<'de> Deserialize<'de> for PanelEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EntryVisitor;
+        impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+            type Value = PanelEntry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a playlistPanelRenderer contents entry")
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                RowEntry::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(|r| PanelEntry::Row(Box::new(r)))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(PanelEntry::Ignored)
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(PanelEntry::Ignored)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(PanelEntry::Ignored)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(PanelEntry::Ignored)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(PanelEntry::Ignored)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(PanelEntry::Ignored)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(PanelEntry::Ignored)
+            }
+        }
+        deserializer.deserialize_any(EntryVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct RowEntry {
+    #[serde(rename = "playlistPanelVideoRenderer", default)]
+    video: Option<PanelRow>,
+    #[serde(rename = "playlistPanelVideoWrapperRenderer", default)]
+    wrapper: Option<RowWrapper>,
+}
+
+#[derive(Deserialize)]
+struct RowWrapper {
+    #[serde(rename = "primaryRenderer", default)]
+    primary: Option<PrimaryRenderer>,
+}
+
+#[derive(Deserialize)]
+struct PrimaryRenderer {
+    #[serde(rename = "playlistPanelVideoRenderer", default)]
+    video: Option<PanelRow>,
+}
+
+#[derive(Deserialize)]
+struct PanelRow {
+    #[serde(rename = "videoId", default)]
+    video_id: Option<String>,
+    #[serde(rename = "navigationEndpoint", default)]
+    navigation: Option<WatchNav>,
+    #[serde(default)]
+    title: Option<TextRuns>,
+    #[serde(rename = "longBylineText", default)]
+    long_byline: Option<TextRuns>,
+    #[serde(rename = "shortBylineText", default)]
+    short_byline: Option<TextRuns>,
+    #[serde(rename = "lengthText", default)]
+    length: Option<TextRuns>,
+    #[serde(default)]
+    thumbnail: Option<ThumbList>,
+}
+
+#[derive(Deserialize)]
+struct WatchNav {
+    #[serde(rename = "watchEndpoint", default)]
+    watch: Option<WatchEndpoint>,
+}
+
+#[derive(Deserialize)]
+struct WatchEndpoint {
+    #[serde(rename = "videoId", default)]
+    video_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TextRuns {
+    #[serde(default)]
+    runs: Option<Vec<BylineRun>>,
+    #[serde(rename = "simpleText", default)]
+    simple: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BylineRun {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(rename = "navigationEndpoint", default)]
+    navigation: Option<BrowseNav>,
+}
+
+#[derive(Deserialize)]
+struct BrowseNav {
+    #[serde(rename = "browseEndpoint", default)]
+    browse: Option<BrowseEndpoint>,
+}
+
+#[derive(Deserialize)]
+struct BrowseEndpoint {
+    #[serde(rename = "browseId", default)]
+    id: Option<String>,
+    #[serde(rename = "browseEndpointContextSupportedConfigs", default)]
+    context_configs: Option<BrowseConfigs>,
+}
+
+#[derive(Deserialize)]
+struct BrowseConfigs {
+    #[serde(rename = "browseEndpointContextMusicConfig", default)]
+    music: Option<BrowseMusic>,
+}
+
+#[derive(Deserialize)]
+struct BrowseMusic {
+    #[serde(rename = "pageType", default)]
+    page_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ThumbList {
+    #[serde(default)]
+    thumbnails: Vec<Thumb>,
+}
+
+#[derive(Deserialize)]
+struct Thumb {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    width: Option<u64>,
+    #[serde(default)]
+    height: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ContinuationWrap {
+    #[serde(rename = "nextRadioContinuationData", default)]
+    radio: Option<ContinuationData>,
+    #[serde(rename = "nextContinuationData", default)]
+    next: Option<ContinuationData>,
+}
+
+#[derive(Deserialize)]
+struct ContinuationData {
+    #[serde(default)]
+    continuation: Option<String>,
+}
+
 /// The watch surface's queue panel for a seed response: the first tab
 /// carrying a `musicQueueRenderer` — the Up-next tab's automix list.
-fn seed_panel(body: &Value) -> Result<&Map<String, Value>, GuestError> {
-    body.pointer(
-        "/contents/singleColumnMusicWatchNextResultsRenderer/tabbedRenderer\
-         /watchNextTabbedResultsRenderer/tabs",
-    )
-    .and_then(Value::as_array)
-    .and_then(|tabs| {
-        tabs.iter().find_map(|tab| {
-            tab.pointer("/tabRenderer/content/musicQueueRenderer/content/playlistPanelRenderer")
-                .and_then(Value::as_object)
+fn seed_panel(body: &NextBody) -> Result<&Panel, GuestError> {
+    body.contents
+        .as_ref()
+        .and_then(|c| c.single_column.as_ref())
+        .and_then(|s| s.tabbed.as_ref())
+        .and_then(|t| t.watch_next.as_ref())
+        .and_then(|w| {
+            w.tabs.iter().find_map(|tab| {
+                tab.renderer
+                    .as_ref()
+                    .and_then(|r| r.content.as_ref())
+                    .and_then(|c| c.queue.as_ref())
+                    .and_then(|q| q.content.as_ref())
+                    .and_then(|c| c.panel.as_ref())
+            })
         })
-    })
-    .ok_or_else(|| {
-        failed(
-            "invalid-response",
-            "next response lacks the queue panel".into(),
-        )
-    })
+        .ok_or_else(|| {
+            failed(
+                "invalid-response",
+                "next response lacks the queue panel".into(),
+            )
+        })
 }
 
 /// The continuation page's queue panel.
-fn continuation_panel(body: &Value) -> Result<&Map<String, Value>, GuestError> {
-    body.get("continuationContents")
-        .and_then(|c| c.get("playlistPanelContinuation"))
-        .and_then(Value::as_object)
+fn continuation_panel(body: &NextBody) -> Result<&Panel, GuestError> {
+    body.continuation_contents
+        .as_ref()
+        .and_then(|c| c.panel.as_ref())
         .ok_or_else(|| {
             failed(
                 "invalid-response",
@@ -144,48 +443,94 @@ fn continuation_panel(body: &Value) -> Result<&Map<String, Value>, GuestError> {
 /// The queue row's renderer: a bare `playlistPanelVideoRenderer` or the
 /// primary video inside a `playlistPanelVideoWrapperRenderer` — the
 /// wrapper's secondary renderer is decoration, never a queue entry.
-fn panel_renderer(entry: &Value) -> Option<&Map<String, Value>> {
-    if let Some(r) = entry
-        .get("playlistPanelVideoRenderer")
-        .and_then(Value::as_object)
-    {
+fn panel_row(entry: &RowEntry) -> Option<&PanelRow> {
+    if let Some(r) = entry.video.as_ref() {
         return Some(r);
     }
     entry
-        .get("playlistPanelVideoWrapperRenderer")
-        .and_then(|w| w.get("primaryRenderer"))
-        .and_then(|p| p.get("playlistPanelVideoRenderer"))
-        .and_then(Value::as_object)
+        .wrapper
+        .as_ref()
+        .and_then(|w| w.primary.as_ref())
+        .and_then(|p| p.video.as_ref())
 }
 
 /// The row's video id: the renderer's own `videoId`, else its watch
-/// endpoint's.
-fn panel_video_id(r: &Map<String, Value>) -> Option<String> {
-    r.get("videoId")
+/// endpoint's — same short-circuit as the Value form (a present but
+/// invalid `videoId` rejects the row even when the endpoint's is
+/// valid).
+fn panel_video_id(r: &PanelRow) -> Option<String> {
+    r.video_id
+        .as_deref()
         .or_else(|| {
-            r.get("navigationEndpoint")
-                .and_then(|e| e.get("watchEndpoint"))
-                .and_then(|e| e.get("videoId"))
+            r.navigation
+                .as_ref()
+                .and_then(|n| n.watch.as_ref())
+                .and_then(|w| w.video_id.as_deref())
         })
-        .and_then(Value::as_str)
         .filter(|s| is_video_id(s))
         .map(str::to_string)
 }
 
-/// The `runs` of a byline-style text node (`longBylineText`,
-/// `shortBylineText`, `lengthText`).
-fn text_runs<'a>(r: &'a Map<String, Value>, key: &str) -> Vec<&'a Map<String, Value>> {
-    r.get(key)
-        .and_then(|t| t.get("runs"))
-        .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(Value::as_object).collect())
-        .unwrap_or_default()
+/// A byline/text node's string: the `runs` join when it carries text,
+/// else `simpleText` — `runs_text`'s contract verbatim.
+fn text_string(t: &TextRuns) -> Option<String> {
+    if let Some(runs) = t.runs.as_ref() {
+        let joined: String = runs.iter().filter_map(|r| r.text.as_deref()).collect();
+        let t = joined.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    t.simple
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// The run's browse endpoint page type.
+fn run_page_type(run: &BylineRun) -> Option<&str> {
+    run.navigation
+        .as_ref()
+        .and_then(|n| n.browse.as_ref())
+        .and_then(|b| b.context_configs.as_ref())
+        .and_then(|c| c.music.as_ref())
+        .and_then(|m| m.page_type.as_deref())
+}
+
+/// Largest HTTPS thumbnail of the row by width×height — panel rows
+/// carry their artwork at `thumbnail.thumbnails`; walking every nested
+/// subtree for stray `thumbnails` keys is what made the row parse cost
+/// scale with renderer weight.
+fn row_artwork(r: &PanelRow) -> Vec<Value> {
+    let mut best: Option<(u64, &Thumb)> = None;
+    if let Some(thumbs) = r.thumbnail.as_ref() {
+        for t in &thumbs.thumbnails {
+            let url = t.url.as_deref().unwrap_or("");
+            if !url.starts_with("https://") || url.len() > 2048 {
+                continue;
+            }
+            let area = t.width.unwrap_or(0).saturating_mul(t.height.unwrap_or(0));
+            if best.is_none_or(|(a, _)| area > a) {
+                best = Some((area, t));
+            }
+        }
+    }
+    best.map(|(_, t)| {
+        json!({
+            "url": t.url.as_deref().unwrap_or(""),
+            "width": t.width.filter(|w| *w > 0),
+            "height": t.height.filter(|h| *h > 0),
+        })
+    })
+    .into_iter()
+    .collect()
 }
 
 /// Map one `playlistPanelVideoRenderer` to a `trackMetadata` item;
 /// rows without a contract-legal title are not items.
-fn panel_item(r: &Map<String, Value>, video_id: String) -> Option<Value> {
-    let title = r.get("title").and_then(runs_text)?;
+fn panel_item(r: &PanelRow, video_id: String) -> Option<Value> {
+    let title = r.title.as_ref().and_then(text_string)?;
     // `trackMetadata.title` caps at 512 scalars — drop the row rather
     // than emit a contract-invalid result.
     if title.chars().count() > 512 {
@@ -197,29 +542,33 @@ fn panel_item(r: &Map<String, Value>, video_id: String) -> Option<Value> {
     // `lengthText` is the authoritative duration; the byline scan below
     // is a fallback for rows that omit it.
     let mut duration_ms: Option<u64> = r
-        .get("lengthText")
-        .and_then(runs_text)
+        .length
+        .as_ref()
+        .and_then(text_string)
         .and_then(|t| duration_ms_of(&t));
     // Long byline carries "artist • album"; short carries the artist.
-    for run in ["longBylineText", "shortBylineText"]
-        .iter()
-        .flat_map(|key| text_runs(r, key))
+    for run in [r.long_byline.as_ref(), r.short_byline.as_ref()]
+        .into_iter()
+        .flatten()
+        .flat_map(|t| t.runs.as_deref().unwrap_or(&[]))
     {
-        let Some(text) = run_text(run).map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(text) = run.text.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
-        if let Some(b) = browse(run) {
-            if artist.is_none()
-                && b.get("browseId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id.starts_with("UC"))
-            {
+        let browse_id = run
+            .navigation
+            .as_ref()
+            .and_then(|n| n.browse.as_ref())
+            .and_then(|b| b.id.as_deref());
+        let page_type = run_page_type(run);
+        if browse_id.is_some() {
+            if artist.is_none() && browse_id.is_some_and(|id| id.starts_with("UC")) {
                 artist = Some(text.to_string());
             }
-            if artist.is_none() && page_type(run) == Some("MUSIC_PAGE_TYPE_ARTIST") {
+            if artist.is_none() && page_type == Some("MUSIC_PAGE_TYPE_ARTIST") {
                 artist = Some(text.to_string());
             }
-            if album.is_none() && page_type(run) == Some("MUSIC_PAGE_TYPE_ALBUM") {
+            if album.is_none() && page_type == Some("MUSIC_PAGE_TYPE_ALBUM") {
                 album = Some(text.to_string());
             }
         }
@@ -230,15 +579,12 @@ fn panel_item(r: &Map<String, Value>, video_id: String) -> Option<Value> {
         // label, separator, duration, or the album run.
         if byline_fallback.is_none()
             && !is_furniture(text)
-            && page_type(run) != Some("MUSIC_PAGE_TYPE_ALBUM")
+            && page_type != Some("MUSIC_PAGE_TYPE_ALBUM")
         {
             byline_fallback = Some(text.to_string());
         }
     }
     let artist = artist.or(byline_fallback);
-    let artwork = best_artwork(&Value::Object(r.clone()))
-        .into_iter()
-        .collect::<Vec<Value>>();
     Some(json!({
         "source_ref": { "provider": "youtube-music", "kind": "track", "id": video_id },
         "title": title,
@@ -246,7 +592,7 @@ fn panel_item(r: &Map<String, Value>, video_id: String) -> Option<Value> {
         "album": album,
         "duration_ms": duration_ms,
         "release_year": null,
-        "artwork": artwork,
+        "artwork": row_artwork(r),
         "explicit": null,
         "genre": null,
         "storefront": null,
@@ -255,14 +601,14 @@ fn panel_item(r: &Map<String, Value>, video_id: String) -> Option<Value> {
 
 /// Upstream queue order, first video id wins — a row that cannot
 /// produce an item does not claim its id.
-fn panel_items(panel: &Map<String, Value>) -> Vec<Value> {
+fn panel_items(panel: &Panel) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen = BTreeSet::new();
-    let Some(contents) = panel.get("contents").and_then(Value::as_array) else {
-        return items;
-    };
-    for entry in contents {
-        let Some(r) = panel_renderer(entry) else {
+    for entry in &panel.contents {
+        let PanelEntry::Row(entry) = entry else {
+            continue;
+        };
+        let Some(r) = panel_row(entry.as_ref()) else {
             continue;
         };
         let Some(video_id) = panel_video_id(r) else {
@@ -283,22 +629,45 @@ fn panel_items(panel: &Map<String, Value>) -> Vec<Value> {
 /// `nextRadioContinuationData` for automix queues and
 /// `nextContinuationData` elsewhere — first nonempty token wins; absent
 /// is the honest terminal page.
-fn next_continuation(panel: &Map<String, Value>) -> Option<String> {
-    panel
-        .get("continuations")?
-        .as_array()?
-        .iter()
-        .find_map(|c| {
-            ["nextRadioContinuationData", "nextContinuationData"]
-                .iter()
-                .find_map(|key| {
-                    c.get(*key)
-                        .and_then(|d| d.get("continuation"))
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                })
+fn next_continuation(panel: &Panel) -> Option<String> {
+    panel.continuations.iter().find_map(|c| {
+        [&c.radio, &c.next].iter().find_map(|d| {
+            d.as_ref()
+                .and_then(|d| d.continuation.as_deref())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
         })
+    })
+}
+
+/// `playabilityStatus` over the typed view — the same bucket order as
+/// `classify_playability`: OK-or-absent wins, then the reason+messages
+/// blob decides bot-check vs age vs sign-in vs unavailable.
+fn next_playability(p: Option<&NextPlayability>) -> Playability {
+    let status_str = p.and_then(|s| s.status.as_deref()).unwrap_or("");
+    if status_str == "OK" || status_str.is_empty() {
+        return Playability::Ok;
+    }
+    let mut blob = p
+        .and_then(|s| s.reason.as_deref())
+        .unwrap_or("")
+        .to_lowercase();
+    if let Some(messages) = p.and_then(|s| s.messages.as_ref()) {
+        for message in messages {
+            blob.push(' ');
+            blob.push_str(&message.to_lowercase());
+        }
+    }
+    if blob.contains("not a bot") || blob.contains("unusual traffic") {
+        return Playability::BotCheck;
+    }
+    if has_whole_word_age(&blob) {
+        return Playability::AgeRestricted;
+    }
+    if blob.contains("sign in") || status_str == "LOGIN_REQUIRED" {
+        return Playability::SignInRequired;
+    }
+    Playability::Unavailable
 }
 
 /// One InnerTube `next` page. The seed asks for the video's automix
@@ -355,11 +724,9 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
     // `playabilityStatus` (when upstream sends one) is classified by
     // the same taxonomy as the player path — a walled or unavailable
     // seed fails honestly, never with a substituted queue.
-    let body: Value = serde_json::from_slice(&resp.body)
-        .ok()
-        .filter(Value::is_object)
-        .ok_or_else(|| failed("invalid-response", "next body is not a JSON object".into()))?;
-    match classify_playability(&body).0 {
+    let body: NextBody = serde_json::from_slice(&resp.body)
+        .map_err(|_| failed("invalid-response", "next body is not a JSON object".into()))?;
+    match next_playability(body.playability.as_ref()) {
         Playability::Ok => {}
         Playability::BotCheck => return Err(failed("transient", "bot-check".into())),
         Playability::SignInRequired | Playability::AgeRestricted => {
@@ -367,8 +734,13 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         }
         Playability::Unavailable => return Err(failed("no-result", "unavailable".into())),
     }
-    if let Some(raw) = visitor_data(&body) {
-        if let Some(visitor) = visitor_token(&raw) {
+    if let Some(raw) = body
+        .response_context
+        .as_ref()
+        .and_then(|c| c.visitor_data.as_deref())
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(visitor) = visitor_token(raw) {
             kv_set(VISITOR_KEY, Some(visitor.as_bytes())).await?;
         } else {
             warn("ignoring malformed visitor value").await?;
@@ -378,8 +750,8 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         RadioPayload::Seed(video_id) => {
             let panel = seed_panel(&body)?;
             if panel
-                .get("playlistId")
-                .and_then(Value::as_str)
+                .playlist_id
+                .as_deref()
                 .is_some_and(|pid| pid != format!("RDAMVM{video_id}"))
             {
                 return Err(failed("no-result", "unavailable".into()));
