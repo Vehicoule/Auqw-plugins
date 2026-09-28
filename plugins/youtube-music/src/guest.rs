@@ -4,10 +4,13 @@
 //! the vendored SDK.
 //!
 //! Per-rung state lives in the host KV namespace: `visitor/<rung-key>`
-//! replays that client's last `responseContext.visitorData`, and
-//! `backoff/<video-id>/<rung-key>` skips a rung that recently failed.
-//! `kv_set` stages writes the host commits only on `done` — a failed
-//! resolve rolls its staged visitors/backoffs back by contract.
+//! replays that client's last `responseContext.visitorData`,
+//! `backoff/<video-id>/<rung-key>` skips a rung that recently failed,
+//! and `ladder/last-good` leads the next resolve's attempt order with
+//! the rung that finished the last one. `kv_set` stages writes the
+//! host commits only on `done` — a failed resolve rolls its staged
+//! visitors/backoffs back by contract. KV is advisory: transient store
+//! errors degrade to the empty-store behavior, never a wedge.
 
 use auqw_guest_sdk::{
     http_request, kv_get, kv_set, log, now_ms, pot_token, GuestError, GuestFuture, HttpResponse,
@@ -20,7 +23,8 @@ use crate::parse::{
     PickOptions, Playability,
 };
 use crate::rungs::{
-    append_pot, player_request, probe_request, LADDER, PROBE_FALLBACK_START, PROBE_TAIL_BYTES,
+    append_pot, is_googlevideo, player_request, probe_request, LADDER, PROBE_FALLBACK_START,
+    PROBE_TAIL_BYTES,
 };
 
 /// Backoff windows staged for a failed rung, keyed by reason.
@@ -28,6 +32,10 @@ const BOT_BACKOFF_MS: u64 = 45_000;
 const RATE_LIMIT_BACKOFF_MS: u64 = 60_000;
 const TRANSPORT_BACKOFF_MS: u64 = 5_000;
 const CAPPED_BACKOFF_MS: u64 = 5_000;
+
+/// `ladder/last-good` — the `kv_key` of the rung that finished the
+/// last `done` resolve. A pure attempt-order hint: see `last_good`.
+const LAST_GOOD_KEY: &str = "ladder/last-good";
 
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
@@ -229,16 +237,21 @@ fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> 
     })
 }
 
+/// The host-error kinds that must abort the work in flight:
+/// `cancelled` is the abort signal, `permission-denied` and
+/// `invalid-response` are contract violations. Anything else is
+/// weather — retryable by nature.
+fn is_terminal_kind(kind: &str) -> bool {
+    matches!(kind, "cancelled" | "permission-denied" | "invalid-response")
+}
+
 /// Propagate terminal host errors; fold retryable ones into a rung
-/// outcome. `cancelled`, `permission-denied`, and `invalid-response`
-/// are terminal; `rate-limit` keeps its taxonomy (its own backoff
+/// outcome. `rate-limit` keeps its taxonomy (its own backoff
 /// reason and fail kind); anything else is weather.
 fn terminal_or_transport(e: GuestError) -> Result<RungOutcome, GuestError> {
     match e {
         GuestError::Host { kind, message } => match kind.as_str() {
-            "cancelled" | "permission-denied" | "invalid-response" => {
-                Err(GuestError::Host { kind, message })
-            }
+            k if is_terminal_kind(k) => Err(GuestError::Host { kind, message }),
             "rate-limit" => Ok(RungOutcome::RateLimited),
             _ => Ok(RungOutcome::Transport),
         },
@@ -247,16 +260,54 @@ fn terminal_or_transport(e: GuestError) -> Result<RungOutcome, GuestError> {
 }
 
 /// A sanitized warning — never carries bodies, URLs, query text, or
-/// video ids.
+/// video ids. Diagnostics are never a wedge: the terminal kinds still
+/// propagate (`cancelled` is the abort signal; `permission-denied` and
+/// `invalid-response` are contract failures a log call can equally
+/// surface), but any other host error on the log channel is swallowed
+/// — a diagnostics path that is down must not fail the resolve it was
+/// annotating.
 pub(crate) async fn warn(message: &str) -> Result<(), GuestError> {
-    log(LogLevel::Warn, message).await
+    match log(LogLevel::Warn, message).await {
+        Err(GuestError::Host { kind, message }) if is_terminal_kind(&kind) => {
+            Err(GuestError::Host { kind, message })
+        }
+        Err(GuestError::Host { .. }) => Ok(()),
+        other => other,
+    }
+}
+
+/// KV is advisory state — visitors, backoffs, and the last-good hint
+/// are optimizations the resolve re-derives when absent. A read that
+/// fails with non-terminal weather degrades to the empty-store answer
+/// with a warning rather than failing user work; the terminal kinds
+/// still propagate.
+async fn kv_get_soft(key: &str) -> Result<Option<Vec<u8>>, GuestError> {
+    match kv_get(key).await {
+        Err(GuestError::Host { kind, .. }) if !is_terminal_kind(&kind) => {
+            warn("ignoring a transient KV read failure").await?;
+            Ok(None)
+        }
+        other => other,
+    }
+}
+
+/// Same rule for staged writes: a dropped write is state the next
+/// resolve re-derives, so transient store weather is warned-and-skipped
+/// — it must never sink a finished result.
+pub(crate) async fn kv_set_soft(key: &str, value: Option<&[u8]>) -> Result<(), GuestError> {
+    match kv_set(key, value).await {
+        Err(GuestError::Host { kind, .. }) if !is_terminal_kind(&kind) => {
+            warn("a transient KV write was dropped").await
+        }
+        other => other,
+    }
 }
 
 /// Load a persisted visitor: nonempty visible-ASCII values only;
 /// anything else is ignored with a sanitized warning and never reaches
 /// a header.
 pub(crate) async fn load_visitor(key: &str) -> Result<Option<String>, GuestError> {
-    match kv_get(key).await? {
+    match kv_get_soft(key).await? {
         Some(bytes) => match String::from_utf8(bytes) {
             Ok(s) if visitor_token(&s).is_some() => Ok(Some(s)),
             _ => {
@@ -276,7 +327,7 @@ const BACKOFF_REASONS: &[&str] = &["bot-check", "rate-limit", "transport", "capp
 /// `{until_ms: u64, reason: <known reason>}` — anything else is
 /// ignored with a sanitized warning.
 async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
-    match kv_get(key).await? {
+    match kv_get_soft(key).await? {
         Some(bytes) => {
             let parsed = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
                 let o = v.as_object()?;
@@ -305,7 +356,30 @@ async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
 async fn stage_backoff(key: &str, until_ms: u64, reason: &str) -> Result<(), GuestError> {
     let v =
         serde_json::to_vec(&json!({ "until_ms": until_ms, "reason": reason })).unwrap_or_default();
-    kv_set(key, Some(&v)).await
+    kv_set_soft(key, Some(&v)).await
+}
+
+/// Read `ladder/last-good`: the key of the rung that completed the
+/// last resolve. The hint only permutes attempt order — a stale entry
+/// costs nothing the static order wouldn't have paid (the hinted rung
+/// is attempted exactly once either way) and the first success
+/// rewrites it, so the order converges per-network. On a flagged
+/// carrier IP where only one client serves bare, the second and later
+/// resolves open with that client — one player POST instead of a walk
+/// — while a clean network keeps the static VISIONOS-first order. A
+/// value naming no current rung is a stale build's artifact or a
+/// foreign write: ignored with a warning, never a wedge.
+async fn last_good() -> Result<Option<String>, GuestError> {
+    match kv_get_soft(LAST_GOOD_KEY).await? {
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(key) if LADDER.iter().any(|r| r.kv_key() == key) => Ok(Some(key)),
+            _ => {
+                warn("ignoring a stale last-good rung KV value").await?;
+                Ok(None)
+            }
+        },
+        None => Ok(None),
+    }
 }
 
 /// Map a stored backoff reason back onto the rung-outcome taxonomy —
@@ -450,6 +524,16 @@ fn truncated_bot_check(body: &[u8]) -> bool {
     collapsed.contains("not a bot") || collapsed.contains("unusual traffic")
 }
 
+/// Does the body (sans a UTF-8 BOM — some stacks' emitters prepend
+/// one, and it must not make a valid envelope look non-JSON) begin
+/// like a JSON value?
+fn looks_json(body: &[u8]) -> bool {
+    let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
+    body.iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| *b == b'{' || *b == b'[')
+}
+
 /// The outcome a non-2xx player response books for its rung. A
 /// flagged IP's wall arrives as a bare 403 — Google's abuse edge
 /// answers with an HTML "automated queries" interstitial, never a JSON
@@ -464,19 +548,13 @@ fn truncated_bot_check(body: &[u8]) -> bool {
 /// a refusal. Only a non-JSON body books Bot outright.
 fn refusal_outcome(resp: &HttpResponse) -> RungOutcome {
     if resp.status == 403 {
-        // A UTF-8 BOM precedes some stacks' JSON emitters — strip it
-        // or a valid envelope looks non-JSON and books Bot on shape
-        // alone.
         let body = resp
             .body
             .strip_prefix(b"\xEF\xBB\xBF")
             .unwrap_or(&resp.body);
-        let looks_json = body
-            .iter()
-            .find(|b| !b.is_ascii_whitespace())
-            .is_some_and(|b| *b == b'{' || *b == b'[');
+        let json_shaped = looks_json(body);
         match (
-            looks_json,
+            json_shaped,
             serde_json::from_slice::<Value>(body)
                 .ok()
                 .map(|b| classify_playability(&b).0),
@@ -501,15 +579,45 @@ fn refusal_outcome(resp: &HttpResponse) -> RungOutcome {
     }
 }
 
-/// Is this response the bot wall — in either of its two shapes: a
-/// non-2xx refusal (`refusal_outcome`) or a 2xx JSON envelope whose
-/// `playabilityStatus` is a bot-check? Used to decide whether a
-/// replayed visitor is worth dropping for a bare re-ask.
+/// The outcome a 2xx response whose body is not a readable player
+/// envelope books for its rung. Markup or text is the abuse edge's
+/// interstitial or a consent page answering OK — the wall in transport
+/// form, symmetric with the bare 403, so it books `Bot` and the
+/// attested replay is its remedy. A JSON-shaped prefix that fails to
+/// parse is a truncated envelope — the surviving wall markers decide
+/// `Bot` vs `Transport`, exactly like a truncated 403. An empty or
+/// whitespace-only body is no envelope and no wall evidence either —
+/// plain transport weather.
+fn unreadable_body_outcome(body: &[u8]) -> RungOutcome {
+    if looks_json(body) {
+        if truncated_bot_check(body) {
+            RungOutcome::Bot
+        } else {
+            RungOutcome::Transport
+        }
+    } else if body.iter().all(|b| b.is_ascii_whitespace()) {
+        RungOutcome::Transport
+    } else {
+        RungOutcome::Bot
+    }
+}
+
+/// Is this response the bot wall — in any of its three shapes: a
+/// non-2xx refusal (`refusal_outcome`), a 2xx JSON envelope whose
+/// `playabilityStatus` is a bot-check, or a 2xx body that is not a
+/// readable envelope at all (`unreadable_body_outcome`)? Used to
+/// decide whether a replayed visitor is worth dropping for a bare
+/// re-ask — replayed state is suspect under every wall shape.
 fn walled_by_bot(resp: &HttpResponse) -> bool {
     if (200..300).contains(&resp.status) {
-        serde_json::from_slice::<Value>(&resp.body)
-            .ok()
-            .is_some_and(|b| classify_playability(&b).0 == Playability::BotCheck)
+        let body = resp
+            .body
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(&resp.body);
+        match serde_json::from_slice::<Value>(body) {
+            Ok(b) => classify_playability(&b).0 == Playability::BotCheck,
+            Err(_) => unreadable_body_outcome(body) == RungOutcome::Bot,
+        }
     } else {
         refusal_outcome(resp) == RungOutcome::Bot
     }
@@ -539,14 +647,21 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // Validated for the Slice 1.5 seam re-mint calls; byte pumping
     // itself is Slice 1.5-owned.
     let _ = p.resume_offset;
+    // The wall clock is the one call a resolve cannot degrade —
+    // backoff arithmetic is meaningless without it, so its failure is
+    // the resolve's failure.
     let now = now_ms().await?;
-    let mut outcomes: Vec<RungOutcome> = Vec::new();
-    // Ladder indices that produced `Bot`, paired with the slot that
-    // verdict occupies in `outcomes` — the attested pass replays only
-    // the attestable ones and overwrites the slot, so a superseded
-    // bot-check can't skew the ladder summary. Includes backoff-derived
-    // entries: a staged bot-backoff is exactly what attestation is for.
-    let mut bot_positions: Vec<(usize, usize)> = Vec::new();
+    // One slot per rung, indexed by static LADDER position: `order`
+    // permutes request scheduling only — the failure summary still
+    // reads the ladder in static order, so a last-good hint can never
+    // change which failure `ladder_error` selects. The attested pass
+    // overwrites a replayed rung's slot with its real verdict, so a
+    // superseded bot-check can't skew the summary either.
+    let mut outcomes: Vec<Option<RungOutcome>> = vec![None; LADDER.len()];
+    // Ladder indices that produced `Bot` — the attested pass replays
+    // only the attestable ones. Includes backoff-derived entries: a
+    // staged bot-backoff is exactly what attestation is for.
+    let mut bot_positions: Vec<usize> = Vec::new();
     let mut pin_seen = false;
     let mut pin_missing = false;
     let mut mint_attempted = false;
@@ -568,35 +683,67 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // documented remedy; it fires only when a provider minted, so a
     // guest with no POT provider pays one locally-denied `pot_token`
     // call and keeps today's terminal behavior.
+    //
+    // Attempt order is the `ladder/last-good` hint — the rung that
+    // finished the previous resolve — followed by the rest of the
+    // static ladder: a pure permutation, so a stale hint never costs
+    // more than the static order (every rung still gets its bare
+    // shot), and a failed resolve never writes it. This is what lets a
+    // flagged carrier IP converge on the one client that serves it
+    // bare instead of re-walking dead rungs on every resolve.
+    let last_good = last_good().await?;
+    let hint = last_good
+        .as_deref()
+        .and_then(|key| LADDER.iter().position(|r| r.kv_key() == key));
+    let mut order: Vec<usize> = Vec::with_capacity(LADDER.len());
+    if let Some(i) = hint {
+        order.push(i);
+    }
+    order.extend((0..LADDER.len()).filter(|i| hint != Some(*i)));
+    // Rungs whose `backoff/<video>` key the resolve touched — an
+    // in-force record it skipped past or one it staged. A finishing
+    // rung clears its key only in those cases; a clean run needs no
+    // write.
+    let mut dirty_backoffs = vec![false; LADDER.len()];
+
     for pass in 0..2u8 {
         let attested = pass == 1;
-        'rung: for (i, rung) in LADDER.iter().enumerate() {
+        'rung: for &i in &order {
+            let rung = &LADDER[i];
             // Pass 2 replays only rungs attestation can lift — a
             // non-attestable client's bot-check is permanent (its wall
             // needs DroidGuard, which a BotGuard mint never produces),
             // so replaying it would be a provably wasted request.
-            if attested && (!rung.attestable || !bot_positions.iter().any(|(rung, _)| *rung == i)) {
+            if attested && (!rung.attestable || !bot_positions.contains(&i)) {
                 continue;
             }
-            let visitor_key = format!("visitor/{}", rung.kv_key());
-            let kv_visitor = load_visitor(&visitor_key).await?;
-            let mut rung_visitor = fresh_visitor.clone().or(kv_visitor);
-
             let backoff_key = format!("backoff/{}/{}", p.video_id, rung.kv_key());
-            // The attested pass deliberately ignores backoffs — a staged
-            // bot-backoff is the thing attestation exists to break.
+            // Backoff before the visitor read: a skipped rung costs one
+            // KV read, not two. The attested pass deliberately ignores
+            // backoffs — a staged bot-backoff is the thing attestation
+            // exists to break.
             if !attested {
                 if let Some((until, reason)) = load_backoff(&backoff_key).await? {
                     if until > now {
+                        dirty_backoffs[i] = true;
                         let outcome = outcome_for_reason(&reason);
                         if outcome == RungOutcome::Bot {
-                            bot_positions.push((i, outcomes.len()));
+                            bot_positions.push(i);
                         }
-                        outcomes.push(outcome);
+                        outcomes[i] = Some(outcome);
                         continue;
                     }
                 }
             }
+            let visitor_key = format!("visitor/{}", rung.kv_key());
+            // A fresh cross-rung visitor shadows the stored value —
+            // skip the read entirely when one exists.
+            let kv_visitor = if fresh_visitor.is_some() {
+                None
+            } else {
+                load_visitor(&visitor_key).await?
+            };
+            let mut rung_visitor = fresh_visitor.clone().or(kv_visitor);
 
             // The rung's sends live in one loop because two one-shot
             // re-asks can stack: a 401 against a carried trust token
@@ -623,9 +770,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     Err(e) => {
                         let outcome = terminal_or_transport(e)?;
                         if let Some((reason, ms)) = backoff_for(outcome) {
+                            dirty_backoffs[i] = true;
                             stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                         }
-                        record(&mut outcomes, attested, i, &bot_positions, outcome);
+                        outcomes[i] = Some(outcome);
                         continue 'rung;
                     }
                 };
@@ -649,11 +797,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     //   committed resolve would re-persist the burned
                     //   token under its source rung's key and the next
                     //   invocation would replay it there.
-                    kv_set(&visitor_key, None).await?;
+                    kv_set_soft(&visitor_key, None).await?;
                     if fresh_visitor.take().is_some() {
                         if let Some(home) = fresh_visitor_key.take() {
                             if home != visitor_key {
-                                kv_set(&home, None).await?;
+                                kv_set_soft(&home, None).await?;
                             }
                         }
                     }
@@ -668,38 +816,50 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 // bare above — every refusal reaching here is the
                 // rung's own and stages its backoff.
                 if let Some((reason, ms)) = backoff_for(outcome) {
+                    dirty_backoffs[i] = true;
                     stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
-                record(&mut outcomes, attested, i, &bot_positions, outcome);
+                outcomes[i] = Some(outcome);
                 if !attested && outcome == RungOutcome::Bot {
-                    bot_positions.push((i, outcomes.len() - 1));
+                    bot_positions.push(i);
                 }
                 continue;
             }
-            // A 2xx player response must be a JSON envelope carrying
-            // `playabilityStatus.status` — anything else (an HTML
-            // interstitial, an empty body, a shape the parser predates) is
-            // upstream breakage, not a rung outcome.
-            let body: Value = serde_json::from_slice(&resp.body).map_err(|_| {
-                failed(
-                    "invalid-response",
-                    "player response body is not JSON".into(),
-                )
-            })?;
-            if body
-                .pointer("/playabilityStatus/status")
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-            {
-                return Err(failed(
-                    "invalid-response",
-                    "player response lacks playabilityStatus".into(),
-                ));
-            }
+            // A 2xx that is not a readable player envelope is this
+            // rung's own answer — the wall in transport form (markup
+            // interstitial, consent page, empty body) or a truncated
+            // envelope — never a reason to starve the rungs behind it.
+            // Booking it like the refusal path keeps an edge-shaped OK
+            // in the same taxonomy: Bot stages the backoff and the
+            // attested-replay slot; Transport marks weather.
+            let stripped = resp
+                .body
+                .strip_prefix(b"\xEF\xBB\xBF")
+                .unwrap_or(&resp.body);
+            let body: Value = match serde_json::from_slice(stripped) {
+                Ok(body) => body,
+                Err(_) => {
+                    let outcome = unreadable_body_outcome(&resp.body);
+                    if let Some((reason, ms)) = backoff_for(outcome) {
+                        dirty_backoffs[i] = true;
+                        stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                    }
+                    outcomes[i] = Some(outcome);
+                    if !attested && outcome == RungOutcome::Bot {
+                        bot_positions.push(i);
+                    }
+                    continue;
+                }
+            };
+            // A parseable body is classified by whatever it carries —
+            // an absent `playabilityStatus` is the parser's documented
+            // "legacy playable" shape and `format_outcome` reports a
+            // format-less answer as no-audio honestly. No JSON shape
+            // the envelope could take is worth aborting the ladder over.
             if let Some(raw) = visitor_data(&body) {
                 if let Some(visitor) = visitor_token(&raw) {
                     let visitor = visitor.to_string();
-                    kv_set(&visitor_key, Some(visitor.as_bytes())).await?;
+                    kv_set_soft(&visitor_key, Some(visitor.as_bytes())).await?;
                     rung_visitor = Some(visitor.clone());
                     fresh_visitor = Some(visitor);
                     fresh_visitor_key = Some(visitor_key.clone());
@@ -718,52 +878,35 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 .and_then(Value::as_str)
                 .is_some_and(|id| id != p.video_id)
             {
-                record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::Unavailable,
-                );
+                outcomes[i] = Some(RungOutcome::Unavailable);
                 continue;
             }
             match classify_playability(&body).0 {
                 Playability::Ok => {}
                 Playability::BotCheck => {
+                    dirty_backoffs[i] = true;
                     stage_backoff(
                         &backoff_key,
                         now.saturating_add(BOT_BACKOFF_MS),
                         "bot-check",
                     )
                     .await?;
-                    record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Bot);
+                    outcomes[i] = Some(RungOutcome::Bot);
                     if !attested {
-                        bot_positions.push((i, outcomes.len() - 1));
+                        bot_positions.push(i);
                     }
                     continue;
                 }
                 Playability::AgeRestricted => {
-                    record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Age);
+                    outcomes[i] = Some(RungOutcome::Age);
                     continue;
                 }
                 Playability::SignInRequired => {
-                    record(
-                        &mut outcomes,
-                        attested,
-                        i,
-                        &bot_positions,
-                        RungOutcome::SignIn,
-                    );
+                    outcomes[i] = Some(RungOutcome::SignIn);
                     continue;
                 }
                 Playability::Unavailable => {
-                    record(
-                        &mut outcomes,
-                        attested,
-                        i,
-                        &bot_positions,
-                        RungOutcome::Unavailable,
-                    );
+                    outcomes[i] = Some(RungOutcome::Unavailable);
                     continue;
                 }
             }
@@ -776,6 +919,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             target_bitrate_kbps: p.target_bitrate_kbps,
                             prefer: &prefer,
                             pin_itag: p.pin_itag,
+                            // Rank only what the sandbox can serve —
+                            // a foreign-host top pick must not starve
+                            // the googlevideo formats behind it.
+                            url_ok: Some(is_googlevideo),
                         },
                     ) {
                         Some(picked) => {
@@ -795,84 +942,100 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             .await?
                             {
                                 PickOutcome::Done(result) => {
-                                    kv_set(&backoff_key, None).await?;
+                                    // Clear the rung's backoff key only
+                                    // when the resolve touched it — an
+                                    // in-force record skipped past or
+                                    // one staged this invocation; a
+                                    // clean key needs no write.
+                                    if dirty_backoffs[i] {
+                                        kv_set_soft(&backoff_key, None).await?;
+                                    }
+                                    // The winning rung leads the next
+                                    // resolve — rewrite the hint only
+                                    // when it changed.
+                                    if last_good.as_deref() != Some(rung.kv_key()) {
+                                        kv_set_soft(LAST_GOOD_KEY, Some(rung.kv_key().as_bytes()))
+                                            .await?;
+                                    }
                                     return Ok(result);
                                 }
                                 PickOutcome::Advance(outcome) => {
                                     if let Some((reason, ms)) = backoff_for(outcome) {
+                                        dirty_backoffs[i] = true;
                                         stage_backoff(&backoff_key, now.saturating_add(ms), reason)
                                             .await?;
                                     }
-                                    record(&mut outcomes, attested, i, &bot_positions, outcome);
+                                    outcomes[i] = Some(outcome);
                                 }
                             }
                         }
                         None => {
-                            // A failed player request cannot establish that
-                            // the pin disappeared. Require a usable format
-                            // from this response when the pin is removed.
-                            if p.pin_itag.is_some()
-                                && pick_audio(
-                                    &body,
-                                    PickOptions {
-                                        target_bitrate_kbps: p.target_bitrate_kbps,
-                                        prefer: &prefer,
-                                        pin_itag: None,
-                                    },
-                                )
-                                .is_some()
+                            // Nothing servable ranked — was the
+                            // response bare of plain audio, or was its
+                            // audio all on hosts the sandbox can never
+                            // serve? Re-pick without the host bar to
+                            // tell them apart: all-foreign books the
+                            // capped mint it is, not a no-audio rung.
+                            if pick_audio(
+                                &body,
+                                PickOptions {
+                                    target_bitrate_kbps: p.target_bitrate_kbps,
+                                    prefer: &prefer,
+                                    pin_itag: p.pin_itag,
+                                    url_ok: None,
+                                },
+                            )
+                            .is_some()
                             {
-                                pin_missing = true;
+                                // The pinned itag exists but its mint
+                                // is unreachable — seen, not missing.
+                                if p.pin_itag.is_some() {
+                                    pin_seen = true;
+                                }
+                                outcomes[i] = Some(RungOutcome::Capped);
+                            } else {
+                                // A failed player request cannot establish that
+                                // the pin disappeared. Require a usable format
+                                // from this response when the pin is removed.
+                                if p.pin_itag.is_some()
+                                    && pick_audio(
+                                        &body,
+                                        PickOptions {
+                                            target_bitrate_kbps: p.target_bitrate_kbps,
+                                            prefer: &prefer,
+                                            pin_itag: None,
+                                            url_ok: None,
+                                        },
+                                    )
+                                    .is_some()
+                                {
+                                    pin_missing = true;
+                                }
+                                outcomes[i] = Some(RungOutcome::NoAudio);
                             }
-                            record(
-                                &mut outcomes,
-                                attested,
-                                i,
-                                &bot_positions,
-                                RungOutcome::NoAudio,
-                            );
                         }
                     }
                 }
-                FormatOutcome::SabrOnly => record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::SabrOnly,
-                ),
-                FormatOutcome::CipheredOnly => record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::CipheredOnly,
-                ),
-                FormatOutcome::NoAudio => record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::NoAudio,
-                ),
+                FormatOutcome::SabrOnly => outcomes[i] = Some(RungOutcome::SabrOnly),
+                FormatOutcome::CipheredOnly => outcomes[i] = Some(RungOutcome::CipheredOnly),
+                FormatOutcome::NoAudio => outcomes[i] = Some(RungOutcome::NoAudio),
             }
         }
         // Escalation: bot-checks accumulate a remedy pass. One shared
         // mint — the same video-bound token also decorates picked URLs
         // via `finish_pick`. A denied/failed mint keeps today's
         // terminal outcome.
-        if attested
-            || !bot_positions
-                .iter()
-                .any(|(rung, _)| LADDER[*rung].attestable)
-        {
+        if attested || !bot_positions.iter().any(|&r| LADDER[r].attestable) {
             break;
         }
         if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
             break;
         }
     }
-    Err(ladder_error(&outcomes, pin_missing, pin_seen))
+    // The taxonomy reads the ladder in static rung order — `order`
+    // scheduled requests only.
+    let seen: Vec<RungOutcome> = outcomes.iter().flatten().copied().collect();
+    Err(ladder_error(&seen, pin_missing, pin_seen))
 }
 
 /// The shared PO token: one video-bound mint per resolve serves both
@@ -930,19 +1093,31 @@ async fn finish_pick(
     if let Some(token) = pot.as_deref() {
         picked.url = append_pot(&picked.url, token);
     }
+    // A picked URL the manifest allowlist can never admit
+    // (`*.googlevideo.com` only) is a dead mint, not weather: probing
+    // it wastes a request that ends in permission-denied. Book it
+    // capped like a refused mint and let the next rung try.
+    if !is_googlevideo(&picked.url) {
+        return Ok(PickOutcome::Advance(RungOutcome::Capped));
+    }
     let mut resp = match http_request(probe_request(rung, &picked.url, picked.content_length)).await
     {
         Ok(r) => r,
+        // A host denial past the local allowlist check is no longer a
+        // foreign destination — `permission-denied` is a contract
+        // failure and stays terminal, never a capped mint.
         Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
     };
     // The host never follows redirects — destination policy is enforced
     // on each request — so a 3xx is re-requested through the normal
     // authorized path. googlevideo edge-balances minted URLs this way;
-    // the verdict runs on wherever the chain lands. One hop: a second
-    // redirect is serving weather, not a chain to chase.
+    // the verdict runs on wherever the chain lands. One hop, and only
+    // to a host the allowlist admits — an edge balancing off
+    // googlevideo is a mint we cannot serve, so a second redirect or
+    // a foreign target is serving weather, not a chain to chase.
     if resp.status / 100 == 3 {
         let target = header_value(&resp.headers, "location").map(str::to_owned);
-        if let Some(target) = target.filter(|t| t.starts_with("https://")) {
+        if let Some(target) = target.filter(|t| t.starts_with("https://") && is_googlevideo(t)) {
             match http_request(probe_request(rung, &target, picked.content_length)).await {
                 Ok(r) => resp = r,
                 Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
@@ -1068,26 +1243,6 @@ fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<Run
     }
 }
 
-/// Append `outcome` — or, on the attested pass, overwrite the slot the
-/// rung's bare `Bot` verdict occupied. The replay's verdict is the
-/// rung's real answer: keeping the superseded `Bot` would report a
-/// bot-check a successful attestation already answered.
-fn record(
-    outcomes: &mut Vec<RungOutcome>,
-    attested: bool,
-    rung: usize,
-    bot_positions: &[(usize, usize)],
-    outcome: RungOutcome,
-) {
-    if attested {
-        if let Some(&(_, slot)) = bot_positions.iter().find(|(r, _)| *r == rung) {
-            outcomes[slot] = outcome;
-            return;
-        }
-    }
-    outcomes.push(outcome);
-}
-
 /// Map the accumulated outcomes to the terminal taxonomy. Precedence:
 /// rate-limit, a demonstrably missing pinned itag (absent from a usable
 /// response and never seen — seen-but-capped is capped/transport weather), the
@@ -1191,6 +1346,13 @@ mod tests {
         logs: Vec<String>,
         /// Value `now_ms` replies with; `NOW` unless a test overrides.
         now: u64,
+        /// When set, every KV call answers `host_error` with this kind —
+        /// the store is advisory, so non-terminal kinds must degrade
+        /// rather than wedge, and terminal kinds must still abort.
+        kv_error: Option<&'static str>,
+        /// Same for the log channel: `warn` must swallow weather but
+        /// never the terminal kinds.
+        log_error: Option<&'static str>,
     }
 
     impl Harness {
@@ -1202,6 +1364,8 @@ mod tests {
                 pot_calls: 0,
                 logs: Vec::new(),
                 now: NOW,
+                kv_error: None,
+                log_error: None,
             }
         }
 
@@ -1249,6 +1413,9 @@ mod tests {
                                     "type": "now_response", "id": id, "now_ms": self.now,
                                 }));
                             }
+                            "kv_get" | "kv_set" if self.kv_error.is_some() => {
+                                out = step(&host_error(id, self.kv_error.unwrap_or("transient")));
+                            }
                             "kv_get" => {
                                 let key = out["payload"]["key"].as_str().unwrap_or("").to_string();
                                 let value = self
@@ -1267,6 +1434,9 @@ mod tests {
                                     .and_then(|s| B64.decode(s).ok());
                                 self.staged.insert(key, value);
                                 out = step(&json!({ "type": "host_ok", "id": id }));
+                            }
+                            "log" if self.log_error.is_some() => {
+                                out = step(&host_error(id, self.log_error.unwrap_or("transient")));
                             }
                             "log" => {
                                 self.logs.push(
@@ -1758,19 +1928,103 @@ mod tests {
     }
 
     #[test]
-    fn player_body_not_json_is_invalid_response() {
+    fn non_json_2xx_is_the_wall_not_an_abort() {
+        // A 200 carrying markup is the edge's interstitial answering
+        // OK — the rung books the wall (the attested replay it earns is
+        // covered by `markup_2xx_earns_an_attested_replay`) and the
+        // ladder walks on; it must not die `invalid-response` with
+        // seven rungs untried.
         let mut h = Harness::new();
         let out = begin(&mut h);
         let out = h.answer(&out, 200, "<html>oops</html>");
-        assert_eq!(fail_kind(&out).0, "invalid-response");
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
     }
 
     #[test]
-    fn player_missing_playability_status_is_invalid_response() {
+    fn missing_envelope_status_advances_as_no_audio() {
+        // A JSON body without `playabilityStatus` is the parser's
+        // legacy "playable" shape — `format_outcome` reports no-audio
+        // honestly and the rung advances. An envelope shape the parser
+        // predates can no longer starve the rungs behind it.
         let mut h = Harness::new();
         let out = begin(&mut h);
         let out = h.answer(&out, 200, &json!({ "videoDetails": {} }).to_string());
-        assert_eq!(fail_kind(&out).0, "invalid-response");
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
+    }
+
+    #[test]
+    fn truncated_2xx_body_is_weather_not_abort() {
+        // A JSON-shaped 2xx that fails to parse is a truncated envelope:
+        // the same marker scan a truncated 403 gets — no wall marker
+        // here, so Transport, and the ladder advances.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = h.answer(
+            &out,
+            200,
+            "{\"playabilityStatus\":{\"status\":\"OK\",\"streami",
+        );
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn markup_2xx_under_visitor_drops_and_reasks() {
+        // The wall in transport form carries the same replayed-state
+        // rule as the 403 wall: a 200-HTML answer under a persisted
+        // visitor drops it and re-asks once bare.
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/VISIONOS".into(), b"persisted-visitor".to_vec());
+        let out = begin(&mut h);
+        assert_eq!(
+            header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+            Some("persisted-visitor")
+        );
+        let out = h.answer(&out, 200, "<html><body>sorry</body></html>");
+        // Same rung re-asked bare — not advanced.
+        assert_eq!(rung_of(&out), 0);
+        assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None);
+    }
+
+    #[test]
+    fn markup_2xx_earns_an_attested_replay() {
+        // The 200-wall is bot taxonomy: with a provider the rung gets
+        // its attested replay like any bot-check — the wall's remedy
+        // must reach every shape the wall takes.
+        let mut h = Harness::new();
+        h.pot = Pot::Token("pot-1");
+        let out = begin(&mut h);
+        let out = h.answer(&out, 200, "<html><body>sorry</body></html>");
+        // The rest of the bare ladder walls too.
+        let mut out = out;
+        for _ in 1..LADDER.len() {
+            out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        }
+        // Pass 2 replays only attestable walled rungs — VISIONOS (0)
+        // and IOS (2) — carrying the PoT.
+        for expected in [0usize, 2] {
+            assert_eq!(rung_of(&out), expected);
+            let body = String::from_utf8(
+                B64.decode(out["payload"]["body"].as_str().unwrap_or(""))
+                    .unwrap_or_default(),
+            )
+            .unwrap_or_default();
+            assert!(body.contains("serviceIntegrityDimensions"));
+            out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
     }
 
     #[test]
@@ -1871,8 +2125,8 @@ mod tests {
             "type": "invoke", "request_id": "t1", "capability": "playback.resolve",
             "payload": { "source_ref": VID },
         }));
-        // now → kv(visitor) → kv(backoff) → player.
-        for _ in 0..3 {
+        // now → kv(last-good) → kv(backoff) → kv(visitor) → player.
+        for _ in 0..4 {
             let id = out["id"].as_u64().unwrap_or(u64::MAX);
             out = match out["kind"].as_str().unwrap_or("") {
                 "now_ms" => step(&json!({"type":"now_response","id":id,"now_ms":NOW})),
@@ -2627,13 +2881,26 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        // The staged write committed under rung 0's key.
+        // The staged write committed under rung 0's key, and the
+        // finishing rung left the `ladder/last-good` hint pointing at
+        // rung 1.
         assert_eq!(
             h.committed.get("visitor/VISIONOS").map(Vec::as_slice),
             Some(b"Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D".as_slice())
         );
-        // A fresh invocation reads it back through KV.
-        let out = begin(&mut h);
+        assert_eq!(
+            h.committed.get("ladder/last-good").map(Vec::as_slice),
+            Some(b"ANDROID_VR@1.57.29".as_slice())
+        );
+        // A fresh invocation leads with the hinted rung; VISIONOS
+        // follows in static order and replays the committed value
+        // through KV — the hinted rung's transport failure keeps the
+        // walk honest.
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 1);
+        assert!(header_of(&out, "X-Goog-Visitor-Id").is_none());
+        let out = h.answer_host_error(&out, "transient");
+        assert_eq!(rung_of(&out), 0);
         assert_eq!(
             header_of(&out, "X-Goog-Visitor-Id").as_deref(),
             Some("Cgt0ZXN0LXZpc2l0b3ItaWQtMDAxEgB6Zg%3D%3D")
@@ -2821,6 +3088,256 @@ mod tests {
         assert_eq!(fail_kind(&out).0, "rate-limit");
         assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
         assert!(h.staged.is_empty());
+    }
+
+    #[test]
+    fn last_good_hint_leads_the_attempt_order() {
+        // The rung that finished last time leads this resolve — the
+        // flagged-IP convergence: second and later resolves open with
+        // the client that serves bare, not a fresh walk.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"IOS".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 2);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // The winner already held the hint — no rewrite needed.
+        assert_eq!(
+            h.committed.get("ladder/last-good").map(Vec::as_slice),
+            Some(b"IOS".as_slice())
+        );
+    }
+
+    #[test]
+    fn last_good_hint_rewrites_to_the_new_winner() {
+        // A hinted rung that walls costs the same bare POST the static
+        // order would have paid; the winner takes the hint so the next
+        // resolve converges on it.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"IOS".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 2);
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        assert_eq!(rung_of(&out), 0);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            h.committed.get("ladder/last-good").map(Vec::as_slice),
+            Some(b"VISIONOS".as_slice())
+        );
+    }
+
+    #[test]
+    fn stale_last_good_is_ignored_not_a_wedge() {
+        // A hint naming no current rung is a stale build's artifact or
+        // a foreign write — warned, ignored, static order.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"DEAD_RUNG".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 0);
+        assert!(h.logs.iter().any(|m| m.contains("last-good")));
+    }
+
+    #[test]
+    fn hinted_rung_backoff_skips_to_static_order() {
+        // The hint permutes, it doesn't exempt: a hinted rung under an
+        // in-force backoff is skipped without a request and the static
+        // order takes over.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"ANDROID_VR@1.57.29".to_vec());
+        h.committed.insert(
+            format!("backoff/{VID}/ANDROID_VR@1.57.29"),
+            json!({ "until_ms": NOW + 60_000, "reason": "bot-check" })
+                .to_string()
+                .into_bytes(),
+        );
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 0);
+    }
+
+    #[test]
+    fn hint_order_still_walks_every_rung() {
+        // A permutation can never starve: with the last rung hinted,
+        // every rung still gets exactly one bare shot.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
+        let mut out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 7);
+        for expected in [0usize, 1, 2, 3, 4, 5, 6] {
+            out = feed(&mut h, &out, SABR);
+            assert_eq!(rung_of(&out), expected);
+        }
+        out = feed(&mut h, &out, SABR);
+        assert_eq!(
+            fail_kind(&out),
+            ("unsupported".to_string(), "sabr-only".to_string())
+        );
+    }
+
+    #[test]
+    fn hinted_order_keeps_the_static_failure_taxonomy() {
+        // The hint permutes requests, never the verdict: rung 7 walled
+        // and every other rung unavailable reads exactly like the cold
+        // order — the last STATIC outcome (rung 7's bot-check), not the
+        // last attempt-order one.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
+        let mut out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 7);
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        for expected in 0..7usize {
+            assert_eq!(rung_of(&out), expected);
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
+    }
+
+    #[test]
+    fn hinted_restricted_rung_keeps_the_static_reason() {
+        // Same rule for the all-restricted summary: the message names
+        // the first STATIC rung's verdict, not the hinted rung's —
+        // sabr-only either way, hinted or cold.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
+        let mut out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 7);
+        out = feed(&mut h, &out, CIPHERED);
+        for expected in 0..7usize {
+            assert_eq!(rung_of(&out), expected);
+            out = feed(&mut h, &out, SABR);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("unsupported".to_string(), "sabr-only".to_string())
+        );
+    }
+
+    #[test]
+    fn transient_kv_failures_never_wedge() {
+        // Every KV call answering non-terminal weather degrades the
+        // advisory namespace to empty-store behavior: the resolve still
+        // walks, mints, probes, and reports — a logging call per drop
+        // but never a wedge.
+        let mut h = Harness::new();
+        h.kv_error = Some("transient");
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+    }
+
+    #[test]
+    fn cancelled_kv_still_aborts() {
+        // `cancelled` is the abort signal, not weather — it must
+        // propagate even out of an advisory read.
+        let mut h = Harness::new();
+        h.kv_error = Some("cancelled");
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(fail_kind(&out).0, "cancelled");
+    }
+
+    #[test]
+    fn warn_channel_swallows_weather_not_terminal_kinds() {
+        // Transient log weather degrades to swallowed diagnostics —
+        // the stale-hint warning is dropped and the resolve walks on.
+        let mut h = Harness::new();
+        h.log_error = Some("transient");
+        h.committed
+            .insert("ladder/last-good".into(), b"DEAD_RUNG".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 0);
+        // A contract violation on the same channel stays terminal — a
+        // log path answering `invalid-response` must still abort.
+        let mut h = Harness::new();
+        h.log_error = Some("invalid-response");
+        h.committed
+            .insert("ladder/last-good".into(), b"DEAD_RUNG".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(fail_kind(&out).0, "invalid-response");
+    }
+
+    #[test]
+    fn foreign_top_pick_falls_back_to_servable_format() {
+        // The best-ranked format sits off the allowlist but other
+        // googlevideo audio remains in the same response — the rung
+        // must try it rather than abandoning the response as capped.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        body["streamingData"]["adaptiveFormats"][3]["url"] =
+            json!("https://cdn.example.com/v.mp4?expire=1893456000&itag=140");
+        let out = feed(&mut h, &out, &body.to_string());
+        // The probe goes to the next servable format (itag 251) — no
+        // capped advance, no request spent on the foreign URL.
+        assert_eq!(out["type"], "host_request");
+        assert_eq!(out["payload"]["method"], "GET");
+        assert!(url_of(&out).contains("itag=251"), "{}", url_of(&out));
+    }
+
+    #[test]
+    fn foreign_pick_url_is_capped_not_probed() {
+        // Every minted URL outside the `*.googlevideo.com` allowlist
+        // can never be served — an all-foreign response books the rung
+        // capped without spending a doomed probe request, and advances
+        // to the next rung.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body["streamingData"]["adaptiveFormats"].as_array_mut() else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        for f in fmts {
+            f["url"] = json!("https://cdn.example.com/v.mp4?expire=1893456000&itag=140");
+        }
+        let out = feed(&mut h, &out, &body.to_string());
+        // No GET probe was emitted — the next request is rung 1's POST.
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_permission_denied_is_terminal() {
+        // The picked URL already passed the local allowlist check, so
+        // a host `permission-denied` is a contract failure — the
+        // resolve reports it rather than booking a capped mint and
+        // walking on to `streams-capped`.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer_host_error(&out, "permission-denied");
+        assert_eq!(fail_kind(&out).0, "permission-denied");
+    }
+
+    #[test]
+    fn redirect_to_foreign_host_is_capped() {
+        // An edge redirect off the allowlist is a mint we cannot
+        // serve — no re-request is made and the rung advances.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = h.answer_headers(
+            &out,
+            302,
+            &[("Location", "https://cdn.example.com/elsewhere")],
+            0,
+        );
+        assert_eq!(rung_of(&out), 1);
     }
 
     #[test]

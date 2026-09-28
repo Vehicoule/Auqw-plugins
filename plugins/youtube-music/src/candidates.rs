@@ -5,10 +5,12 @@
 
 use std::collections::BTreeSet;
 
-use auqw_guest_sdk::{http_request, kv_get, kv_set, GuestError, HttpRequest};
+use auqw_guest_sdk::{http_request, GuestError, HttpRequest};
 use serde_json::{json, Map, Value};
 
-use crate::guest::{bad_payload, failed, is_video_id, payload_keys, warn};
+use crate::guest::{
+    bad_payload, failed, is_video_id, kv_set_soft, load_visitor, payload_keys, warn,
+};
 use crate::parse::{visitor_data, visitor_token};
 
 /// InnerTube `search`. The `key` is YouTube's public embedded API key
@@ -213,16 +215,10 @@ fn search_request(query: &str, visitor: Option<&str>, auth: Option<&str>) -> Htt
 
 pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
     let p = parse_candidates_payload(payload)?;
-    let visitor = match kv_get(VISITOR_KEY).await? {
-        Some(bytes) => match String::from_utf8(bytes) {
-            Ok(s) if visitor_token(&s).is_some() => Some(s),
-            _ => {
-                warn("ignoring malformed visitor KV value").await?;
-                None
-            }
-        },
-        None => None,
-    };
+    // The shared loader validates the stored value and degrades a
+    // transient KV read to "no visitor" — a metadata call must not
+    // wedge on advisory state.
+    let visitor = load_visitor(VISITOR_KEY).await?;
     let mut resp = match http_request(search_request(
         &p.search_text,
         visitor.as_deref(),
@@ -270,7 +266,7 @@ pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
         })?;
     if let Some(raw) = visitor_data(&body) {
         if let Some(visitor) = visitor_token(&raw) {
-            kv_set(VISITOR_KEY, Some(visitor.as_bytes())).await?;
+            kv_set_soft(VISITOR_KEY, Some(visitor.as_bytes())).await?;
         } else {
             warn("ignoring malformed visitor value").await?;
         }

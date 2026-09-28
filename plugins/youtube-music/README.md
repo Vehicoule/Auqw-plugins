@@ -23,7 +23,8 @@ accepts the legacy 11-character video-id string or a
 - `resume_offset` (null/absent or u64): validated seam input for the
   Slice 1.5 re-mint path; byte pumping itself is Slice 1.5-owned.
 
-It walks an eight-rung, version-pinned client ladder, in order:
+It walks an eight-rung, version-pinned client ladder. The static
+fallback order is:
 
 1. `VISIONOS` 1.02
 2. `ANDROID_VR` 1.57.29
@@ -33,6 +34,14 @@ It walks an eight-rung, version-pinned client ladder, in order:
 6. `ANDROID_VR` 1.61.48
 7. `ANDROID_VR` 1.60.19
 8. `ANDROID_VR` 1.43.32
+
+Once a resolve has finished, the winning rung's key is kept under
+`ladder/last-good` and leads the next resolve's attempt order (the
+rest of the ladder follows in the static order — a pure permutation,
+never an exemption). On a flagged IP where only one client serves
+bare, this converges the second and later resolves to a single player
+POST instead of re-walking dead rungs; on a clean network the hint
+keeps pointing at VISIONOS.
 
 For each rung it POSTs `youtubei/v1/player?key=<public InnerTube
 key>&prettyPrint=false` with the rung's client identity (`User-Agent`,
@@ -65,7 +74,16 @@ Each rung has a stable KV key (`VISIONOS`, `IOS`,
   reason still participates in the final failure taxonomy — a stored
   `rate-limit` answers `rate-limit`. Failed rungs stage backoffs:
   bot-check 45 s, rate-limit 60 s, transport 5 s, capped probe 5 s; a
-  successful rung clears its own key.
+  successful rung clears its own key only when the resolve touched it.
+- `ladder/last-good` — the `kv_key` of the rung that finished the last
+  resolve; it leads the next attempt order. A value naming no current
+  rung is ignored with a warning.
+
+The KV namespace is advisory state: a non-terminal host error on a
+read degrades to the empty-store answer and a dropped write is
+warned-and-skipped — a transient KV failure can never wedge a resolve.
+`cancelled`, `permission-denied`, and `invalid-response` still
+propagate.
 
 `kv_set` writes are **staged**: the host commits them only when the
 invocation ends `done`. Failed-rung backoffs and early visitors persist
@@ -195,6 +213,10 @@ and the googlevideo behaviour both change with the client pin:
   fetchable without a PO token. `IOS` 21.26.4 (the version yt-dlp
   currently tracks) is served **SABR-only**: audio formats carry
   neither `url` nor `signatureCipher`, only `serverAbrStreamingUrl`.
+- `ANDROID` sits at 20.19.36, not the predecessor's 19.09.37: upstream
+  retired that pin outright (HTTP 400 `FAILED_PRECONDITION` on every
+  player call), while 20.19.36 is live-verified to resolve with plain
+  audio URLs that pass the head/tail probes.
 - `ANDROID_VR` 1.61.48 / 1.60.19 / 1.43.32 URLs serve the **full
   stream** anonymously — any `Range: bytes=` chunk is honoured fast —
   but the rung itself is the most bot-checked (`LOGIN_REQUIRED` / "Sign
@@ -214,12 +236,24 @@ preserved for the host.
 Per rung: non-2xx advances the ladder (429 is remembered; a 403
 carrying a non-JSON body — the abuse edge's HTML interstitial —
 books as bot-check, a 403 with a JSON envelope stays transport),
+and a 2xx that is not a readable player envelope is the rung's own
+outcome rather than a wedge: markup, text, or an empty body books
+bot-check (the wall answering OK, earning the same replay slot the
+403 wall does), while a JSON-shaped body that fails to parse scans
+its surviving prefix for wall markers exactly like a truncated 403
+— marked is bot-check, otherwise transport. A parseable body is
+classified by whatever it carries — an absent `playabilityStatus`
+is the parser's legacy-playable shape — so no envelope shape can
+starve the rungs behind it.
 bot-check /
 sign-in / age / unavailable playability advances, SABR / ciphered /
 no-audio advances, and a refused tail probe advances as `capped`. A
+minted URL outside the `*.googlevideo.com` allowlist books capped
+without spending a doomed probe; a
 3xx probe is re-requested once against its `Location` — the host
-enforces the destination allowlist on every request — before the
-verdict lands. A
+enforces the destination allowlist on every request, so a target off
+the allowlist (or a second redirect) is capped without a fetch —
+before the verdict lands. A
 bot-check never ends the bare pass — every
 rung gets its bare try — and the walled web-attestable rungs
 (`VISIONOS`/`IOS`) then get one attested replay each when a POT

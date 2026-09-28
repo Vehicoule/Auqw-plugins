@@ -6,10 +6,10 @@
 
 use serde_json::{json, Map, Value};
 
-use auqw_guest_sdk::{http_request, kv_set, GuestError, HttpRequest};
+use auqw_guest_sdk::{http_request, GuestError, HttpRequest};
 
 use crate::candidates::{web_remix_context, web_remix_request, VISITOR_KEY};
-use crate::guest::{bad_payload, failed, load_visitor, payload_keys, warn};
+use crate::guest::{bad_payload, failed, kv_set_soft, load_visitor, payload_keys, warn};
 use crate::parse::{visitor_data, visitor_token};
 
 const SUGGEST_URL: &str = "https://music.youtube.com/youtubei/v1/music/get_search_suggestions?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
@@ -119,7 +119,7 @@ pub async fn suggest(payload: &Value) -> Result<Value, GuestError> {
         })?;
     if let Some(raw) = visitor_data(&body) {
         if let Some(v) = visitor_token(&raw) {
-            kv_set(VISITOR_KEY, Some(v.as_bytes())).await?;
+            kv_set_soft(VISITOR_KEY, Some(v.as_bytes())).await?;
         } else {
             warn("ignoring malformed visitor value").await?;
         }

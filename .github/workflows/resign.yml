@@ -1,0 +1,131 @@
+name: resign
+
+# Re-sign an existing release with the canonical ed25519 key — used when
+# a release dir was staged locally under a different key (the lock in
+# the Auqw repo pins `keyId`, so a release signed elsewhere can never
+# sync until provenance.key_id matches again).
+#
+# Requires the AUQW_PLUGINS_ED25519_KEY repo secret: the keypair JSON
+# ({public_key_pem, private_key_pem} — the same JSON tooling/sign.mjs
+# reads via --key-file). Dispatch against the branch carrying the
+# release dir.
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: 'plugin id (e.g. youtube-music)'
+        required: true
+      version:
+        description: 'release version to re-sign (e.g. 0.4.4)'
+        required: true
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PLUGIN: ${{ inputs.plugin }}
+      VERSION: ${{ inputs.version }}
+      KEY_FILE: ${{ runner.temp }}/keys/auqw-ed25519.json
+      STAGE_DIR: ${{ runner.temp }}/resign-stage
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: validate the dispatch inputs
+        run: |
+          # Both inputs become path components — pin them to the manifest
+          # grammar (the same one tooling/sign.mjs enforces) so a
+          # dispatched string can never walk out of releases/<plugin>/<version>/.
+          [[ "$PLUGIN" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+            || { echo "plugin id must match ^[a-z0-9][a-z0-9-]*$" >&2; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "version must be semver x.y.z" >&2; exit 1; }
+
+      - name: pin the signer to the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # The canonical key must never meet branch-controlled code:
+          # dispatch on a writable branch would run that branch's
+          # sign.mjs with the private key, so a modified signer could
+          # exfiltrate it. The signer's bytes must equal the default
+          # branch's before the key is even materialized.
+          git fetch --depth=1 origin "$DEFAULT_BRANCH"
+          git show "FETCH_HEAD:tooling/sign.mjs" | cmp -s - tooling/sign.mjs \
+            || { echo 'tooling/sign.mjs differs from the default branch — refusing to run it with the release key' >&2; exit 1; }
+
+      - name: materialize the canonical key
+        env:
+          AUQW_PLUGINS_ED25519_KEY: ${{ secrets.AUQW_PLUGINS_ED25519_KEY }}
+        run: |
+          if [ -z "$AUQW_PLUGINS_ED25519_KEY" ]; then
+            echo 'AUQW_PLUGINS_ED25519_KEY is not set in this repo — the canonical keypair JSON belongs here.' >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$KEY_FILE")" && chmod 700 "$(dirname "$KEY_FILE")"
+          printf '%s' "$AUQW_PLUGINS_ED25519_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+      - name: assert the key is the canonical signer
+        run: |
+          # Compare the key_id header line exactly — a substring grep
+          # would match the id appearing anywhere in the output.
+          PUBKEY="$(node tooling/sign.mjs --key-file "$KEY_FILE" pubkey)"
+          echo "$PUBKEY"
+          [ "$(echo "$PUBKEY" | head -n 1)" = 'key_id: 42d8cac606f16c04' ] \
+            || { echo 'secret does not hold the canonical 42d8cac6 key — refusing to re-sign' >&2; exit 1; }
+
+      - name: stage the selected release and re-sign
+        run: |
+          RELEASE_DIR="releases/$PLUGIN/$VERSION"
+          WASM="$RELEASE_DIR/$PLUGIN-$VERSION.wasm"
+          MANIFEST="$RELEASE_DIR/plugin.manifest.json"
+          test -f "$WASM" || { echo "release artifact $WASM missing" >&2; exit 1; }
+          test -f "$MANIFEST" || { echo "release manifest $MANIFEST missing" >&2; exit 1; }
+          # sign reads the manifest inside the plugin dir it is given —
+          # stage THIS release's manifest and wasm so an older release
+          # re-signs against its own pinned digest, not whatever the
+          # source tree's manifest currently says.
+          mkdir -p "$STAGE_DIR/dist"
+          cp "$MANIFEST" "$STAGE_DIR/plugin.manifest.json"
+          cp "$WASM" "$STAGE_DIR/dist/$PLUGIN.wasm"
+          # The release manifest must name the dispatched plugin and
+          # version — signing derives the release path from it, so a
+          # mismatch would overwrite a different release.
+          node -e '
+            const m = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            if (m.id !== process.argv[2] || m.version !== process.argv[3]) {
+              console.error(`release manifest is ${m.id}@${m.version}, not ${process.argv[2]}@${process.argv[3]}`);
+              process.exit(1);
+            }
+          ' "$STAGE_DIR/plugin.manifest.json" "$PLUGIN" "$VERSION"
+          # --force: the release dir already exists — only provenance.json
+          # and signature are rewritten; the wasm bytes are unchanged.
+          node tooling/sign.mjs --key-file "$KEY_FILE" sign "$STAGE_DIR" --force
+          node tooling/sign.mjs --key-file "$KEY_FILE" verify "releases/$PLUGIN/$VERSION"
+
+      - name: commit the re-signed release
+        run: |
+          # Stage before diffing: `git diff` alone ignores untracked
+          # files, so a newly created provenance.json or signature
+          # would be silently skipped and never committed.
+          git add "releases/$PLUGIN/$VERSION"
+          if git diff --cached --quiet -- "releases/$PLUGIN/$VERSION"; then
+            echo 'release unchanged — nothing to commit'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore($PLUGIN): re-sign $VERSION with the canonical release key"
+          git push
+
+      - name: scrub the signing key
+        if: always()
+        run: |
+          # The key materializes on disk for the sign step only — never
+          # leave it readable for later steps or runner state.
+          if [ -f "$KEY_FILE" ]; then
+            shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
+          fi

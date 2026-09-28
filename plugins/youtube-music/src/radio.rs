@@ -13,7 +13,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use auqw_guest_sdk::{http_request, kv_set, GuestError};
+use auqw_guest_sdk::{http_request, GuestError};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,7 +21,9 @@ use serde_json::{json, Value};
 use crate::candidates::{
     duration_ms_of, is_furniture, web_remix_context, web_remix_request, VISITOR_KEY,
 };
-use crate::guest::{bad_payload, failed, is_video_id, load_visitor, payload_keys, warn};
+use crate::guest::{
+    bad_payload, failed, is_video_id, kv_set_soft, load_visitor, payload_keys, warn,
+};
 use crate::parse::{has_whole_word_age, visitor_token, Playability};
 
 const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
@@ -1933,7 +1935,7 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         .filter(|s| !s.is_empty())
     {
         if let Some(visitor) = visitor_token(raw) {
-            kv_set(VISITOR_KEY, Some(visitor.as_bytes())).await?;
+            kv_set_soft(VISITOR_KEY, Some(visitor.as_bytes())).await?;
         } else {
             warn("ignoring malformed visitor value").await?;
         }
