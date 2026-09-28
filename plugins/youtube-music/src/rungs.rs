@@ -38,12 +38,15 @@ impl Rung {
     }
 }
 
-/// The ladder, in fallback order. `VISIONOS` runs first: it resolves
-/// nearly everywhere and almost never bot-checks from residential IPs.
-/// `ANDROID_VR` 1.57.29 — the predecessor plugin's primary context,
-/// proven-bare on real devices with no poToken — runs second so it is
-/// always reached whenever `VISIONOS` walls, before the attestable
-/// `IOS` is the second
+/// The ladder, in fallback order — the attempt order a cold resolve
+/// uses; once KV carries a `ladder/last-good` hint the winning rung
+/// leads (see `guest.rs`), which is what converges a flagged IP onto
+/// the one client that serves it bare. `VISIONOS` runs first
+/// statically: it resolves nearly everywhere and almost never
+/// bot-checks from residential IPs. `ANDROID_VR` 1.57.29 — the
+/// predecessor plugin's primary context, proven-bare on real devices
+/// with no poToken — runs second so it is always reached whenever
+/// `VISIONOS` walls, before the attestable `IOS` is the second
 /// web-attestable rung (occasionally SABR-only on newer versions —
 /// hence the 20.10.4 pin), then `ANDROID_VR` 1.61.29, plain `ANDROID`,
 /// and the Oculus-pinned `ANDROID_VR` trio.
@@ -223,8 +226,9 @@ pub fn append_pot(url: &str, token: &str) -> String {
 /// `url` is HTTPS with host `googlevideo.com` or a subdomain — the same
 /// shape the manifest's `*.googlevideo.com` allowlist admits. The host
 /// still validates the `done` URL; this just avoids leaking the token
-/// into a URL shaped like googlevideo that isn't.
-fn is_googlevideo(url: &str) -> bool {
+/// into a URL shaped like googlevideo that isn't. Also used to skip
+/// probing destinations the allowlist can never admit.
+pub(crate) fn is_googlevideo(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("https://") else {
         return false;
     };
