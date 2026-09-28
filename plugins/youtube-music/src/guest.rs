@@ -260,14 +260,15 @@ fn terminal_or_transport(e: GuestError) -> Result<RungOutcome, GuestError> {
 }
 
 /// A sanitized warning — never carries bodies, URLs, query text, or
-/// video ids. Diagnostics are never a wedge: a `cancelled` host error
-/// still propagates (it is the abort signal, not a logging failure)
-/// and a protocol violation stays fatal, but any other host error on
-/// the log channel is swallowed — a diagnostics path that is down must
-/// not fail the resolve it was annotating.
+/// video ids. Diagnostics are never a wedge: the terminal kinds still
+/// propagate (`cancelled` is the abort signal; `permission-denied` and
+/// `invalid-response` are contract failures a log call can equally
+/// surface), but any other host error on the log channel is swallowed
+/// — a diagnostics path that is down must not fail the resolve it was
+/// annotating.
 pub(crate) async fn warn(message: &str) -> Result<(), GuestError> {
     match log(LogLevel::Warn, message).await {
-        Err(GuestError::Host { kind, message }) if kind == "cancelled" => {
+        Err(GuestError::Host { kind, message }) if is_terminal_kind(&kind) => {
             Err(GuestError::Host { kind, message })
         }
         Err(GuestError::Host { .. }) => Ok(()),
@@ -650,13 +651,17 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // backoff arithmetic is meaningless without it, so its failure is
     // the resolve's failure.
     let now = now_ms().await?;
-    let mut outcomes: Vec<RungOutcome> = Vec::new();
-    // Ladder indices that produced `Bot`, paired with the slot that
-    // verdict occupies in `outcomes` — the attested pass replays only
-    // the attestable ones and overwrites the slot, so a superseded
-    // bot-check can't skew the ladder summary. Includes backoff-derived
-    // entries: a staged bot-backoff is exactly what attestation is for.
-    let mut bot_positions: Vec<(usize, usize)> = Vec::new();
+    // One slot per rung, indexed by static LADDER position: `order`
+    // permutes request scheduling only — the failure summary still
+    // reads the ladder in static order, so a last-good hint can never
+    // change which failure `ladder_error` selects. The attested pass
+    // overwrites a replayed rung's slot with its real verdict, so a
+    // superseded bot-check can't skew the summary either.
+    let mut outcomes: Vec<Option<RungOutcome>> = vec![None; LADDER.len()];
+    // Ladder indices that produced `Bot` — the attested pass replays
+    // only the attestable ones. Includes backoff-derived entries: a
+    // staged bot-backoff is exactly what attestation is for.
+    let mut bot_positions: Vec<usize> = Vec::new();
     let mut pin_seen = false;
     let mut pin_missing = false;
     let mut mint_attempted = false;
@@ -709,7 +714,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // non-attestable client's bot-check is permanent (its wall
             // needs DroidGuard, which a BotGuard mint never produces),
             // so replaying it would be a provably wasted request.
-            if attested && (!rung.attestable || !bot_positions.iter().any(|(rung, _)| *rung == i)) {
+            if attested && (!rung.attestable || !bot_positions.contains(&i)) {
                 continue;
             }
             let backoff_key = format!("backoff/{}/{}", p.video_id, rung.kv_key());
@@ -723,9 +728,9 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         dirty_backoffs[i] = true;
                         let outcome = outcome_for_reason(&reason);
                         if outcome == RungOutcome::Bot {
-                            bot_positions.push((i, outcomes.len()));
+                            bot_positions.push(i);
                         }
-                        outcomes.push(outcome);
+                        outcomes[i] = Some(outcome);
                         continue;
                     }
                 }
@@ -768,7 +773,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             dirty_backoffs[i] = true;
                             stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                         }
-                        record(&mut outcomes, attested, i, &bot_positions, outcome);
+                        outcomes[i] = Some(outcome);
                         continue 'rung;
                     }
                 };
@@ -814,9 +819,9 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     dirty_backoffs[i] = true;
                     stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                 }
-                record(&mut outcomes, attested, i, &bot_positions, outcome);
+                outcomes[i] = Some(outcome);
                 if !attested && outcome == RungOutcome::Bot {
-                    bot_positions.push((i, outcomes.len() - 1));
+                    bot_positions.push(i);
                 }
                 continue;
             }
@@ -839,9 +844,9 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         dirty_backoffs[i] = true;
                         stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                     }
-                    record(&mut outcomes, attested, i, &bot_positions, outcome);
+                    outcomes[i] = Some(outcome);
                     if !attested && outcome == RungOutcome::Bot {
-                        bot_positions.push((i, outcomes.len() - 1));
+                        bot_positions.push(i);
                     }
                     continue;
                 }
@@ -873,13 +878,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 .and_then(Value::as_str)
                 .is_some_and(|id| id != p.video_id)
             {
-                record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::Unavailable,
-                );
+                outcomes[i] = Some(RungOutcome::Unavailable);
                 continue;
             }
             match classify_playability(&body).0 {
@@ -892,34 +891,22 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         "bot-check",
                     )
                     .await?;
-                    record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Bot);
+                    outcomes[i] = Some(RungOutcome::Bot);
                     if !attested {
-                        bot_positions.push((i, outcomes.len() - 1));
+                        bot_positions.push(i);
                     }
                     continue;
                 }
                 Playability::AgeRestricted => {
-                    record(&mut outcomes, attested, i, &bot_positions, RungOutcome::Age);
+                    outcomes[i] = Some(RungOutcome::Age);
                     continue;
                 }
                 Playability::SignInRequired => {
-                    record(
-                        &mut outcomes,
-                        attested,
-                        i,
-                        &bot_positions,
-                        RungOutcome::SignIn,
-                    );
+                    outcomes[i] = Some(RungOutcome::SignIn);
                     continue;
                 }
                 Playability::Unavailable => {
-                    record(
-                        &mut outcomes,
-                        attested,
-                        i,
-                        &bot_positions,
-                        RungOutcome::Unavailable,
-                    );
+                    outcomes[i] = Some(RungOutcome::Unavailable);
                     continue;
                 }
             }
@@ -974,7 +961,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                                         stage_backoff(&backoff_key, now.saturating_add(ms), reason)
                                             .await?;
                                     }
-                                    record(&mut outcomes, attested, i, &bot_positions, outcome);
+                                    outcomes[i] = Some(outcome);
                                 }
                             }
                         }
@@ -995,67 +982,30 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             {
                                 pin_missing = true;
                             }
-                            record(
-                                &mut outcomes,
-                                attested,
-                                i,
-                                &bot_positions,
-                                RungOutcome::NoAudio,
-                            );
+                            outcomes[i] = Some(RungOutcome::NoAudio);
                         }
                     }
                 }
-                FormatOutcome::SabrOnly => record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::SabrOnly,
-                ),
-                FormatOutcome::CipheredOnly => record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::CipheredOnly,
-                ),
-                FormatOutcome::NoAudio => record(
-                    &mut outcomes,
-                    attested,
-                    i,
-                    &bot_positions,
-                    RungOutcome::NoAudio,
-                ),
+                FormatOutcome::SabrOnly => outcomes[i] = Some(RungOutcome::SabrOnly),
+                FormatOutcome::CipheredOnly => outcomes[i] = Some(RungOutcome::CipheredOnly),
+                FormatOutcome::NoAudio => outcomes[i] = Some(RungOutcome::NoAudio),
             }
         }
         // Escalation: bot-checks accumulate a remedy pass. One shared
         // mint — the same video-bound token also decorates picked URLs
         // via `finish_pick`. A denied/failed mint keeps today's
         // terminal outcome.
-        if attested
-            || !bot_positions
-                .iter()
-                .any(|(rung, _)| LADDER[*rung].attestable)
-        {
+        if attested || !bot_positions.iter().any(|&r| LADDER[r].attestable) {
             break;
         }
         if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
             break;
         }
     }
-    Err(ladder_error(&outcomes, pin_missing, pin_seen))
-}
-
-/// A probe transport failure folds to a rung outcome: `permission-
-/// denied` means the destination sat outside the manifest allowlist —
-/// this mint can never serve us, so it books `capped` like a refused
-/// probe rather than aborting the ladder. The terminal kinds and other
-/// weather keep `terminal_or_transport`'s mapping.
-fn probe_error(e: GuestError) -> Result<RungOutcome, GuestError> {
-    match e {
-        GuestError::Host { kind, .. } if kind == "permission-denied" => Ok(RungOutcome::Capped),
-        other => terminal_or_transport(other),
-    }
+    // The taxonomy reads the ladder in static rung order — `order`
+    // scheduled requests only.
+    let seen: Vec<RungOutcome> = outcomes.iter().flatten().copied().collect();
+    Err(ladder_error(&seen, pin_missing, pin_seen))
 }
 
 /// The shared PO token: one video-bound mint per resolve serves both
@@ -1123,7 +1073,10 @@ async fn finish_pick(
     let mut resp = match http_request(probe_request(rung, &picked.url, picked.content_length)).await
     {
         Ok(r) => r,
-        Err(e) => return Ok(PickOutcome::Advance(probe_error(e)?)),
+        // A host denial past the local allowlist check is no longer a
+        // foreign destination — `permission-denied` is a contract
+        // failure and stays terminal, never a capped mint.
+        Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
     };
     // The host never follows redirects — destination policy is enforced
     // on each request — so a 3xx is re-requested through the normal
@@ -1137,7 +1090,7 @@ async fn finish_pick(
         if let Some(target) = target.filter(|t| t.starts_with("https://") && is_googlevideo(t)) {
             match http_request(probe_request(rung, &target, picked.content_length)).await {
                 Ok(r) => resp = r,
-                Err(e) => return Ok(PickOutcome::Advance(probe_error(e)?)),
+                Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
             }
         }
     }
@@ -1260,26 +1213,6 @@ fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<Run
     }
 }
 
-/// Append `outcome` — or, on the attested pass, overwrite the slot the
-/// rung's bare `Bot` verdict occupied. The replay's verdict is the
-/// rung's real answer: keeping the superseded `Bot` would report a
-/// bot-check a successful attestation already answered.
-fn record(
-    outcomes: &mut Vec<RungOutcome>,
-    attested: bool,
-    rung: usize,
-    bot_positions: &[(usize, usize)],
-    outcome: RungOutcome,
-) {
-    if attested {
-        if let Some(&(_, slot)) = bot_positions.iter().find(|(r, _)| *r == rung) {
-            outcomes[slot] = outcome;
-            return;
-        }
-    }
-    outcomes.push(outcome);
-}
-
 /// Map the accumulated outcomes to the terminal taxonomy. Precedence:
 /// rate-limit, a demonstrably missing pinned itag (absent from a usable
 /// response and never seen — seen-but-capped is capped/transport weather), the
@@ -1387,6 +1320,9 @@ mod tests {
         /// the store is advisory, so non-terminal kinds must degrade
         /// rather than wedge, and terminal kinds must still abort.
         kv_error: Option<&'static str>,
+        /// Same for the log channel: `warn` must swallow weather but
+        /// never the terminal kinds.
+        log_error: Option<&'static str>,
     }
 
     impl Harness {
@@ -1399,6 +1335,7 @@ mod tests {
                 logs: Vec::new(),
                 now: NOW,
                 kv_error: None,
+                log_error: None,
             }
         }
 
@@ -1467,6 +1404,9 @@ mod tests {
                                     .and_then(|s| B64.decode(s).ok());
                                 self.staged.insert(key, value);
                                 out = step(&json!({ "type": "host_ok", "id": id }));
+                            }
+                            "log" if self.log_error.is_some() => {
+                                out = step(&host_error(id, self.log_error.unwrap_or("transient")));
                             }
                             "log" => {
                                 self.logs.push(
@@ -3214,6 +3154,49 @@ mod tests {
     }
 
     #[test]
+    fn hinted_order_keeps_the_static_failure_taxonomy() {
+        // The hint permutes requests, never the verdict: rung 7 walled
+        // and every other rung unavailable reads exactly like the cold
+        // order — the last STATIC outcome (rung 7's bot-check), not the
+        // last attempt-order one.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
+        let mut out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 7);
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        for expected in 0..7usize {
+            assert_eq!(rung_of(&out), expected);
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
+    }
+
+    #[test]
+    fn hinted_restricted_rung_keeps_the_static_reason() {
+        // Same rule for the all-restricted summary: the message names
+        // the first STATIC rung's verdict, not the hinted rung's —
+        // sabr-only either way, hinted or cold.
+        let mut h = Harness::new();
+        h.committed
+            .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
+        let mut out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 7);
+        out = feed(&mut h, &out, CIPHERED);
+        for expected in 0..7usize {
+            assert_eq!(rung_of(&out), expected);
+            out = feed(&mut h, &out, SABR);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("unsupported".to_string(), "sabr-only".to_string())
+        );
+    }
+
+    #[test]
     fn transient_kv_failures_never_wedge() {
         // Every KV call answering non-terminal weather degrades the
         // advisory namespace to empty-store behavior: the resolve still
@@ -3239,6 +3222,26 @@ mod tests {
     }
 
     #[test]
+    fn warn_channel_swallows_weather_not_terminal_kinds() {
+        // Transient log weather degrades to swallowed diagnostics —
+        // the stale-hint warning is dropped and the resolve walks on.
+        let mut h = Harness::new();
+        h.log_error = Some("transient");
+        h.committed
+            .insert("ladder/last-good".into(), b"DEAD_RUNG".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(rung_of(&out), 0);
+        // A contract violation on the same channel stays terminal — a
+        // log path answering `invalid-response` must still abort.
+        let mut h = Harness::new();
+        h.log_error = Some("invalid-response");
+        h.committed
+            .insert("ladder/last-good".into(), b"DEAD_RUNG".to_vec());
+        let out = h.invoke(json!({ "source_ref": VID }));
+        assert_eq!(fail_kind(&out).0, "invalid-response");
+    }
+
+    #[test]
     fn foreign_pick_url_is_capped_not_probed() {
         // A minted URL outside the `*.googlevideo.com` allowlist can
         // never be served — book the pick capped without spending a
@@ -3254,15 +3257,17 @@ mod tests {
     }
 
     #[test]
-    fn probe_permission_denied_advances() {
-        // A probe destination the host denies is a mint that cannot
-        // serve us — the rung's own outcome, not a resolve-level abort.
+    fn probe_permission_denied_is_terminal() {
+        // The picked URL already passed the local allowlist check, so
+        // a host `permission-denied` is a contract failure — the
+        // resolve reports it rather than booking a capped mint and
+        // walking on to `streams-capped`.
         let mut h = Harness::new();
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
         let out = h.answer_host_error(&out, "permission-denied");
-        assert_eq!(rung_of(&out), 1);
+        assert_eq!(fail_kind(&out).0, "permission-denied");
     }
 
     #[test]

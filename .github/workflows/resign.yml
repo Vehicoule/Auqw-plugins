@@ -29,8 +29,19 @@ jobs:
       PLUGIN: ${{ inputs.plugin }}
       VERSION: ${{ inputs.version }}
       KEY_FILE: ${{ runner.temp }}/keys/auqw-ed25519.json
+      STAGE_DIR: ${{ runner.temp }}/resign-stage
     steps:
       - uses: actions/checkout@v4
+
+      - name: validate the dispatch inputs
+        run: |
+          # Both inputs become path components — pin them to the manifest
+          # grammar (the same one tooling/sign.mjs enforces) so a
+          # dispatched string can never walk out of releases/<plugin>/<version>/.
+          [[ "$PLUGIN" =~ ^[a-z0-9][a-z0-9-]*$ ]] \
+            || { echo "plugin id must match ^[a-z0-9][a-z0-9-]*$" >&2; exit 1; }
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "version must be semver x.y.z" >&2; exit 1; }
 
       - name: materialize the canonical key
         env:
@@ -50,17 +61,34 @@ jobs:
           node tooling/sign.mjs --key-file "$KEY_FILE" pubkey | grep -q '42d8cac606f16c04' \
             || { echo 'secret does not hold the canonical 42d8cac6 key — refusing to re-sign' >&2; exit 1; }
 
-      - name: stage the released artifact and re-sign
+      - name: stage the selected release and re-sign
         run: |
-          WASM="releases/$PLUGIN/$VERSION/$PLUGIN-$VERSION.wasm"
+          RELEASE_DIR="releases/$PLUGIN/$VERSION"
+          WASM="$RELEASE_DIR/$PLUGIN-$VERSION.wasm"
+          MANIFEST="$RELEASE_DIR/plugin.manifest.json"
           test -f "$WASM" || { echo "release artifact $WASM missing" >&2; exit 1; }
-          mkdir -p "plugins/$PLUGIN/dist"
-          cp "$WASM" "plugins/$PLUGIN/dist/$PLUGIN.wasm"
+          test -f "$MANIFEST" || { echo "release manifest $MANIFEST missing" >&2; exit 1; }
+          # sign reads the manifest inside the plugin dir it is given —
+          # stage THIS release's manifest and wasm so an older release
+          # re-signs against its own pinned digest, not whatever the
+          # source tree's manifest currently says.
+          mkdir -p "$STAGE_DIR/dist"
+          cp "$MANIFEST" "$STAGE_DIR/plugin.manifest.json"
+          cp "$WASM" "$STAGE_DIR/dist/$PLUGIN.wasm"
+          # The release manifest must name the dispatched plugin and
+          # version — signing derives the release path from it, so a
+          # mismatch would overwrite a different release.
+          node -e '
+            const m = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            if (m.id !== process.argv[2] || m.version !== process.argv[3]) {
+              console.error(`release manifest is ${m.id}@${m.version}, not ${process.argv[2]}@${process.argv[3]}`);
+              process.exit(1);
+            }
+          ' "$STAGE_DIR/plugin.manifest.json" "$PLUGIN" "$VERSION"
           # --force: the release dir already exists — only provenance.json
           # and signature are rewritten; the wasm bytes are unchanged.
-          node tooling/sign.mjs --key-file "$KEY_FILE" sign "plugins/$PLUGIN" --force
+          node tooling/sign.mjs --key-file "$KEY_FILE" sign "$STAGE_DIR" --force
           node tooling/sign.mjs --key-file "$KEY_FILE" verify "releases/$PLUGIN/$VERSION"
-          rm -f "plugins/$PLUGIN/dist/$PLUGIN.wasm"
 
       - name: commit the re-signed release
         run: |
@@ -73,3 +101,12 @@ jobs:
           git add "releases/$PLUGIN/$VERSION"
           git commit -m "chore($PLUGIN): re-sign $VERSION with the canonical release key"
           git push
+
+      - name: scrub the signing key
+        if: always()
+        run: |
+          # The key materializes on disk for the sign step only — never
+          # leave it readable for later steps or runner state.
+          if [ -f "$KEY_FILE" ]; then
+            shred -u "$KEY_FILE" 2>/dev/null || rm -f "$KEY_FILE"
+          fi
