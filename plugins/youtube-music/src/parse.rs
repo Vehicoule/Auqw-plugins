@@ -175,6 +175,10 @@ pub struct PickOptions<'a> {
     /// Exact itag requirement — `Some` picks only that itag, never a
     /// fallback.
     pub pin_itag: Option<u32>,
+    /// Extra admissibility bar on the format URL beyond https — the
+    /// caller's serving contract (e.g. the manifest allowlist shape).
+    /// `None` accepts any https URL.
+    pub url_ok: Option<fn(&str) -> bool>,
 }
 
 /// A format's itag as `u32`, from either the numeric or the
@@ -187,10 +191,11 @@ fn itag_of(format: &Value) -> Option<u32> {
 }
 
 /// Pick the best plain audio format. Audio-only, plain-HTTPS-URL
-/// formats are eligible; ciphered rows never are. When `pin_itag` is
-/// set only that exact itag can pick. Ranking: preferred MIME base
-/// first (unlisted bases after all listed), then absolute bitrate
-/// distance to the target, then stable upstream order.
+/// formats passing `url_ok` are eligible; ciphered rows never are.
+/// When `pin_itag` is set only that exact itag can pick. Ranking:
+/// preferred MIME base first (unlisted bases after all listed), then
+/// absolute bitrate distance to the target, then stable upstream
+/// order.
 pub fn pick_audio(body: &Value, options: PickOptions<'_>) -> Option<Picked> {
     let formats = body
         .pointer("/streamingData/adaptiveFormats")
@@ -202,13 +207,19 @@ pub fn pick_audio(body: &Value, options: PickOptions<'_>) -> Option<Picked> {
         if !mime.starts_with("audio/") {
             continue;
         }
-        if format
-            .get("url")
-            .and_then(Value::as_str)
-            .is_none_or(|u| !u.starts_with("https://"))
-        {
-            // The host only serves https:// destinations — a non-https
-            // format is unusable, not a reason to kill the resolve.
+        let Some(url) = format.get("url").and_then(Value::as_str) else {
+            continue;
+        };
+        // The host only serves https:// destinations — a non-https
+        // format is unusable, not a reason to kill the resolve.
+        if !url.starts_with("https://") {
+            continue;
+        }
+        // A URL outside the caller's serving contract (e.g. off the
+        // manifest allowlist) is inadmissible: filter before ranking
+        // so an unservable top pick can't starve servable formats in
+        // the same response.
+        if options.url_ok.is_some_and(|ok| !ok(url)) {
             continue;
         }
         if let Some(pin) = options.pin_itag {
@@ -452,6 +463,7 @@ mod tests {
             target_bitrate_kbps: 128,
             prefer: &["audio/mp4", "audio/webm"],
             pin_itag: None,
+            url_ok: None,
         }
     }
 
@@ -519,6 +531,39 @@ mod tests {
             panic!("expected a pick");
         };
         assert_eq!(p.itag, Some(139));
+    }
+
+    #[test]
+    fn url_ok_filters_before_ranking() {
+        // The best-ranked format fails the serving bar — the pick
+        // falls to the next admissible format rather than returning
+        // the unservable one.
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"itag": 140, "mimeType": "audio/mp4", "bitrate": 130000, "url": "https://cdn.example.com/v.mp4"},
+                {"itag": 251, "mimeType": "audio/webm", "bitrate": 131000, "url": "https://rr1---sn-x.googlevideo.com/h"}
+            ]}
+        });
+        let Some(p) = pick_audio(
+            &body,
+            PickOptions {
+                url_ok: Some(|u| u.contains("googlevideo.com")),
+                ..default_opts()
+            },
+        ) else {
+            panic!("expected a pick");
+        };
+        assert_eq!(p.itag, Some(251));
+    }
+
+    #[test]
+    fn url_ok_none_keeps_any_https_eligible() {
+        let body = serde_json::json!({
+            "streamingData": { "adaptiveFormats": [
+                {"itag": 140, "mimeType": "audio/mp4", "bitrate": 130000, "url": "https://cdn.example.com/v.mp4"}
+            ]}
+        });
+        assert!(pick_audio(&body, default_opts()).is_some());
     }
 
     #[test]

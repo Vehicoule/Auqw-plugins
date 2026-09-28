@@ -43,6 +43,19 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "version must be semver x.y.z" >&2; exit 1; }
 
+      - name: pin the signer to the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # The canonical key must never meet branch-controlled code:
+          # dispatch on a writable branch would run that branch's
+          # sign.mjs with the private key, so a modified signer could
+          # exfiltrate it. The signer's bytes must equal the default
+          # branch's before the key is even materialized.
+          git fetch --depth=1 origin "$DEFAULT_BRANCH"
+          git show "FETCH_HEAD:tooling/sign.mjs" | cmp -s - tooling/sign.mjs \
+            || { echo 'tooling/sign.mjs differs from the default branch — refusing to run it with the release key' >&2; exit 1; }
+
       - name: materialize the canonical key
         env:
           AUQW_PLUGINS_ED25519_KEY: ${{ secrets.AUQW_PLUGINS_ED25519_KEY }}
@@ -57,8 +70,11 @@ jobs:
 
       - name: assert the key is the canonical signer
         run: |
-          node tooling/sign.mjs --key-file "$KEY_FILE" pubkey
-          node tooling/sign.mjs --key-file "$KEY_FILE" pubkey | grep -q '42d8cac606f16c04' \
+          # Compare the key_id header line exactly — a substring grep
+          # would match the id appearing anywhere in the output.
+          PUBKEY="$(node tooling/sign.mjs --key-file "$KEY_FILE" pubkey)"
+          echo "$PUBKEY"
+          [ "$(echo "$PUBKEY" | head -n 1)" = 'key_id: 42d8cac606f16c04' ] \
             || { echo 'secret does not hold the canonical 42d8cac6 key — refusing to re-sign' >&2; exit 1; }
 
       - name: stage the selected release and re-sign
@@ -92,13 +108,16 @@ jobs:
 
       - name: commit the re-signed release
         run: |
-          if git diff --quiet -- "releases/$PLUGIN/$VERSION"; then
+          # Stage before diffing: `git diff` alone ignores untracked
+          # files, so a newly created provenance.json or signature
+          # would be silently skipped and never committed.
+          git add "releases/$PLUGIN/$VERSION"
+          if git diff --cached --quiet -- "releases/$PLUGIN/$VERSION"; then
             echo 'release unchanged — nothing to commit'
             exit 0
           fi
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add "releases/$PLUGIN/$VERSION"
           git commit -m "chore($PLUGIN): re-sign $VERSION with the canonical release key"
           git push
 

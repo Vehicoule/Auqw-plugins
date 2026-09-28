@@ -919,6 +919,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             target_bitrate_kbps: p.target_bitrate_kbps,
                             prefer: &prefer,
                             pin_itag: p.pin_itag,
+                            // Rank only what the sandbox can serve —
+                            // a foreign-host top pick must not starve
+                            // the googlevideo formats behind it.
+                            url_ok: Some(is_googlevideo),
                         },
                     ) {
                         Some(picked) => {
@@ -966,23 +970,49 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                             }
                         }
                         None => {
-                            // A failed player request cannot establish that
-                            // the pin disappeared. Require a usable format
-                            // from this response when the pin is removed.
-                            if p.pin_itag.is_some()
-                                && pick_audio(
-                                    &body,
-                                    PickOptions {
-                                        target_bitrate_kbps: p.target_bitrate_kbps,
-                                        prefer: &prefer,
-                                        pin_itag: None,
-                                    },
-                                )
-                                .is_some()
+                            // Nothing servable ranked — was the
+                            // response bare of plain audio, or was its
+                            // audio all on hosts the sandbox can never
+                            // serve? Re-pick without the host bar to
+                            // tell them apart: all-foreign books the
+                            // capped mint it is, not a no-audio rung.
+                            if pick_audio(
+                                &body,
+                                PickOptions {
+                                    target_bitrate_kbps: p.target_bitrate_kbps,
+                                    prefer: &prefer,
+                                    pin_itag: p.pin_itag,
+                                    url_ok: None,
+                                },
+                            )
+                            .is_some()
                             {
-                                pin_missing = true;
+                                // The pinned itag exists but its mint
+                                // is unreachable — seen, not missing.
+                                if p.pin_itag.is_some() {
+                                    pin_seen = true;
+                                }
+                                outcomes[i] = Some(RungOutcome::Capped);
+                            } else {
+                                // A failed player request cannot establish that
+                                // the pin disappeared. Require a usable format
+                                // from this response when the pin is removed.
+                                if p.pin_itag.is_some()
+                                    && pick_audio(
+                                        &body,
+                                        PickOptions {
+                                            target_bitrate_kbps: p.target_bitrate_kbps,
+                                            prefer: &prefer,
+                                            pin_itag: None,
+                                            url_ok: None,
+                                        },
+                                    )
+                                    .is_some()
+                                {
+                                    pin_missing = true;
+                                }
+                                outcomes[i] = Some(RungOutcome::NoAudio);
                             }
-                            outcomes[i] = Some(RungOutcome::NoAudio);
                         }
                     }
                 }
@@ -3242,15 +3272,38 @@ mod tests {
     }
 
     #[test]
-    fn foreign_pick_url_is_capped_not_probed() {
-        // A minted URL outside the `*.googlevideo.com` allowlist can
-        // never be served — book the pick capped without spending a
-        // doomed probe request, and advance to the next rung.
+    fn foreign_top_pick_falls_back_to_servable_format() {
+        // The best-ranked format sits off the allowlist but other
+        // googlevideo audio remains in the same response — the rung
+        // must try it rather than abandoning the response as capped.
         let mut h = Harness::new();
         let out = begin(&mut h);
         let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
         body["streamingData"]["adaptiveFormats"][3]["url"] =
             json!("https://cdn.example.com/v.mp4?expire=1893456000&itag=140");
+        let out = feed(&mut h, &out, &body.to_string());
+        // The probe goes to the next servable format (itag 251) — no
+        // capped advance, no request spent on the foreign URL.
+        assert_eq!(out["type"], "host_request");
+        assert_eq!(out["payload"]["method"], "GET");
+        assert!(url_of(&out).contains("itag=251"), "{}", url_of(&out));
+    }
+
+    #[test]
+    fn foreign_pick_url_is_capped_not_probed() {
+        // Every minted URL outside the `*.googlevideo.com` allowlist
+        // can never be served — an all-foreign response books the rung
+        // capped without spending a doomed probe request, and advances
+        // to the next rung.
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
+        let Some(fmts) = body["streamingData"]["adaptiveFormats"].as_array_mut() else {
+            panic!("fixture has no adaptiveFormats");
+        };
+        for f in fmts {
+            f["url"] = json!("https://cdn.example.com/v.mp4?expire=1893456000&itag=140");
+        }
         let out = feed(&mut h, &out, &body.to_string());
         // No GET probe was emitted — the next request is rung 1's POST.
         assert_eq!(rung_of(&out), 1);
