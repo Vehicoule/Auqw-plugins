@@ -1233,16 +1233,32 @@ impl<'de> Deserialize<'de> for ThumbSet {
                     drain_skip_seq(&mut s)?;
                     return Ok(ThumbSet(None));
                 };
-                let mut best = None;
+                // DOM order: every element's own url/width/height
+                // candidate (array order) before ANY element's
+                // subtree — merging each node's own+inner eagerly
+                // would let an earlier element's nested art beat a
+                // later element's own entry on equal area.
+                let mut owns = Vec::new();
+                let mut inners = Vec::new();
                 loop {
                     if !scan_depth::node() {
                         drain_skip_seq(&mut s)?;
                         break;
                     }
                     match s.next_element::<ThumbNode>()? {
-                        Some(ThumbNode(node)) => merge_art(&mut best, node),
+                        Some(node) => {
+                            owns.push(node.own);
+                            inners.push(node.inner);
+                        }
                         None => break,
                     }
+                }
+                let mut best = None;
+                for own in owns {
+                    offer_art(&mut best, own);
+                }
+                for inner in inners {
+                    merge_art(&mut best, inner);
                 }
                 Ok(ThumbSet(best))
             }
@@ -1285,10 +1301,30 @@ impl<'de> Deserialize<'de> for ThumbSet {
     }
 }
 
-/// One element of a `thumbnails` array: `url`/`width`/`height` make it
-/// a candidate, and its remaining keys — including nested
-/// `thumbnails` — are still walked for deeper art.
-struct ThumbNode(Option<(u64, Thumb)>);
+/// One element of a `thumbnails` array: `url`/`width`/`height` make
+/// `own` the element's candidate, and its remaining keys — including
+/// nested `thumbnails` — are walked for deeper art into `inner`. The
+/// halves stay separate so ThumbSet can offer every element's own
+/// candidate (array order) before merging any element's subtree —
+/// the DOM walk's order, where a later element's own entry ties
+/// ahead of an earlier element's nested art, not behind it.
+struct ThumbNode {
+    own: Thumb,
+    inner: Option<(u64, Thumb)>,
+}
+
+impl ThumbNode {
+    fn empty() -> Self {
+        ThumbNode {
+            own: Thumb {
+                url: None,
+                width: None,
+                height: None,
+            },
+            inner: None,
+        }
+    }
+}
 
 impl<'de> Deserialize<'de> for ThumbNode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
@@ -1301,7 +1337,7 @@ impl<'de> Deserialize<'de> for ThumbNode {
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<ThumbNode, A::Error> {
                 let Some(_guard) = scan_depth::enter() else {
                     drain_skip_map(&mut m)?;
-                    return Ok(ThumbNode(None));
+                    return Ok(ThumbNode::empty());
                 };
                 let mut url = OptStr::default();
                 let mut width = OptU64::default();
@@ -1332,25 +1368,23 @@ impl<'de> Deserialize<'de> for ThumbNode {
                 note_key(&mut inner, Cow::Borrowed("url"), url.art_out());
                 note_key(&mut inner, Cow::Borrowed("width"), width.art_out());
                 note_key(&mut inner, Cow::Borrowed("height"), height.art_out());
-                // The old walk offered the element itself before
-                // descending into it — on equal area the outer
-                // candidate wins the tie.
-                let mut art = None;
-                offer_art(
-                    &mut art,
-                    Thumb {
+                // `own` returns unmerged — ThumbSet offers every
+                // element's own candidate before any element's
+                // subtree, so the outer candidate still wins ties
+                // against this element's nested art.
+                Ok(ThumbNode {
+                    own: Thumb {
                         url: url.v.clone(),
                         width: width.v,
                         height: height.v,
                     },
-                );
-                merge_art(&mut art, merge_keyed(inner));
-                Ok(ThumbNode(art))
+                    inner: merge_keyed(inner),
+                })
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut s: A) -> Result<ThumbNode, A::Error> {
                 let Some(_guard) = scan_depth::enter() else {
                     drain_skip_seq(&mut s)?;
-                    return Ok(ThumbNode(None));
+                    return Ok(ThumbNode::empty());
                 };
                 let mut best = None;
                 loop {
@@ -1363,31 +1397,40 @@ impl<'de> Deserialize<'de> for ThumbNode {
                         None => break,
                     }
                 }
-                Ok(ThumbNode(best))
+                // A bare array element carries no url of its own — all
+                // its art is subtree.
+                Ok(ThumbNode {
+                    own: Thumb {
+                        url: None,
+                        width: None,
+                        height: None,
+                    },
+                    inner: best,
+                })
             }
             fn visit_bool<E>(self, _v: bool) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_i64<E>(self, _v: i64) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_u64<E>(self, _v: u64) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_f64<E>(self, _v: f64) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_str<E>(self, _v: &str) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_string<E>(self, _v: String) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_unit<E>(self) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_none<E>(self) -> Result<ThumbNode, E> {
-                Ok(ThumbNode(None))
+                Ok(ThumbNode::empty())
             }
             fn visit_some<D2: serde::Deserializer<'de>>(
                 self,

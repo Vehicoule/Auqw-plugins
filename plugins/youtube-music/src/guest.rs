@@ -605,18 +605,25 @@ fn unreadable_body_outcome(body: &[u8]) -> RungOutcome {
 /// Is this response the bot wall — in any of its three shapes: a
 /// non-2xx refusal (`refusal_outcome`), a 2xx JSON envelope whose
 /// `playabilityStatus` is a bot-check, or a 2xx body that is not a
-/// readable envelope at all (`unreadable_body_outcome`)? Used to
-/// decide whether a replayed visitor is worth dropping for a bare
+/// readable envelope at all (`unreadable_body_outcome`)? `parsed` is
+/// the caller's already-parsed 2xx body — the send loop parses once
+/// and the wall check and post-loop extraction share that Value, so a
+/// `None` here is the same unreadable body the post-loop books. Used
+/// to decide whether a replayed visitor is worth dropping for a bare
 /// re-ask — replayed state is suspect under every wall shape.
-fn walled_by_bot(resp: &HttpResponse) -> bool {
+fn walled_by_bot(resp: &HttpResponse, parsed: Option<&Value>) -> bool {
     if (200..300).contains(&resp.status) {
-        let body = resp
-            .body
-            .strip_prefix(b"\xEF\xBB\xBF")
-            .unwrap_or(&resp.body);
-        match serde_json::from_slice::<Value>(body) {
-            Ok(b) => classify_playability(&b).0 == Playability::BotCheck,
-            Err(_) => unreadable_body_outcome(body) == RungOutcome::Bot,
+        match parsed {
+            Some(b) => classify_playability(b).0 == Playability::BotCheck,
+            // The send loop's parse failed — classify the same
+            // BOM-stripped bytes it read.
+            None => {
+                unreadable_body_outcome(
+                    resp.body
+                        .strip_prefix(b"\xEF\xBB\xBF")
+                        .unwrap_or(&resp.body),
+                ) == RungOutcome::Bot
+            }
         }
     } else {
         refusal_outcome(resp) == RungOutcome::Bot
@@ -756,7 +763,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // so the value would wall this rung on every later resolve
             // too, and the attested pass replays the same one.
             let mut dropped_visitor = false;
-            let resp = 'request: loop {
+            let (resp, parsed_body) = 'request: loop {
                 let sent = http_request(player_request(
                     rung,
                     &p.video_id,
@@ -780,7 +787,20 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 if r.status == 401 && access_token.take().is_some() {
                     continue 'request;
                 }
-                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&r) {
+                // Parse a 2xx body ONCE per send — the wall check below
+                // and the post-loop playability/visitor/format pipeline
+                // share this Value; a second DOM walk of the same bytes
+                // is pure fuel against the shared per-entry budget.
+                let parsed = if (200..300).contains(&r.status) {
+                    serde_json::from_slice::<Value>(
+                        r.body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&r.body),
+                    )
+                    .ok()
+                } else {
+                    None
+                };
+                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&r, parsed.as_ref())
+                {
                     dropped_visitor = true;
                     // Drop the suspect state everywhere it can persist —
                     // all deletions are staged and commit on `done`, so
@@ -808,7 +828,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     rung_visitor = None;
                     continue 'request;
                 }
-                break 'request r;
+                break 'request (r, parsed);
             };
             if !(200..300).contains(&resp.status) {
                 let outcome = refusal_outcome(&resp);
@@ -832,13 +852,12 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // Booking it like the refusal path keeps an edge-shaped OK
             // in the same taxonomy: Bot stages the backoff and the
             // attested-replay slot; Transport marks weather.
-            let stripped = resp
-                .body
-                .strip_prefix(b"\xEF\xBB\xBF")
-                .unwrap_or(&resp.body);
-            let body: Value = match serde_json::from_slice(stripped) {
-                Ok(body) => body,
-                Err(_) => {
+            // `parsed_body` is the one parse the send loop already ran
+            // on the BOM-stripped bytes — `None` is exactly that
+            // unreadable body.
+            let body: Value = match parsed_body {
+                Some(body) => body,
+                None => {
                     let outcome = unreadable_body_outcome(&resp.body);
                     if let Some((reason, ms)) = backoff_for(outcome) {
                         dirty_backoffs[i] = true;
