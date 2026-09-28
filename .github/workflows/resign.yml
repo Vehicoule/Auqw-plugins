@@ -1,0 +1,75 @@
+name: resign
+
+# Re-sign an existing release with the canonical ed25519 key — used when
+# a release dir was staged locally under a different key (the lock in
+# the Auqw repo pins `keyId`, so a release signed elsewhere can never
+# sync until provenance.key_id matches again).
+#
+# Requires the AUQW_PLUGINS_ED25519_KEY repo secret: the keypair JSON
+# ({public_key_pem, private_key_pem} — the same JSON tooling/sign.mjs
+# reads via --key-file). Dispatch against the branch carrying the
+# release dir.
+
+on:
+  workflow_dispatch:
+    inputs:
+      plugin:
+        description: 'plugin id (e.g. youtube-music)'
+        required: true
+      version:
+        description: 'release version to re-sign (e.g. 0.4.4)'
+        required: true
+
+jobs:
+  resign:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      PLUGIN: ${{ inputs.plugin }}
+      VERSION: ${{ inputs.version }}
+      KEY_FILE: ${{ runner.temp }}/keys/auqw-ed25519.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: materialize the canonical key
+        env:
+          AUQW_PLUGINS_ED25519_KEY: ${{ secrets.AUQW_PLUGINS_ED25519_KEY }}
+        run: |
+          if [ -z "$AUQW_PLUGINS_ED25519_KEY" ]; then
+            echo 'AUQW_PLUGINS_ED25519_KEY is not set in this repo — the canonical keypair JSON belongs here.' >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$KEY_FILE")" && chmod 700 "$(dirname "$KEY_FILE")"
+          printf '%s' "$AUQW_PLUGINS_ED25519_KEY" > "$KEY_FILE"
+          chmod 600 "$KEY_FILE"
+
+      - name: assert the key is the canonical signer
+        run: |
+          node tooling/sign.mjs --key-file "$KEY_FILE" pubkey
+          node tooling/sign.mjs --key-file "$KEY_FILE" pubkey | grep -q '42d8cac606f16c04' \
+            || { echo 'secret does not hold the canonical 42d8cac6 key — refusing to re-sign' >&2; exit 1; }
+
+      - name: stage the released artifact and re-sign
+        run: |
+          WASM="releases/$PLUGIN/$VERSION/$PLUGIN-$VERSION.wasm"
+          test -f "$WASM" || { echo "release artifact $WASM missing" >&2; exit 1; }
+          mkdir -p "plugins/$PLUGIN/dist"
+          cp "$WASM" "plugins/$PLUGIN/dist/$PLUGIN.wasm"
+          # --force: the release dir already exists — only provenance.json
+          # and signature are rewritten; the wasm bytes are unchanged.
+          node tooling/sign.mjs --key-file "$KEY_FILE" sign "plugins/$PLUGIN" --force
+          node tooling/sign.mjs --key-file "$KEY_FILE" verify "releases/$PLUGIN/$VERSION"
+          rm -f "plugins/$PLUGIN/dist/$PLUGIN.wasm"
+
+      - name: commit the re-signed release
+        run: |
+          if git diff --quiet -- "releases/$PLUGIN/$VERSION"; then
+            echo 'release unchanged — nothing to commit'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "releases/$PLUGIN/$VERSION"
+          git commit -m "chore($PLUGIN): re-sign $VERSION with the canonical release key"
+          git push
