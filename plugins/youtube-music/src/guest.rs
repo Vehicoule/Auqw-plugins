@@ -23,8 +23,8 @@ use crate::parse::{
     PickOptions, Playability,
 };
 use crate::rungs::{
-    append_pot, is_googlevideo, player_request, probe_request, LADDER, PROBE_FALLBACK_START,
-    PROBE_TAIL_BYTES,
+    append_pot, is_googlevideo, player_request, probe_request, LADDER, PROBE_FALLBACK_BYTES,
+    PROBE_FALLBACK_START, PROBE_TAIL_BYTES,
 };
 
 /// Backoff windows staged for a failed rung, keyed by reason.
@@ -1220,7 +1220,7 @@ fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<Run
                 // The fallback window ends past the ~1 MiB horizon, so
                 // the whole asked span — or an earlier reported EOF —
                 // proves the mint serves beyond it.
-                None => reached_eof || end == start_asked + PROBE_TAIL_BYTES - 1,
+                None => reached_eof || end == start_asked + PROBE_FALLBACK_BYTES - 1,
             };
             let span_carried = end
                 .checked_sub(start)
@@ -1552,24 +1552,25 @@ mod tests {
     }
 
     /// Assert `out` is a GET tail probe for the OK fixture's pick
-    /// (`contentLength` 4,557,665 → last 64 KiB) and return `out`.
+    /// (`contentLength` 4,557,665 → the file's last byte) and return
+    /// `out`.
     fn probe_of(out: &Value) {
         assert_eq!(out["type"], "host_request");
         assert_eq!(out["payload"]["method"], "GET");
         assert_eq!(
             header_of(out, "Range").as_deref(),
-            Some("bytes=4492129-4557664")
+            Some("bytes=4557664-4557664")
         );
     }
 
-    /// The honest 206 for the OK fixture's pick: tail
-    /// `4492129-4557664`, span 64 KiB.
+    /// The honest 206 for the OK fixture's pick: the last byte
+    /// `4557664-4557664`, span 1.
     fn answer_probe_206(h: &mut Harness, out: &Value) -> Value {
         h.answer_headers(
             out,
             206,
-            &[("Content-Range", "bytes 4492129-4557664/4557665")],
-            65536,
+            &[("Content-Range", "bytes 4557664-4557664/4557665")],
+            1,
         )
     }
 
@@ -1873,11 +1874,14 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
+        // Right start, but the reported total runs one byte past the
+        // manifest's length — the range never reaches the file's real
+        // last byte, so it proves nothing about serving past a horizon.
         let out = h.answer_headers(
             &out,
             206,
-            &[("Content-Range", "bytes 4492129-4557663/4557665")],
-            65535,
+            &[("Content-Range", "bytes 4557664-4557664/4557666")],
+            1,
         );
         assert_eq!(rung_of(&out), 1);
     }
@@ -1888,11 +1892,30 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
+        // The echoed range claims the last byte but the body is empty —
+        // a truncated answer carries no evidence.
         let out = h.answer_headers(
             &out,
             206,
-            &[("Content-Range", "bytes 4492129-4557664/4557665")],
-            1024,
+            &[("Content-Range", "bytes 4557664-4557664/4557665")],
+            0,
+        );
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_oversized_body_is_capped() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // A body wider than the asked span is a mismatch too — the
+        // verdict keys on the exact span, not "at least the span".
+        let out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 4557664-4557664/4557665")],
+            2,
         );
         assert_eq!(rung_of(&out), 1);
     }

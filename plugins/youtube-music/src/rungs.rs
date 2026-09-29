@@ -257,14 +257,22 @@ fn url_query_value(value: &str) -> String {
     out
 }
 
-/// Bytes requested by a minted-URL probe: the file's last 64 KiB.
-/// Strict-mode mints carry a served horizon H (~1 MiB, varies per
-/// mint): windows must end at or below H. A tail window ends at the
-/// file's last byte, so a 206 proves this mint serves the whole file;
-/// a 403 marks the rung capped. When `contentLength` is unknown the
-/// probe falls back to a window past the most-observed ~1 MiB horizon
-/// — a weaker guarantee (a higher H can still pass and cap later).
-pub const PROBE_TAIL_BYTES: u64 = 65536;
+/// The tail probe's Range header asks for exactly the file's last
+/// byte. Strict-mode mints carry a served horizon H (~1 MiB, varies
+/// per mint): windows must end at or below H. Any ask ending at the
+/// file's last byte proves the same verdict — a 206 means this mint
+/// serves the whole file, a refusal marks the rung capped — and the
+/// 1-byte span keeps the proof off the resolve's critical path: the
+/// verdict needs the range's END at EOF, not its width, so the 64 KiB
+/// tail only ever bought transfer time, never evidence. When
+/// `contentLength` is unknown the probe falls back to a window past
+/// the most-observed ~1 MiB horizon — a weaker guarantee (a higher H
+/// can still pass and cap later), and the one place the span still
+/// carries weight: the window must extend past H, so the fallback
+/// keeps its 64 KiB width.
+pub const PROBE_TAIL_BYTES: u64 = 1;
+/// Span of the fallback probe window (64 KiB).
+pub const PROBE_FALLBACK_BYTES: u64 = 65536;
 /// First byte of the fallback probe window (1 MiB in).
 pub const PROBE_FALLBACK_START: u64 = 1_048_576;
 
@@ -277,7 +285,7 @@ fn probe_range(content_length: Option<u64>) -> String {
         }
         None => format!(
             "bytes={PROBE_FALLBACK_START}-{}",
-            PROBE_FALLBACK_START + PROBE_TAIL_BYTES - 1
+            PROBE_FALLBACK_START + PROBE_FALLBACK_BYTES - 1
         ),
     }
 }
