@@ -9,8 +9,12 @@ wasm_name="auqw_$(printf '%s' "$plugin" | tr '-' '_').wasm"
 
 # Normalize embedded cargo and toolchain/sysroot paths so the artifact
 # digest is identical on every machine — the same export lives in
-# .github/workflows/ci.yml.
-export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot ${RUSTFLAGS:-}"
+# .github/workflows/ci.yml. The rust-src remap must come FIRST: with the
+# rust-src component installed, std item paths embed the local
+# <sysroot>/lib/rustlib/src/rust tree; CI has no rust-src, so its std
+# paths stay at the abstract /rustc/<commit-hash> prefix. Mapping ours
+# onto the same prefix keeps local release builds byte-identical to CI's.
+export RUSTFLAGS="--remap-path-prefix=$(rustc --print sysroot)/lib/rustlib/src/rust=/rustc/$(rustc -vV | awk '/commit-hash/{print $2}') --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot ${RUSTFLAGS:-}"
 
 cargo build --release --target wasm32-unknown-unknown -p "$crate"
 
