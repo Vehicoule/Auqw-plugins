@@ -27,7 +27,7 @@ jobs:
       # (e.g. serde/derive enabled by one guest changes siblings' bytes),
       # so only per-plugin builds reproduce the pinned digests.
       - run: |
-          export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot"
+          export RUSTFLAGS="--remap-path-prefix=$(rustc --print sysroot)/lib/rustlib/src/rust=/rustc/$(rustc -vV | awk '/commit-hash/{print $2}') --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot"
           for crate in auqw-youtube-music auqw-itunes auqw-deezer auqw-lyrics-lrclib; do
             cargo build --target wasm32-unknown-unknown --release -p "$crate"
           done
