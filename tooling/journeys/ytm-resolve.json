@@ -1,5 +1,5 @@
 {
-  "name": "youtube-music playback.resolve — plain-URL pick probes tail and serves",
+  "name": "youtube-music playback.resolve — plain-URL pick probes last byte and serves",
   "plugin": "youtube-music",
   "capability": "playback.resolve",
   "request": {
@@ -20,10 +20,10 @@
       "url_contains": "googlevideo.com",
       "status": 206,
       "request_headers": {
-        "range": "bytes=4492129-4557664"
+        "range": "bytes=4557664-4557664"
       },
       "headers": {
-        "content-range": "bytes 4492129-4557664/4557665"
+        "content-range": "bytes 4557664-4557664/4557665"
       },
       "body_file": "../../plugins/youtube-music/fixtures/probe-tail.bin"
     }

@@ -164,8 +164,8 @@ non-2xx and transport host errors → `transient`,
 non-object 2xx body or a missing queue panel → `invalid-response`.
 
 A picked URL is probed before it is returned: a `Range` request on the
-file's last 64 KiB (derived from `contentLength`; a fixed window past
-the ~1 MiB horizon when the length is unknown). On the tail window a
+file's last byte (derived from `contentLength`; a fixed 64 KiB window
+past the ~1 MiB horizon when the length is unknown). On the tail ask a
 206 that reaches the file's last byte proves this mint serves the whole
 file; on the fallback window a 206 carrying the asked span — or a
 reported EOF inside it — proves the mint serves past the horizon. A
