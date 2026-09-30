@@ -470,22 +470,36 @@ pub fn primary_artist(artist: &str) -> String {
     }
 }
 
-/// The named collaborator(s) after the first feature separator —
-/// "Rihanna feat. JAY-Z" yields "JAY-Z". `None` for a bare lead act.
+/// The collaborator sequence after the first feature separator with
+/// every later separator collapsed to one canonical spelling — so
+/// "feat. B x C" and "featuring B feat. C" name the same guests and
+/// compare equal, while a different guest list still disagrees.
+/// `None` for a bare lead act.
 fn feature_tail(artist: &str) -> Option<String> {
     let base = strip_topic(artist);
-    FEATURE_SEPARATORS
+    let first = FEATURE_SEPARATORS
         .iter()
         .filter_map(|pat| find_ascii_ci(&base, pat).map(|i| (i, pat.len())))
+        .min_by_key(|(i, _)| *i)?;
+    const CANON: &str = " feat ";
+    let mut tail = base[first.0 + first.1..].to_string();
+    // Each replacement lands the canonical spelling — resume the scan
+    // past it so it never re-matches itself.
+    let mut from = 0usize;
+    while let Some((i, len)) = FEATURE_SEPARATORS
+        .iter()
+        .filter_map(|pat| find_ascii_ci(&tail[from..], pat).map(|j| (from + j, pat.len())))
         .min_by_key(|(i, _)| *i)
-        .and_then(|(i, len)| {
-            let tail = strip_topic(&base[i + len..]).trim().to_string();
-            if tail.is_empty() {
-                None
-            } else {
-                Some(tail)
-            }
-        })
+    {
+        tail.replace_range(i..i + len, CANON);
+        from = i + CANON.len();
+    }
+    let tail = strip_topic(&tail).trim().to_string();
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
 }
 
 /// Whether two artist strings plausibly name the same act: exact
@@ -941,6 +955,10 @@ mod tests {
             // Same collaborator under another separator spelling.
             ("Rihanna feat. JAY-Z", "Rihanna featuring JAY-Z"),
             ("Rihanna feat. JAY-Z", "Rihanna ft. JAY-Z"),
+            // Multi-guest credits: the same guest list under mixed
+            // separator spellings is the same credit.
+            ("A feat. B x C", "A featuring B feat. C"),
+            ("A ft. B with C", "A feat. B x C"),
             ("portishead", "PORTISHEAD"),
             ("Sigur Rós", "Sigur Ros"),
         ] {
@@ -965,6 +983,11 @@ mod tests {
             ("Rihanna ft. JAY-Z", "Rihanna feat. Drake"),
             ("A with B", "A with C"),
             ("Rihanna feat. JAY-Z - Topic", "Rihanna feat. Drake"),
+            // A different guest list — extra guest, swapped order, or
+            // renamed guest — still disagrees.
+            ("A feat. B", "A feat. B x C"),
+            ("A feat. B x C", "A feat. C x B"),
+            ("A feat. B x C", "A feat. B x D"),
         ] {
             assert!(!artist_names_match(a, b), "{a} vs {b}");
         }
