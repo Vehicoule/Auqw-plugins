@@ -130,6 +130,7 @@ const ERROR_KINDS: &[&str] = &[
     "auth-expired",
     "rate-limit",
     "transient",
+    "provider-wall",
     "expired-resource",
     "permission-denied",
     "invalid-response",

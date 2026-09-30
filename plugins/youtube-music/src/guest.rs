@@ -1288,7 +1288,25 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
         .rfind(|o| !matches!(o, RungOutcome::SabrOnly | RungOutcome::CipheredOnly))
         .unwrap_or(RungOutcome::Transport)
     {
-        RungOutcome::Bot => failed("transient", "bot-check".into()),
+        // `provider-wall` (ABI taxonomy since host-side 0.3.x): the wall
+        // is a verdict on this visitor/IP, not transport weather — the
+        // dedicated kind keeps it terminal + row-preserving without any
+        // message sniffing on the app side. But a wall is only certain
+        // when every rung met a verdict: a rung that failed on retryable
+        // weather (Transport — never resolved; Capped — the mint refused
+        // the probe) can succeed on retry before the walled rung is even
+        // reached, so a mixed ladder keeps the retryable kind and the
+        // wall detail rides the message for classification.
+        RungOutcome::Bot => {
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, RungOutcome::Transport | RungOutcome::Capped))
+            {
+                failed("transient", "bot-check".into())
+            } else {
+                failed("provider-wall", "bot-check".into())
+            }
+        }
         RungOutcome::SignIn | RungOutcome::Age => {
             failed("auth-required", "sign-in-required".into())
         }
@@ -2046,7 +2064,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -2094,7 +2112,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -2598,7 +2616,7 @@ mod tests {
         let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
         assert_eq!(h.pot_calls, 1);
     }
@@ -2645,7 +2663,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
         assert_eq!(h.pot_calls, 1);
     }
@@ -2732,7 +2750,7 @@ mod tests {
         assert_eq!(h.pot_calls, 1);
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -3224,7 +3242,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -3388,7 +3406,7 @@ mod tests {
     #[test]
     fn pinned_resolve_preserves_uninspectable_player_outcomes() {
         for (body, attempts, expected) in [
-            (BOT, 8, "transient"),
+            (BOT, 8, "provider-wall"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
                 8,
@@ -3410,6 +3428,26 @@ mod tests {
             }
             assert_eq!(fail_kind(&out).0, expected, "{body}");
         }
+    }
+
+    #[test]
+    fn mixed_transport_then_wall_stays_retryable() {
+        // Rung 0 books Transport (a JSON-403 the parser can't read as a
+        // playability verdict), rungs 1-7 all bot-check. The ladder's
+        // last verdict is the wall — but a retry may recover rung 0
+        // before the walled rung is reached, so the kind stays
+        // `transient` and `bot-check` rides the message.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = h.answer(&out, 403, "{\"error\":{\"code\":403}}");
+        assert_eq!(rung_of(&out), 1);
+        for _ in 0..7 {
+            out = feed(&mut h, &out, BOT);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
     }
 
     #[test]
