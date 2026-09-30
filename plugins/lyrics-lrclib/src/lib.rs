@@ -1,10 +1,14 @@
 //! LRCLIB lyrics guest: `lyrics.plain` and `lyrics.synced` over the
 //! keyless `https://lrclib.net` API (ABI 0.3.0).
 //!
-//! Seven-tier fallback waterfall (providers.md): exact `/api/get`
-//! with duration → without duration → cleaned-metadata get → scoped
-//! `/api/search` with album → scoped search without album → general
-//! query → ASCII-normalized query. A 404 is a tier miss that advances
+//! Fallback waterfall (providers.md): exact `/api/get` with duration
+//! → without duration → cleaned-metadata get → lead-artist get →
+//! scoped `/api/search` with album → scoped search without album →
+//! lead-artist scoped search → general query → lead-artist general →
+//! ASCII-normalized query. The lead-artist tiers repeat the relaxed
+//! request under `primary_artist(artist)` — the act left after "- Topic"
+//! channel suffixes and featured-artist tails strip — when it differs
+//! from the artist as given. A 404 is a tier miss that advances
 //! the waterfall; a record that lacks the requested flavor counts as
 //! a miss too — a later tier may hold a usable record. A 429 fails
 //! closed `rate-limit` (never a retry storm); a malformed upstream

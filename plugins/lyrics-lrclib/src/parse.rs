@@ -219,10 +219,20 @@ pub fn names_query(r: &Record, title: &str, artist: Option<&str>) -> bool {
         raw_title_eq(&r.title, title) || raw_title_eq(&r.title, &clean_title(title))
     } else {
         // The record's own decorations are transparent too: "Roads
-        // (Remastered 2011)" names the track Roads.
+        // (Remastered 2011)" names the track Roads. The cleaned-record
+        // comparison demands a nonempty normalized form — an empty fold
+        // would equate every non-Latin query with every non-Latin
+        // record once a video suffix cleans away; those fall back to
+        // the literal comparison instead.
+        let cleaned_record = clean_title(&r.title);
+        let cleaned_norm = norm(&cleaned_record);
         got == norm(title)
             || got == norm(&clean_title(title))
-            || norm(&clean_title(&r.title)) == norm(title)
+            || if cleaned_norm.is_empty() {
+                raw_title_eq(&cleaned_record, title)
+            } else {
+                cleaned_norm == norm(title)
+            }
     };
     if !title_hit {
         return false;
@@ -395,37 +405,59 @@ const MARKER_EXACT: &[&str] = &[
     "animated",
 ];
 
-/// The lead-artist form of a decorated artist string: a trailing
-/// " - Topic"/" – Topic" channel suffix drops (YouTube's generated
-/// uploads name the channel, not the act), and everything from the
-/// first featured-artist separator onward drops — "Rihanna feat.
-/// JAY-Z" resolves to Rihanna. Bare "&"/"," separators stay — a
-/// real act can contain them ("Earth, Wind & Fire"), so only explicit
-/// feature phrasing splits. An empty result falls back to the input.
-pub fn primary_artist(artist: &str) -> String {
+/// Trailing channel suffixes YouTube's generated uploads carry —
+/// "- Topic"/" – Topic" name the channel, not the act.
+const TOPIC_SUFFIXES: &[&str] = &[" - topic", " – topic"];
+
+/// Explicit featured-artist phrasing — the only separators allowed
+/// to cut a lead act from its collaborators. Bare "&"/","/"and"
+/// never split: a real act can contain them ("Earth, Wind & Fire").
+const FEATURE_SEPARATORS: &[&str] = &[
+    " feat. ",
+    " feat ",
+    " ft. ",
+    " ft ",
+    " featuring ",
+    " with ",
+    " vs. ",
+    " vs ",
+    " x ",
+];
+
+/// Trailing topic suffixes removed — looped so a decoration that
+/// uncovers another ("- Topic - Topic") still cleans fully.
+fn strip_topic(artist: &str) -> String {
     let mut cur = artist.trim().to_string();
     loop {
         let before = cur.clone();
-        for pat in [" - topic", " – topic"] {
+        for pat in TOPIC_SUFFIXES {
             if cur.len() > pat.len() && cur.to_lowercase().ends_with(pat) {
                 cur = cur[..cur.len() - pat.len()].trim_end().to_string();
             }
         }
-        for pat in [
-            " feat. ",
-            " feat ",
-            " ft. ",
-            " ft ",
-            " featuring ",
-            " with ",
-            " vs. ",
-            " vs ",
-            " x ",
-        ] {
+        if cur == before {
+            break;
+        }
+    }
+    cur
+}
+
+/// The lead-artist form of a decorated artist string: the channel
+/// suffix drops, and everything from the first featured-artist
+/// separator onward drops — "Rihanna feat. JAY-Z" resolves to
+/// Rihanna. The cut fixpoints with the topic strip because a feature
+/// cut can leave the suffix trailing again ("X - Topic feat. Y" →
+/// "X - Topic" → "X"). An empty result falls back to the input.
+pub fn primary_artist(artist: &str) -> String {
+    let mut cur = strip_topic(artist);
+    loop {
+        let before = cur.clone();
+        for pat in FEATURE_SEPARATORS {
             if let Some(i) = find_ascii_ci(&cur, pat) {
                 cur = cur[..i].trim_end().to_string();
             }
         }
+        cur = strip_topic(&cur);
         if cur == before {
             break;
         }
@@ -438,10 +470,30 @@ pub fn primary_artist(artist: &str) -> String {
     }
 }
 
+/// The named collaborator(s) after the first feature separator —
+/// "Rihanna feat. JAY-Z" yields "JAY-Z". `None` for a bare lead act.
+fn feature_tail(artist: &str) -> Option<String> {
+    let base = strip_topic(artist);
+    FEATURE_SEPARATORS
+        .iter()
+        .filter_map(|pat| find_ascii_ci(&base, pat).map(|i| (i, pat.len())))
+        .min_by_key(|(i, _)| *i)
+        .and_then(|(i, len)| {
+            let tail = strip_topic(&base[i + len..]).trim().to_string();
+            if tail.is_empty() {
+                None
+            } else {
+                Some(tail)
+            }
+        })
+}
+
 /// Whether two artist strings plausibly name the same act: exact
 /// normalized equality, or equal *primary-artist* norms — a featured
-/// partner or "- Topic" channel decoration on either side never
-/// decides the match on its own.
+/// partner or "- Topic" channel decoration on one side never decides
+/// the match on its own. But equal leads with *different* named
+/// collaborators disagree: "Rihanna feat. JAY-Z" is not "Rihanna
+/// feat. Drake", and serving one for the other returns wrong lyrics.
 pub fn artist_names_match(want: &str, got: &str) -> bool {
     let w = norm(want);
     let g = norm(got);
@@ -450,7 +502,17 @@ pub fn artist_names_match(want: &str, got: &str) -> bool {
     }
     let wp = norm(&primary_artist(want));
     let gp = norm(&primary_artist(got));
-    !wp.is_empty() && wp == gp
+    if wp.is_empty() || wp != gp {
+        return false;
+    }
+    match (feature_tail(want), feature_tail(got)) {
+        (Some(wt), Some(gt)) => {
+            let wtn = norm(&wt);
+            let gtn = norm(&gt);
+            wtn.is_empty() || gtn.is_empty() || wtn == gtn
+        }
+        _ => true,
+    }
 }
 
 /// Byte index of the first ASCII-case-insensitive `pat` in `hay` —
@@ -681,6 +743,19 @@ mod tests {
         assert_eq!(picked.map(|r| r.title.as_str()), Some("ΟΣ"));
     }
 
+    /// A decorated non-Latin record title cleans to an empty fold that
+    /// must never equate with a different non-Latin query: "(Official
+    /// Video)" strips off, and "別の歌" does not become "夜の歌". The
+    /// same decoration on the *right* title still names it via the
+    /// literal comparison.
+    #[test]
+    fn cleaned_non_latin_record_never_empty_fold_matches() {
+        let decorated_other = rec("別の歌 (Official Video)", None, true);
+        assert!(!names_query(&decorated_other, "夜の歌", None));
+        let decorated_same = rec("夜の歌 (Lyric Video)", None, true);
+        assert!(names_query(&decorated_same, "夜の歌", None));
+    }
+
     /// A duration-matching record outranks a same-name sibling outside
     /// the drift bound — the wrong-edit row the app would have to
     /// reject never leads the walk.
@@ -863,6 +938,9 @@ mod tests {
             ("Portishead", "Portishead - Topic"),
             ("Rihanna feat. JAY-Z", "Rihanna"),
             ("Rihanna", "Rihanna feat. JAY-Z"),
+            // Same collaborator under another separator spelling.
+            ("Rihanna feat. JAY-Z", "Rihanna featuring JAY-Z"),
+            ("Rihanna feat. JAY-Z", "Rihanna ft. JAY-Z"),
             ("portishead", "PORTISHEAD"),
             ("Sigur Rós", "Sigur Ros"),
         ] {
@@ -872,6 +950,21 @@ mod tests {
             ("Portishead", "Someone Else"),
             ("Portishead feat. Someone", "Other Band"),
             ("別の人", "Portishead"),
+        ] {
+            assert!(!artist_names_match(a, b), "{a} vs {b}");
+        }
+    }
+
+    /// Equal lead acts with *different* named collaborators disagree —
+    /// "Rihanna feat. JAY-Z" is not "Rihanna feat. Drake"; serving one
+    /// for the other returns the wrong song's lyrics.
+    #[test]
+    fn artist_names_match_rejects_different_featured_partners() {
+        for (a, b) in [
+            ("Rihanna feat. JAY-Z", "Rihanna feat. Drake"),
+            ("Rihanna ft. JAY-Z", "Rihanna feat. Drake"),
+            ("A with B", "A with C"),
+            ("Rihanna feat. JAY-Z - Topic", "Rihanna feat. Drake"),
         ] {
             assert!(!artist_names_match(a, b), "{a} vs {b}");
         }

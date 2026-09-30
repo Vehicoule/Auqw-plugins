@@ -2,9 +2,9 @@
   "plugin": "lyrics-lrclib",
   "version": "0.1.4",
   "abi_version": "0.3.0",
-  "wasm_sha256": "sha256:307c2397b1877f47975195d7f58d0d9aef7e96823ead9407f9f950aff7e379c7",
-  "manifest_sha256": "sha256:e68a11178c54b75caad23073bcbfe690cd6151b1cdef3753bce900481057d67b",
-  "signed_at": "2026-09-30T17:15:56.884Z",
+  "wasm_sha256": "sha256:5224d33d8ca43af27513d31a39a83f0a20c84dca1edaa03845eab2aa1e66efa4",
+  "manifest_sha256": "sha256:a85ae26b1c16e7a3e6196ab28d46441561b79a65a381933d7704482378d82b93",
+  "signed_at": "2026-09-30T17:22:08.950Z",
   "key_id": "42d8cac606f16c04",
   "toolchain": {
     "node": "v24.19.0",
