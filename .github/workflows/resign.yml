@@ -28,10 +28,15 @@ jobs:
     env:
       PLUGIN: ${{ inputs.plugin }}
       VERSION: ${{ inputs.version }}
-      KEY_FILE: ${{ runner.temp }}/keys/auqw-ed25519.json
-      STAGE_DIR: ${{ runner.temp }}/resign-stage
     steps:
       - uses: actions/checkout@v4
+
+      - name: set up scratch paths
+        # runner.temp is not an allowed context in job-level env — the
+        # process env var RUNNER_TEMP is set on every step instead.
+        run: |
+          echo "KEY_FILE=$RUNNER_TEMP/keys/auqw-ed25519.json" >> "$GITHUB_ENV"
+          echo "STAGE_DIR=$RUNNER_TEMP/resign-stage" >> "$GITHUB_ENV"
 
       - name: validate the dispatch inputs
         run: |
