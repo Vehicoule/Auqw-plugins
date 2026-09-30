@@ -1,10 +1,14 @@
 //! LRCLIB lyrics guest: `lyrics.plain` and `lyrics.synced` over the
 //! keyless `https://lrclib.net` API (ABI 0.3.0).
 //!
-//! Seven-tier fallback waterfall (providers.md): exact `/api/get`
-//! with duration → without duration → cleaned-metadata get → scoped
-//! `/api/search` with album → scoped search without album → general
-//! query → ASCII-normalized query. A 404 is a tier miss that advances
+//! Fallback waterfall (providers.md): exact `/api/get` with duration
+//! → without duration → cleaned-metadata get → lead-artist get →
+//! scoped `/api/search` with album → scoped search without album →
+//! lead-artist scoped search → general query → lead-artist general →
+//! ASCII-normalized query. The lead-artist tiers repeat the relaxed
+//! request under `primary_artist(artist)` — the act left after "- Topic"
+//! channel suffixes and featured-artist tails strip — when it differs
+//! from the artist as given. A 404 is a tier miss that advances
 //! the waterfall; a record that lacks the requested flavor counts as
 //! a miss too — a later tier may hold a usable record. A 429 fails
 //! closed `rate-limit` (never a retry storm); a malformed upstream
@@ -158,11 +162,16 @@ struct Tier {
     url: String,
 }
 
-/// The seven tiers in order. Tiers whose parameters cannot be formed
-/// (no artist for `/api/get`, no album for the album-scoped search)
-/// are skipped, and a URL already issued is never repeated — a
-/// duration-less query makes tier 1 identical to tier 2, an
-/// ASCII-only query makes tier 7 identical to tier 6.
+/// The waterfall in order: exact `/api/get` with duration → without
+/// duration → cleaned-metadata get → lead-artist get → scoped
+/// `/api/search` with album → scoped search without album → lead-artist
+/// scoped search → general query → lead-artist general → ASCII-folded
+/// general. Tiers whose parameters cannot be formed (no artist for
+/// `/api/get`, no album for the album-scoped search, no lead-artist
+/// variant) are skipped, and a URL already issued is never repeated —
+/// a duration-less query makes tier 1 identical to tier 2, an
+/// ASCII-only query makes the ASCII general tier identical to its
+/// predecessor.
 fn tiers(q: &Query) -> Vec<Tier> {
     let mut out: Vec<Tier> = Vec::new();
     let push = |kind: TierKind, url: String, out: &mut Vec<Tier>| {
@@ -175,53 +184,69 @@ fn tiers(q: &Query) -> Vec<Tier> {
         .filter(|d| *d > 0)
         .map(|d| d.saturating_add(500) / 1000)
         .filter(|d| (1..=DURATION_MAX_SECS).contains(d));
-    if let Some(artist) = &q.artist {
-        let mut exact = format!(
+    // The artist as given, then its lead-artist form when they differ:
+    // "- Topic" channels and "feat."-decorated artist fields never
+    // match LRCLIB's canonical artist string verbatim.
+    let artist_variants: Vec<String> = match &q.artist {
+        Some(artist) => {
+            let primary = parse::primary_artist(artist);
+            if primary != *artist {
+                vec![artist.clone(), primary]
+            } else {
+                vec![artist.clone()]
+            }
+        }
+        None => Vec::new(),
+    };
+    let get_url = |title: &str, artist: &str, with_duration: bool, q: &Query| {
+        let mut url = format!(
             "{API}/api/get?track_name={}&artist_name={}",
-            encode::percent_encode(&q.title),
+            encode::percent_encode(title),
             encode::percent_encode(artist)
         );
         if let Some(album) = &q.album {
-            exact.push_str(&format!("&album_name={}", encode::percent_encode(album)));
+            url.push_str(&format!("&album_name={}", encode::percent_encode(album)));
         }
+        if with_duration {
+            if let Some(d) = duration_secs {
+                url.push_str(&format!("&duration={d}"));
+            }
+        }
+        url
+    };
+    if let Some(artist) = artist_variants.first() {
         // 1. Exact get with duration.
-        if let Some(d) = duration_secs {
-            push(TierKind::Get, format!("{exact}&duration={d}"), &mut out);
+        if duration_secs.is_some() {
+            push(TierKind::Get, get_url(&q.title, artist, true, q), &mut out);
         }
         // 2. Exact get without duration.
-        push(TierKind::Get, exact.clone(), &mut out);
+        push(TierKind::Get, get_url(&q.title, artist, false, q), &mut out);
         // 3. Cleaned-metadata get: same signature, version-suffix-free
         //    title.
         let cleaned = parse::clean_title(&q.title);
         if cleaned != q.title {
-            let mut url = format!(
-                "{API}/api/get?track_name={}&artist_name={}",
-                encode::percent_encode(&cleaned),
-                encode::percent_encode(artist)
-            );
-            if let Some(album) = &q.album {
-                url.push_str(&format!("&album_name={}", encode::percent_encode(album)));
-            }
-            if let Some(d) = duration_secs {
-                url.push_str(&format!("&duration={d}"));
-            }
-            push(TierKind::Get, url, &mut out);
+            push(TierKind::Get, get_url(&cleaned, artist, true, q), &mut out);
+        }
+        // 4. Lead-artist get: the cleaned title under the primary act —
+        //    one relaxed exact form, not a second mini-waterfall.
+        if let Some(primary) = artist_variants.get(1) {
+            push(TierKind::Get, get_url(&cleaned, primary, true, q), &mut out);
         }
     }
-    // 4. Scoped search with album.
+    // 5. Scoped search with album.
     if let Some(album) = &q.album {
         let mut url = format!(
             "{API}/api/search?track_name={}&album_name={}",
             encode::percent_encode(&q.title),
             encode::percent_encode(album)
         );
-        if let Some(artist) = &q.artist {
+        if let Some(artist) = artist_variants.first() {
             url.push_str(&format!("&artist_name={}", encode::percent_encode(artist)));
         }
         push(TierKind::Search, url, &mut out);
     }
-    // 5. Scoped search without album.
-    if let Some(artist) = &q.artist {
+    // 6. Scoped search without album, then its lead-artist variant.
+    if let Some(artist) = artist_variants.first() {
         push(
             TierKind::Search,
             format!(
@@ -232,8 +257,19 @@ fn tiers(q: &Query) -> Vec<Tier> {
             &mut out,
         );
     }
-    // 6. General query.
-    let general = match &q.artist {
+    if let Some(primary) = artist_variants.get(1) {
+        push(
+            TierKind::Search,
+            format!(
+                "{API}/api/search?track_name={}&artist_name={}",
+                encode::percent_encode(&parse::clean_title(&q.title)),
+                encode::percent_encode(primary)
+            ),
+            &mut out,
+        );
+    }
+    // 7. General query, then its lead-artist variant.
+    let general = match artist_variants.first() {
         Some(artist) => format!("{} {artist}", q.title),
         None => q.title.clone(),
     };
@@ -242,7 +278,15 @@ fn tiers(q: &Query) -> Vec<Tier> {
         format!("{API}/api/search?q={}", encode::percent_encode(&general)),
         &mut out,
     );
-    // 7. ASCII-normalized general query — only a new request when the
+    if let Some(primary) = artist_variants.get(1) {
+        let relaxed = format!("{} {primary}", parse::clean_title(&q.title));
+        push(
+            TierKind::Search,
+            format!("{API}/api/search?q={}", encode::percent_encode(&relaxed)),
+            &mut out,
+        );
+    }
+    // 8. ASCII-normalized general query — only a new request when the
     //    fold actually changes the query text.
     if let Some(ascii) = encode::ascii_fold(&general) {
         if ascii != general {
@@ -1012,5 +1056,84 @@ mod tests {
         assert_eq!(out["result"]["state"], "absent");
         assert_eq!(out["result"]["text"], Value::Null);
         assert_eq!(out["result"]["matched"], Value::Null);
+    }
+
+    /// A decorated artist field — " - Topic" channel, "feat."-tail —
+    /// adds lead-artist variants of the get, scoped-search, and
+    /// general tiers after the verbatim ones.
+    #[test]
+    fn topic_channel_artist_adds_lead_artist_tiers() {
+        let mut q = query();
+        q["artist"] = json!("Portishead - Topic");
+        let req = invoke_request("lyrics.plain", &q);
+        let (urls, out) = miss_all(req, 12);
+        assert_eq!(out["result"]["state"], "absent", "{out}");
+        assert_eq!(
+            urls,
+            [
+                "https://lrclib.net/api/get?track_name=Roads&artist_name=Portishead%20-%20Topic&album_name=Dummy&duration=307",
+                "https://lrclib.net/api/get?track_name=Roads&artist_name=Portishead%20-%20Topic&album_name=Dummy",
+                "https://lrclib.net/api/get?track_name=Roads&artist_name=Portishead&album_name=Dummy&duration=307",
+                "https://lrclib.net/api/search?track_name=Roads&album_name=Dummy&artist_name=Portishead%20-%20Topic",
+                "https://lrclib.net/api/search?track_name=Roads&artist_name=Portishead%20-%20Topic",
+                "https://lrclib.net/api/search?track_name=Roads&artist_name=Portishead",
+                "https://lrclib.net/api/search?q=Roads%20Portishead%20-%20Topic",
+                "https://lrclib.net/api/search?q=Roads%20Portishead",
+            ],
+            "{urls:?}"
+        );
+    }
+
+    #[test]
+    fn feat_artist_adds_lead_artist_tiers() {
+        let mut q = query();
+        q["artist"] = json!("Portishead feat. Geoff Barrow");
+        let req = invoke_request("lyrics.plain", &q);
+        let (urls, out) = miss_all(req, 12);
+        assert_eq!(out["result"]["state"], "absent", "{out}");
+        assert_eq!(
+            urls,
+            [
+                "https://lrclib.net/api/get?track_name=Roads&artist_name=Portishead%20feat.%20Geoff%20Barrow&album_name=Dummy&duration=307",
+                "https://lrclib.net/api/get?track_name=Roads&artist_name=Portishead%20feat.%20Geoff%20Barrow&album_name=Dummy",
+                "https://lrclib.net/api/get?track_name=Roads&artist_name=Portishead&album_name=Dummy&duration=307",
+                "https://lrclib.net/api/search?track_name=Roads&album_name=Dummy&artist_name=Portishead%20feat.%20Geoff%20Barrow",
+                "https://lrclib.net/api/search?track_name=Roads&artist_name=Portishead%20feat.%20Geoff%20Barrow",
+                "https://lrclib.net/api/search?track_name=Roads&artist_name=Portishead",
+                "https://lrclib.net/api/search?q=Roads%20Portishead%20feat.%20Geoff%20Barrow",
+                "https://lrclib.net/api/search?q=Roads%20Portishead",
+            ],
+            "{urls:?}"
+        );
+    }
+
+    /// The lead-artist get tier actually rescues a query whose
+    /// verbatim artist can never hit LRCLIB's canonical string.
+    #[test]
+    fn lead_artist_get_rescues_topic_channel_query() {
+        let mut q = query();
+        q["artist"] = json!("Portishead - Topic");
+        let req = invoke_request("lyrics.synced", &q);
+        let out = answer(&req, 404, MISS_404);
+        let out = answer(&out, 404, MISS_404);
+        // Third tier is the lead-artist get.
+        let url = url_of(&out);
+        assert!(url.contains("/api/get?"), "{url}");
+        assert!(url.contains("artist_name=Portishead&"), "{url}");
+        assert!(!url.contains("Topic"), "{url}");
+        let out = answer(&out, 200, GET_SYNCED);
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["state"], "synced");
+        assert_eq!(out["result"]["matched"]["artist"], "Portishead");
+    }
+
+    /// A verbatim-equal artist never pays for duplicate tiers.
+    #[test]
+    fn plain_artist_has_no_lead_artist_tiers() {
+        let req = invoke_request("lyrics.plain", &query());
+        let (urls, _) = miss_all(req, 12);
+        assert_eq!(urls.len(), 5, "{urls:?}");
+        let unique: std::collections::BTreeSet<&String> = urls.iter().collect();
+        assert_eq!(unique.len(), urls.len(), "{urls:?}");
     }
 }
