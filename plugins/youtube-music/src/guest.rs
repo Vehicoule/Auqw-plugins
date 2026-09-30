@@ -1133,6 +1133,11 @@ async fn finish_pick(
             "content_length": picked.content_length,
             "client": rung.name,
             "itag": picked.itag,
+            // The mint's fetch identity: the URL was minted (and just
+            // probed) as this client — the host must serve the stream
+            // fetch with the same UA or the edge answers as bot
+            // traffic.
+            "headers": {"user-agent": rung.user_agent},
         }))),
         Some(outcome) => Ok(PickOutcome::Advance(outcome)),
     }
@@ -1641,6 +1646,12 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .starts_with("https://"));
+        // The minted URL is served by the edge under this rung's
+        // client identity — the fetch must ride the same UA.
+        assert_eq!(
+            out["result"]["headers"]["user-agent"],
+            "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+        );
     }
 
     #[test]
