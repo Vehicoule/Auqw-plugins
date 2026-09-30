@@ -148,10 +148,9 @@ pub fn ranked<'a>(
     let want_title = norm(title);
     let cleaned = clean_title(title);
     let want_cleaned = norm(&cleaned);
-    let want_artist = artist.map(norm);
-    let artist_ok = |r: &Record| match (&want_artist, &r.artist) {
+    let artist_ok = |r: &Record| match (artist, &r.artist) {
         (None, _) => true,
-        (Some(want), Some(got)) => !want.is_empty() && *want == norm(got),
+        (Some(want), Some(got)) => artist_names_match(want, got),
         (Some(_), None) => false,
     };
     // An empty fold is never evidence *between folded strings*: a
@@ -219,13 +218,17 @@ pub fn names_query(r: &Record, title: &str, artist: Option<&str>) -> bool {
         // match, raw or against the cleaned query, names the query.
         raw_title_eq(&r.title, title) || raw_title_eq(&r.title, &clean_title(title))
     } else {
-        got == norm(title) || got == norm(&clean_title(title))
+        // The record's own decorations are transparent too: "Roads
+        // (Remastered 2011)" names the track Roads.
+        got == norm(title)
+            || got == norm(&clean_title(title))
+            || norm(&clean_title(&r.title)) == norm(title)
     };
     if !title_hit {
         return false;
     }
-    match (artist.map(norm), r.artist.as_deref().map(norm)) {
-        (Some(w), Some(g)) => !w.is_empty() && !g.is_empty() && w == g,
+    match (artist, r.artist.as_deref()) {
+        (Some(w), Some(g)) => artist_names_match(w, g),
         _ => true,
     }
 }
@@ -351,9 +354,104 @@ const MARKER_STEMS: &[&str] = &[
     "symphon",
 ];
 const MARKER_EXACT: &[&str] = &[
-    "live", "edit", "mono", "stereo", "bonus", "demo", "mix", "dub", "ep", "lp", "feat", "ft",
-    "clean", "explicit", "single", "radio", "cover", "session", "sessions", "mtv",
+    "live",
+    "edit",
+    "mono",
+    "stereo",
+    "bonus",
+    "demo",
+    "mix",
+    "dub",
+    "ep",
+    "lp",
+    "feat",
+    "ft",
+    "clean",
+    "explicit",
+    "single",
+    "radio",
+    "cover",
+    "session",
+    "sessions",
+    "mtv",
+    // Upload/video-flavor tags streaming titles carry: "(Official
+    // Video)", "(Lyric Video)", "(Audio)", "(Visualizer)", "[HD]",
+    // "(Performance Video)". The parenthetical must survive on a real
+    // release, so these stay title-tail markers, never bare-word
+    // matches.
+    "official",
+    "video",
+    "audio",
+    "lyric",
+    "lyrics",
+    "visualizer",
+    "visualiser",
+    "mv",
+    "hd",
+    "hq",
+    "4k",
+    "vevo",
+    "performance",
+    "animated",
 ];
+
+/// The lead-artist form of a decorated artist string: a trailing
+/// " - Topic"/" – Topic" channel suffix drops (YouTube's generated
+/// uploads name the channel, not the act), and everything from the
+/// first featured-artist separator onward drops — "Rihanna feat.
+/// JAY-Z" resolves to Rihanna. Bare "&"/"," separators stay — a
+/// real act can contain them ("Earth, Wind & Fire"), so only explicit
+/// feature phrasing splits. An empty result falls back to the input.
+pub fn primary_artist(artist: &str) -> String {
+    let mut cur = artist.trim().to_string();
+    loop {
+        let before = cur.clone();
+        for pat in [" - topic", " – topic"] {
+            if cur.len() > pat.len() && cur.to_lowercase().ends_with(pat) {
+                cur = cur[..cur.len() - pat.len()].trim_end().to_string();
+            }
+        }
+        for pat in [
+            " feat. ",
+            " feat ",
+            " ft. ",
+            " ft ",
+            " featuring ",
+            " with ",
+            " vs. ",
+            " vs ",
+            " x ",
+        ] {
+            if let Some(i) = find_ascii_ci(&cur, pat) {
+                cur = cur[..i].trim_end().to_string();
+            }
+        }
+        if cur == before {
+            break;
+        }
+    }
+    let collapsed = cur.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        artist.to_string()
+    } else {
+        collapsed
+    }
+}
+
+/// Whether two artist strings plausibly name the same act: exact
+/// normalized equality, or equal *primary-artist* norms — a featured
+/// partner or "- Topic" channel decoration on either side never
+/// decides the match on its own.
+pub fn artist_names_match(want: &str, got: &str) -> bool {
+    let w = norm(want);
+    let g = norm(got);
+    if !w.is_empty() && w == g {
+        return true;
+    }
+    let wp = norm(&primary_artist(want));
+    let gp = norm(&primary_artist(got));
+    !wp.is_empty() && wp == gp
+}
 
 /// Byte index of the first ASCII-case-insensitive `pat` in `hay` —
 /// byte-preserving, so the offset slices `hay` safely.
@@ -677,6 +775,106 @@ mod tests {
             "Roads",
             Some("Portishead")
         ));
+        // A decorated *record* title still names the plain query.
+        assert!(names_query(
+            &rec("Roads (Remastered 2011)", Some("Portishead"), true),
+            "Roads",
+            Some("Portishead")
+        ));
+        // A featured-artist decoration on the record's artist is not
+        // a disagreement.
+        assert!(names_query(
+            &rec("Roads", Some("Portishead feat. Geoff Barrow"), true),
+            "Roads",
+            Some("Portishead")
+        ));
+    }
+
+    /// Upload-flavor tags on a streamed title clean away the same as
+    /// version markers — "(Official Video)", "(Audio)", "[HD]" never
+    /// survive into the lookup.
+    #[test]
+    fn clean_drops_video_upload_tags() {
+        for (given, want) in [
+            ("Roads (Official Video)", "Roads"),
+            ("Roads (Official Music Video)", "Roads"),
+            ("Roads (Lyric Video)", "Roads"),
+            ("Roads (Audio)", "Roads"),
+            ("Roads (Visualizer)", "Roads"),
+            ("Roads (HD)", "Roads"),
+            ("Roads - Official Video", "Roads"),
+            ("Roads (Video)", "Roads"),
+        ] {
+            assert_eq!(clean_title(given), want, "{given}");
+        }
+        // A parenthetical that merely *contains* a video word in a
+        // real title phrase still strips — it is a tail decoration,
+        // not the track name.
+        for given in ["Video Killed the Radio Star", "Audio Slave", "Lyric Pieces"] {
+            assert_eq!(clean_title(given), given, "{given}");
+        }
+    }
+
+    #[test]
+    fn primary_artist_strips_topic_and_feature_tails() {
+        for (given, want) in [
+            ("Portishead - Topic", "Portishead"),
+            ("Portishead - TOPIC", "Portishead"),
+            ("Portishead – Topic", "Portishead"),
+            ("Rihanna feat. JAY-Z", "Rihanna"),
+            ("Rihanna Feat. JAY-Z", "Rihanna"),
+            ("Rihanna ft. JAY-Z", "Rihanna"),
+            ("Rihanna featuring JAY-Z", "Rihanna"),
+            ("A with B", "A"),
+            ("A vs. B", "A"),
+            ("A x B", "A"),
+            ("Portishead - Topic feat. Someone", "Portishead"),
+            ("  Portishead  ", "Portishead"),
+        ] {
+            assert_eq!(primary_artist(given), want, "{given}");
+        }
+    }
+
+    /// Separators a real act can contain — "&", ",", "and" — never
+    /// split the name; an artist that is nothing but a decoration
+    /// falls back to itself.
+    #[test]
+    fn primary_artist_keeps_ambiguous_separators() {
+        for (given, want) in [
+            ("Earth, Wind & Fire", "Earth, Wind & Fire"),
+            (
+                "Crosby, Stills, Nash & Young",
+                "Crosby, Stills, Nash & Young",
+            ),
+            ("Florence and the Machine", "Florence and the Machine"),
+            ("& Juliet", "& Juliet"),
+            ("feat.", "feat."),
+            ("- Topic", "- Topic"),
+        ] {
+            assert_eq!(primary_artist(given), want, "{given}");
+        }
+    }
+
+    #[test]
+    fn artist_names_match_tolerates_decoration() {
+        for (a, b) in [
+            ("Portishead", "Portishead"),
+            ("Portishead - Topic", "Portishead"),
+            ("Portishead", "Portishead - Topic"),
+            ("Rihanna feat. JAY-Z", "Rihanna"),
+            ("Rihanna", "Rihanna feat. JAY-Z"),
+            ("portishead", "PORTISHEAD"),
+            ("Sigur Rós", "Sigur Ros"),
+        ] {
+            assert!(artist_names_match(a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            ("Portishead", "Someone Else"),
+            ("Portishead feat. Someone", "Other Band"),
+            ("別の人", "Portishead"),
+        ] {
+            assert!(!artist_names_match(a, b), "{a} vs {b}");
+        }
     }
 
     /// A minute tag beyond u64 arithmetic saturates instead of
