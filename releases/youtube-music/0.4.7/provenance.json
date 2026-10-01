@@ -1,0 +1,13 @@
+{
+  "plugin": "youtube-music",
+  "version": "0.4.7",
+  "abi_version": "0.3.0",
+  "wasm_sha256": "sha256:969d40aed918643e033febe6b6a9de31f1ce42865e707b90f7f33ffad773302d",
+  "manifest_sha256": "sha256:9a2ae163d3bd44619a8607918a065837a68e2b2355f615112dec4dc31e3aa6e3",
+  "signed_at": "2026-09-30T01:23:01.667Z",
+  "key_id": "42d8cac606f16c04",
+  "toolchain": {
+    "node": "v24.19.0",
+    "platform": "linux/x64"
+  }
+}

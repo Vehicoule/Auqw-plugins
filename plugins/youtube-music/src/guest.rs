@@ -23,8 +23,8 @@ use crate::parse::{
     PickOptions, Playability,
 };
 use crate::rungs::{
-    append_pot, is_googlevideo, player_request, probe_request, LADDER, PROBE_FALLBACK_START,
-    PROBE_TAIL_BYTES,
+    append_pot, is_googlevideo, player_request, probe_request, LADDER, PROBE_FALLBACK_BYTES,
+    PROBE_FALLBACK_START, PROBE_TAIL_BYTES,
 };
 
 /// Backoff windows staged for a failed rung, keyed by reason.
@@ -323,10 +323,25 @@ pub(crate) async fn load_visitor(key: &str) -> Result<Option<String>, GuestError
 /// record may carry.
 const BACKOFF_REASONS: &[&str] = &["bot-check", "rate-limit", "transport", "capped"];
 
+/// What a `backoff/<video>/<rung>` KV read found. A record that
+/// exists but is not in force — expired, or bytes that fail the
+/// record shape — is inert state a finishing rung still collects, so
+/// it marks the key dirty where a truly absent key does not.
+enum StoredBackoff {
+    /// Nothing stored under the key.
+    Absent,
+    /// A record exists but is expired or malformed (the latter warned
+    /// on read): garbage the next `Done` deletes.
+    Stale,
+    /// An in-force skip — the stored reason for the taxonomy.
+    Active(String),
+}
+
 /// Load a stored backoff: the bytes must be exactly
-/// `{until_ms: u64, reason: <known reason>}` — anything else is
-/// ignored with a sanitized warning.
-async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
+/// `{until_ms: u64, reason: <known reason>}` and still ahead of
+/// `now` — anything else reads `Stale` (malformed values warn; expired
+/// ones do not), and an absent key reads `Absent`.
+async fn load_backoff(key: &str, now: u64) -> Result<StoredBackoff, GuestError> {
     match kv_get_soft(key).await? {
         Some(bytes) => {
             let parsed = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
@@ -342,14 +357,15 @@ async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
                 Some((until, reason.to_string()))
             });
             match parsed {
-                Some(b) => Ok(Some(b)),
+                Some((until, reason)) if until > now => Ok(StoredBackoff::Active(reason)),
+                Some(_) => Ok(StoredBackoff::Stale),
                 None => {
                     warn("ignoring malformed backoff KV value").await?;
-                    Ok(None)
+                    Ok(StoredBackoff::Stale)
                 }
             }
         }
-        None => Ok(None),
+        None => Ok(StoredBackoff::Absent),
     }
 }
 
@@ -602,31 +618,51 @@ fn unreadable_body_outcome(body: &[u8]) -> RungOutcome {
     }
 }
 
+/// A player response classified once — the visitor-drop wall check
+/// and the rung's booked outcome both read this verdict, so a 2xx
+/// pays one `serde_json::Value` DOM parse and a refusal one
+/// `refusal_outcome` per response, never two inside the shared
+/// per-entry fuel budget.
+enum PlayerVerdict {
+    /// A 2xx carrying a readable player envelope.
+    Envelope(Value),
+    /// The outcome the response books — a non-2xx refusal
+    /// (`refusal_outcome`) or a 2xx that is not a readable envelope
+    /// (`unreadable_body_outcome` over the BOM-stripped body, so a
+    /// BOM-only or whitespace body reads Transport exactly like the
+    /// wall check sees it).
+    Outcome(RungOutcome),
+}
+
+/// Classify a player response once for both the wall check and the
+/// post-loop booking: a 2xx is BOM-stripped and parsed — `Envelope`
+/// on success, its unreadable-body `Outcome` on failure — and a
+/// non-2xx is its `refusal_outcome`.
+fn classify_response(resp: &HttpResponse) -> PlayerVerdict {
+    if (200..300).contains(&resp.status) {
+        let stripped = resp
+            .body
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(&resp.body);
+        match serde_json::from_slice::<Value>(stripped) {
+            Ok(b) => PlayerVerdict::Envelope(b),
+            Err(_) => PlayerVerdict::Outcome(unreadable_body_outcome(stripped)),
+        }
+    } else {
+        PlayerVerdict::Outcome(refusal_outcome(resp))
+    }
+}
+
 /// Is this response the bot wall — in any of its three shapes: a
 /// non-2xx refusal (`refusal_outcome`), a 2xx JSON envelope whose
 /// `playabilityStatus` is a bot-check, or a 2xx body that is not a
-/// readable envelope at all (`unreadable_body_outcome`)? `parsed` is
-/// the caller's already-parsed 2xx body — the send loop parses once
-/// and the wall check and post-loop extraction share that Value, so a
-/// `None` here is the same unreadable body the post-loop books. Used
-/// to decide whether a replayed visitor is worth dropping for a bare
+/// readable envelope at all (`unreadable_body_outcome`)? Used to
+/// decide whether a replayed visitor is worth dropping for a bare
 /// re-ask — replayed state is suspect under every wall shape.
-fn walled_by_bot(resp: &HttpResponse, parsed: Option<&Value>) -> bool {
-    if (200..300).contains(&resp.status) {
-        match parsed {
-            Some(b) => classify_playability(b).0 == Playability::BotCheck,
-            // The send loop's parse failed — classify the same
-            // BOM-stripped bytes it read.
-            None => {
-                unreadable_body_outcome(
-                    resp.body
-                        .strip_prefix(b"\xEF\xBB\xBF")
-                        .unwrap_or(&resp.body),
-                ) == RungOutcome::Bot
-            }
-        }
-    } else {
-        refusal_outcome(resp) == RungOutcome::Bot
+fn walled_by_bot(verdict: &PlayerVerdict) -> bool {
+    match verdict {
+        PlayerVerdict::Envelope(b) => classify_playability(b).0 == Playability::BotCheck,
+        PlayerVerdict::Outcome(o) => *o == RungOutcome::Bot,
     }
 }
 
@@ -730,8 +766,8 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // backoffs — a staged bot-backoff is the thing attestation
             // exists to break.
             if !attested {
-                if let Some((until, reason)) = load_backoff(&backoff_key).await? {
-                    if until > now {
+                match load_backoff(&backoff_key, now).await? {
+                    StoredBackoff::Active(reason) => {
                         dirty_backoffs[i] = true;
                         let outcome = outcome_for_reason(&reason);
                         if outcome == RungOutcome::Bot {
@@ -740,6 +776,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         outcomes[i] = Some(outcome);
                         continue;
                     }
+                    // An inert record (malformed or expired) still
+                    // marks the key dirty — it is garbage a `Done`
+                    // collects, where `Absent` needs no write.
+                    StoredBackoff::Stale => dirty_backoffs[i] = true,
+                    StoredBackoff::Absent => {}
                 }
             }
             let visitor_key = format!("visitor/{}", rung.kv_key());
@@ -763,7 +804,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // so the value would wall this rung on every later resolve
             // too, and the attested pass replays the same one.
             let mut dropped_visitor = false;
-            let (resp, parsed_body) = 'request: loop {
+            let verdict = 'request: loop {
                 let sent = http_request(player_request(
                     rung,
                     &p.video_id,
@@ -787,20 +828,8 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 if r.status == 401 && access_token.take().is_some() {
                     continue 'request;
                 }
-                // Parse a 2xx body ONCE per send — the wall check below
-                // and the post-loop playability/visitor/format pipeline
-                // share this Value; a second DOM walk of the same bytes
-                // is pure fuel against the shared per-entry budget.
-                let parsed = if (200..300).contains(&r.status) {
-                    serde_json::from_slice::<Value>(
-                        r.body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&r.body),
-                    )
-                    .ok()
-                } else {
-                    None
-                };
-                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&r, parsed.as_ref())
-                {
+                let verdict = classify_response(&r);
+                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&verdict) {
                     dropped_visitor = true;
                     // Drop the suspect state everywhere it can persist —
                     // all deletions are staged and commit on `done`, so
@@ -828,37 +857,18 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     rung_visitor = None;
                     continue 'request;
                 }
-                break 'request (r, parsed);
+                break 'request verdict;
             };
-            if !(200..300).contains(&resp.status) {
-                let outcome = refusal_outcome(&resp);
-                // A 401 that carried the token was already re-asked
-                // bare above — every refusal reaching here is the
-                // rung's own and stages its backoff.
-                if let Some((reason, ms)) = backoff_for(outcome) {
-                    dirty_backoffs[i] = true;
-                    stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
-                }
-                outcomes[i] = Some(outcome);
-                if !attested && outcome == RungOutcome::Bot {
-                    bot_positions.push(i);
-                }
-                continue;
-            }
-            // A 2xx that is not a readable player envelope is this
-            // rung's own answer — the wall in transport form (markup
-            // interstitial, consent page, empty body) or a truncated
-            // envelope — never a reason to starve the rungs behind it.
-            // Booking it like the refusal path keeps an edge-shaped OK
-            // in the same taxonomy: Bot stages the backoff and the
-            // attested-replay slot; Transport marks weather.
-            // `parsed_body` is the one parse the send loop already ran
-            // on the BOM-stripped bytes — `None` is exactly that
-            // unreadable body.
-            let body: Value = match parsed_body {
-                Some(body) => body,
-                None => {
-                    let outcome = unreadable_body_outcome(&resp.body);
+            // A non-envelope verdict is this rung's own answer — the
+            // wall in transport form (a bare refusal, a markup
+            // interstitial or consent page answering OK, a truncated
+            // envelope) or plain transport weather — never a reason to
+            // starve the rungs behind it. A 401 that carried the token
+            // was already re-asked bare above, so every outcome
+            // reaching here is the rung's own and stages its backoff:
+            // Bot also books the attested-replay slot.
+            let body: Value = match verdict {
+                PlayerVerdict::Outcome(outcome) => {
                     if let Some((reason, ms)) = backoff_for(outcome) {
                         dirty_backoffs[i] = true;
                         stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
@@ -869,6 +879,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     }
                     continue;
                 }
+                PlayerVerdict::Envelope(b) => b,
             };
             // A parseable body is classified by whatever it carries —
             // an absent `playabilityStatus` is the parser's documented
@@ -1152,6 +1163,11 @@ async fn finish_pick(
             "content_length": picked.content_length,
             "client": rung.name,
             "itag": picked.itag,
+            // The mint's fetch identity: the URL was minted (and just
+            // probed) as this client — the host must serve the stream
+            // fetch with the same UA or the edge answers as bot
+            // traffic.
+            "headers": {"user-agent": rung.user_agent},
         }))),
         Some(outcome) => Ok(PickOutcome::Advance(outcome)),
     }
@@ -1239,7 +1255,7 @@ fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<Run
                 // The fallback window ends past the ~1 MiB horizon, so
                 // the whole asked span — or an earlier reported EOF —
                 // proves the mint serves beyond it.
-                None => reached_eof || end == start_asked + PROBE_TAIL_BYTES - 1,
+                None => reached_eof || end == start_asked + PROBE_FALLBACK_BYTES - 1,
             };
             let span_carried = end
                 .checked_sub(start)
@@ -1307,7 +1323,25 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
         .rfind(|o| !matches!(o, RungOutcome::SabrOnly | RungOutcome::CipheredOnly))
         .unwrap_or(RungOutcome::Transport)
     {
-        RungOutcome::Bot => failed("transient", "bot-check".into()),
+        // `provider-wall` (ABI taxonomy since host-side 0.3.x): the wall
+        // is a verdict on this visitor/IP, not transport weather — the
+        // dedicated kind keeps it terminal + row-preserving without any
+        // message sniffing on the app side. But a wall is only certain
+        // when every rung met a verdict: a rung that failed on retryable
+        // weather (Transport — never resolved; Capped — the mint refused
+        // the probe) can succeed on retry before the walled rung is even
+        // reached, so a mixed ladder keeps the retryable kind and the
+        // wall detail rides the message for classification.
+        RungOutcome::Bot => {
+            if outcomes
+                .iter()
+                .any(|o| matches!(o, RungOutcome::Transport | RungOutcome::Capped))
+            {
+                failed("transient", "bot-check".into())
+            } else {
+                failed("provider-wall", "bot-check".into())
+            }
+        }
         RungOutcome::SignIn | RungOutcome::Age => {
             failed("auth-required", "sign-in-required".into())
         }
@@ -1571,24 +1605,25 @@ mod tests {
     }
 
     /// Assert `out` is a GET tail probe for the OK fixture's pick
-    /// (`contentLength` 4,557,665 → last 64 KiB) and return `out`.
+    /// (`contentLength` 4,557,665 → the file's last byte) and return
+    /// `out`.
     fn probe_of(out: &Value) {
         assert_eq!(out["type"], "host_request");
         assert_eq!(out["payload"]["method"], "GET");
         assert_eq!(
             header_of(out, "Range").as_deref(),
-            Some("bytes=4492129-4557664")
+            Some("bytes=4557664-4557664")
         );
     }
 
-    /// The honest 206 for the OK fixture's pick: tail
-    /// `4492129-4557664`, span 64 KiB.
+    /// The honest 206 for the OK fixture's pick: the last byte
+    /// `4557664-4557664`, span 1.
     fn answer_probe_206(h: &mut Harness, out: &Value) -> Value {
         h.answer_headers(
             out,
             206,
-            &[("Content-Range", "bytes 4492129-4557664/4557665")],
-            65536,
+            &[("Content-Range", "bytes 4557664-4557664/4557665")],
+            1,
         )
     }
 
@@ -1641,6 +1676,12 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .starts_with("https://"));
+        // The minted URL is served by the edge under this rung's
+        // client identity — the fetch must ride the same UA.
+        assert_eq!(
+            out["result"]["headers"]["user-agent"],
+            "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+        );
     }
 
     #[test]
@@ -1892,11 +1933,14 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
+        // Right start, but the reported total runs one byte past the
+        // manifest's length — the range never reaches the file's real
+        // last byte, so it proves nothing about serving past a horizon.
         let out = h.answer_headers(
             &out,
             206,
-            &[("Content-Range", "bytes 4492129-4557663/4557665")],
-            65535,
+            &[("Content-Range", "bytes 4557664-4557664/4557666")],
+            1,
         );
         assert_eq!(rung_of(&out), 1);
     }
@@ -1907,11 +1951,30 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
+        // The echoed range claims the last byte but the body is empty —
+        // a truncated answer carries no evidence.
         let out = h.answer_headers(
             &out,
             206,
-            &[("Content-Range", "bytes 4492129-4557664/4557665")],
-            1024,
+            &[("Content-Range", "bytes 4557664-4557664/4557665")],
+            0,
+        );
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_206_oversized_body_is_capped() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // A body wider than the asked span is a mismatch too — the
+        // verdict keys on the exact span, not "at least the span".
+        let out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 4557664-4557664/4557665")],
+            2,
         );
         assert_eq!(rung_of(&out), 1);
     }
@@ -2042,7 +2105,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -2090,7 +2153,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -2594,7 +2657,7 @@ mod tests {
         let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
         assert_eq!(h.pot_calls, 1);
     }
@@ -2641,7 +2704,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
         assert_eq!(h.pot_calls, 1);
     }
@@ -2728,7 +2791,7 @@ mod tests {
         assert_eq!(h.pot_calls, 1);
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -3220,7 +3283,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "bot-check".to_string())
+            ("provider-wall".to_string(), "bot-check".to_string())
         );
     }
 
@@ -3384,7 +3447,7 @@ mod tests {
     #[test]
     fn pinned_resolve_preserves_uninspectable_player_outcomes() {
         for (body, attempts, expected) in [
-            (BOT, 8, "transient"),
+            (BOT, 8, "provider-wall"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
                 8,
@@ -3406,6 +3469,26 @@ mod tests {
             }
             assert_eq!(fail_kind(&out).0, expected, "{body}");
         }
+    }
+
+    #[test]
+    fn mixed_transport_then_wall_stays_retryable() {
+        // Rung 0 books Transport (a JSON-403 the parser can't read as a
+        // playability verdict), rungs 1-7 all bot-check. The ladder's
+        // last verdict is the wall — but a retry may recover rung 0
+        // before the walled rung is reached, so the kind stays
+        // `transient` and `bot-check` rides the message.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = h.answer(&out, 403, "{\"error\":{\"code\":403}}");
+        assert_eq!(rung_of(&out), 1);
+        for _ in 0..7 {
+            out = feed(&mut h, &out, BOT);
+        }
+        assert_eq!(
+            fail_kind(&out),
+            ("transient".to_string(), "bot-check".to_string())
+        );
     }
 
     #[test]

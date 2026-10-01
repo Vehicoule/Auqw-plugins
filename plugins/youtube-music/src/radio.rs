@@ -1965,7 +1965,9 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         .map_err(|_| failed("invalid-response", "next body is not a JSON object".into()))?;
     match next_playability(body.playability.as_ref()) {
         Playability::Ok => {}
-        Playability::BotCheck => return Err(failed("transient", "bot-check".into())),
+        Playability::BotCheck => {
+            return Err(failed("provider-wall", "bot-check".into()));
+        }
         Playability::SignInRequired | Playability::AgeRestricted => {
             return Err(failed("auth-required", "sign-in-required".into()));
         }
@@ -2290,13 +2292,13 @@ mod tests {
     }
 
     #[test]
-    fn bot_check_is_transient_and_sign_in_is_auth() {
+    fn bot_check_is_provider_wall_and_sign_in_is_auth() {
         for (status, reason, kind, message) in [
             (
                 "LOGIN_REQUIRED",
                 "Sign in to confirm you're not a bot",
-                "transient",
-                "transient: bot-check",
+                "provider-wall",
+                "provider-wall: bot-check",
             ),
             (
                 "LOGIN_REQUIRED",
