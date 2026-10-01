@@ -159,7 +159,11 @@ when upstream yields none the result is `continuation: null` — the
 honest end of the mix.
 
 Error mapping mirrors `playback.candidates`: 429 → `rate-limit`, other
-non-2xx and transport host errors → `transient`,
+non-2xx and transport host errors → `transient` — except a 403
+`next` refusal, which books by its body: the abuse edge's
+interstitial (non-JSON or truncated wall page) → `provider-wall`,
+and a parseable JSON envelope rides its `playabilityStatus` verdict
+(`auth-required`, `no-result`) like the 2xx path;
 `cancelled`/`permission-denied`/`invalid-response` propagate, a
 non-object 2xx body or a missing queue panel → `invalid-response`.
 
