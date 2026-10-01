@@ -502,38 +502,52 @@ fn feature_tail(artist: &str) -> Option<String> {
     }
 }
 
-/// Whether two artist strings plausibly name the same act: exact
-/// normalized equality, or equal *primary-artist* norms — a featured
-/// partner or "- Topic" channel decoration on one side never decides
-/// the match on its own. But equal leads with *different* named
-/// collaborators disagree: "Rihanna feat. JAY-Z" is not "Rihanna
-/// feat. Drake", and serving one for the other returns wrong lyrics.
-/// The collaborator check runs before the full-norm early return —
-/// `norm` only sees ASCII-foldable text, so two different non-Latin
-/// tails can share one fold — and an un-foldable tail compares
-/// literally like `raw_title_eq`: an empty fold is never evidence
-/// between folded strings.
+/// Whether two artist strings plausibly name the same act: the lead
+/// acts agree and so do the named collaborators when both sides name
+/// them — a featured partner or "- Topic" channel decoration on one
+/// side alone never disagrees, but equal leads with *different* named
+/// collaborators do: "Rihanna feat. JAY-Z" is not "Rihanna feat.
+/// Drake", and serving one for the other returns wrong lyrics.
+///
+/// Every named party is compared under the same fold-or-literal rule:
+/// the ASCII `norm` fold decides when BOTH sides leave nonempty folds,
+/// preserving case/punct/separator/diacritic forgiveness; when either
+/// fold is empty the strings compare literally (`raw_title_eq`) — an
+/// empty fold is never evidence. And an *equal* fold is not evidence
+/// either when un-foldable letters remain: `non_latin_remnant` keeps
+/// the non-Latin identity `norm` drops, so "別の人 & JAY-Z" and
+/// "米津玄師 & JAY-Z" disagree despite both folding to `jayz`.
 pub fn artist_names_match(want: &str, got: &str) -> bool {
     if let (Some(wt), Some(gt)) = (feature_tail(want), feature_tail(got)) {
-        let wtn = norm(&wt);
-        let gtn = norm(&gt);
-        let tails_agree = if wtn.is_empty() || gtn.is_empty() {
-            raw_title_eq(&wt, &gt)
-        } else {
-            wtn == gtn
-        };
-        if !tails_agree {
+        if !names_agree(&wt, &gt) {
             return false;
         }
     }
+    names_agree(&primary_artist(want), &primary_artist(got))
+}
+
+/// The fold-or-literal agreement rule: nonempty ASCII folds compare
+/// by key plus non-Latin remnant; an empty fold on either side demotes
+/// to the literal `raw_title_eq` compare.
+fn names_agree(want: &str, got: &str) -> bool {
     let w = norm(want);
     let g = norm(got);
-    if !w.is_empty() && w == g {
-        return true;
+    if w.is_empty() || g.is_empty() {
+        raw_title_eq(want, got)
+    } else {
+        w == g && non_latin_remnant(want) == non_latin_remnant(got)
     }
-    let wp = norm(&primary_artist(want));
-    let gp = norm(&primary_artist(got));
-    !wp.is_empty() && wp == gp
+}
+
+/// The alphanumeric letters `ascii_fold` drops — CJK, Cyrillic,
+/// unmapped scripts — kept under the same uppercase fold
+/// `raw_title_eq` uses. Latin diacritics and mapped punctuation leave
+/// no remnant, so folded identity still decides their match.
+fn non_latin_remnant(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() && !c.is_ascii() && ascii_fold(&c.to_string()).is_none())
+        .flat_map(char::to_uppercase)
+        .collect()
 }
 
 /// Byte index of the first ASCII-case-insensitive `pat` in `hay` —
@@ -1018,6 +1032,15 @@ mod tests {
             // Fully un-foldable credits: same lead fold, different
             // literal acts and guests.
             ("別の人 feat. 米津玄師", "別の人 feat. ある人"),
+            // Different non-Latin leads under the same ASCII guest:
+            // the surviving guest fold must not equate the leads.
+            ("別の人 feat. JAY-Z", "米津玄師 feat. JAY-Z"),
+            // Mixed-script guests sharing an ASCII key still name
+            // different collaborators.
+            (
+                "Rihanna feat. 米津玄師 & JAY-Z",
+                "Rihanna feat. 別の人 & JAY-Z",
+            ),
         ] {
             assert!(!artist_names_match(a, b), "{a} vs {b}");
         }
@@ -1026,6 +1049,10 @@ mod tests {
             ("Rihanna feat. 米津玄師", "Rihanna feat. 米津玄師"),
             // A tail on only one side stays a lead-artist match.
             ("Rihanna feat. 別の人", "Rihanna"),
+            // A literal non-Latin lead agrees — including under a
+            // shared ASCII guest the fold alone would equate.
+            ("別の人 feat. JAY-Z", "別の人 feat. jay z"),
+            ("米津玄師", "米津玄師 feat. JAY-Z"),
         ] {
             assert!(artist_names_match(a, b), "{a} vs {b}");
         }
@@ -1034,6 +1061,11 @@ mod tests {
             &rec("Roads", Some("Rihanna feat. 別の人"), true),
             "Roads",
             Some("Rihanna feat. 米津玄師")
+        ));
+        assert!(!names_query(
+            &rec("Roads", Some("米津玄師 feat. JAY-Z"), true),
+            "Roads",
+            Some("別の人 feat. JAY-Z")
         ));
     }
 

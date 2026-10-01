@@ -1912,8 +1912,10 @@ fn next_playability(status: Option<&NextPlayability>) -> Playability {
 /// shapes `refusal_outcome` reads on the player path. A flagged IP's
 /// bare 403 is the abuse edge's HTML interstitial: the bot wall in
 /// transport form, terminal like its envelope twin, never transient
-/// weather. A JSON refusal body classifies by its `playabilityStatus`;
-/// anything else stays transport weather.
+/// weather. A parseable JSON refusal body carries a real
+/// `playabilityStatus` verdict — it books the same terminal outcome the
+/// 2xx path would (`auth-required`, `no-result`, `provider-wall`), so a
+/// sign-in wall is never retried as transport weather either.
 fn next_refusal(resp: &HttpResponse) -> GuestError {
     if resp.status != 403 {
         return failed("transient", "next transport".into());
@@ -1922,17 +1924,19 @@ fn next_refusal(resp: &HttpResponse) -> GuestError {
         .body
         .strip_prefix(b"\xEF\xBB\xBF")
         .unwrap_or(&resp.body);
-    let wall = match (
-        looks_json(body),
-        serde_json::from_slice::<Value>(body)
-            .ok()
-            .map(|b| classify_playability(&b).0),
-    ) {
-        (false, _) | (_, Some(Playability::BotCheck)) => true,
-        (true, None) => truncated_bot_check(body),
-        _ => false,
-    };
-    if wall {
+    if let Ok(b) = serde_json::from_slice::<Value>(body) {
+        return match classify_playability(&b).0 {
+            Playability::BotCheck => failed("provider-wall", "bot-check".into()),
+            Playability::SignInRequired | Playability::AgeRestricted => {
+                failed("auth-required", "sign-in-required".into())
+            }
+            Playability::Unavailable => failed("no-result", "unavailable".into()),
+            Playability::Ok => failed("transient", "next transport".into()),
+        };
+    }
+    // Not a JSON envelope: the HTML interstitial, or a truncated
+    // JSON-looking body — both are the wall in transport form.
+    if !looks_json(body) || truncated_bot_check(body) {
         failed("provider-wall", "bot-check".into())
     } else {
         failed("transient", "next transport".into())
@@ -2870,5 +2874,45 @@ mod tests {
             let out = h.invoke(p.clone());
             assert_eq!(fail_kind(&out).0, "invalid-response", "{p}");
         }
+    }
+
+    /// A 403 `next` refusal books by its body: the interstitial wall
+    /// and envelope walls are terminal on their own kinds; only a
+    /// verdict-less JSON or a non-403 refusal stays transport weather.
+    #[test]
+    fn next_refusal_books_by_body() {
+        let refusal = |status: u16, body: &[u8]| match next_refusal(&HttpResponse {
+            status,
+            headers: vec![],
+            body: body.to_vec(),
+        }) {
+            GuestError::Failed { kind, .. } | GuestError::Host { kind, .. } => kind,
+            _ => "other".into(),
+        };
+        // HTML interstitial — the bot wall in transport form.
+        assert_eq!(
+            refusal(403, b"<html>unusual traffic</html>"),
+            "provider-wall"
+        );
+        // JSON envelopes book their verdict's own terminal kind —
+        // sign-in walls are never retried as transient.
+        assert_eq!(
+            refusal(
+                403,
+                br#"{"playabilityStatus":{"status":"LOGIN_REQUIRED","reason":"Please sign in"}}"#
+            ),
+            "auth-required"
+        );
+        assert_eq!(
+            refusal(
+                403,
+                br#"{"playabilityStatus":{"status":"ERROR","reason":"Video unavailable"}}"#
+            ),
+            "no-result"
+        );
+        // A verdict-less parseable body stays weather.
+        assert_eq!(refusal(403, br#"{"error":{}}"#), "transient");
+        // Non-403 refusals stay weather whatever they carry.
+        assert_eq!(refusal(500, b"<html></html>"), "transient");
     }
 }
