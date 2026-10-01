@@ -323,10 +323,25 @@ pub(crate) async fn load_visitor(key: &str) -> Result<Option<String>, GuestError
 /// record may carry.
 const BACKOFF_REASONS: &[&str] = &["bot-check", "rate-limit", "transport", "capped"];
 
+/// What a `backoff/<video>/<rung>` KV read found. A record that
+/// exists but is not in force — expired, or bytes that fail the
+/// record shape — is inert state a finishing rung still collects, so
+/// it marks the key dirty where a truly absent key does not.
+enum StoredBackoff {
+    /// Nothing stored under the key.
+    Absent,
+    /// A record exists but is expired or malformed (the latter warned
+    /// on read): garbage the next `Done` deletes.
+    Stale,
+    /// An in-force skip — the stored reason for the taxonomy.
+    Active(String),
+}
+
 /// Load a stored backoff: the bytes must be exactly
-/// `{until_ms: u64, reason: <known reason>}` — anything else is
-/// ignored with a sanitized warning.
-async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
+/// `{until_ms: u64, reason: <known reason>}` and still ahead of
+/// `now` — anything else reads `Stale` (malformed values warn; expired
+/// ones do not), and an absent key reads `Absent`.
+async fn load_backoff(key: &str, now: u64) -> Result<StoredBackoff, GuestError> {
     match kv_get_soft(key).await? {
         Some(bytes) => {
             let parsed = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
@@ -342,14 +357,15 @@ async fn load_backoff(key: &str) -> Result<Option<(u64, String)>, GuestError> {
                 Some((until, reason.to_string()))
             });
             match parsed {
-                Some(b) => Ok(Some(b)),
+                Some((until, reason)) if until > now => Ok(StoredBackoff::Active(reason)),
+                Some(_) => Ok(StoredBackoff::Stale),
                 None => {
                     warn("ignoring malformed backoff KV value").await?;
-                    Ok(None)
+                    Ok(StoredBackoff::Stale)
                 }
             }
         }
-        None => Ok(None),
+        None => Ok(StoredBackoff::Absent),
     }
 }
 
@@ -602,24 +618,51 @@ fn unreadable_body_outcome(body: &[u8]) -> RungOutcome {
     }
 }
 
+/// A player response classified once — the visitor-drop wall check
+/// and the rung's booked outcome both read this verdict, so a 2xx
+/// pays one `serde_json::Value` DOM parse and a refusal one
+/// `refusal_outcome` per response, never two inside the shared
+/// per-entry fuel budget.
+enum PlayerVerdict {
+    /// A 2xx carrying a readable player envelope.
+    Envelope(Value),
+    /// The outcome the response books — a non-2xx refusal
+    /// (`refusal_outcome`) or a 2xx that is not a readable envelope
+    /// (`unreadable_body_outcome` over the BOM-stripped body, so a
+    /// BOM-only or whitespace body reads Transport exactly like the
+    /// wall check sees it).
+    Outcome(RungOutcome),
+}
+
+/// Classify a player response once for both the wall check and the
+/// post-loop booking: a 2xx is BOM-stripped and parsed — `Envelope`
+/// on success, its unreadable-body `Outcome` on failure — and a
+/// non-2xx is its `refusal_outcome`.
+fn classify_response(resp: &HttpResponse) -> PlayerVerdict {
+    if (200..300).contains(&resp.status) {
+        let stripped = resp
+            .body
+            .strip_prefix(b"\xEF\xBB\xBF")
+            .unwrap_or(&resp.body);
+        match serde_json::from_slice::<Value>(stripped) {
+            Ok(b) => PlayerVerdict::Envelope(b),
+            Err(_) => PlayerVerdict::Outcome(unreadable_body_outcome(stripped)),
+        }
+    } else {
+        PlayerVerdict::Outcome(refusal_outcome(resp))
+    }
+}
+
 /// Is this response the bot wall — in any of its three shapes: a
 /// non-2xx refusal (`refusal_outcome`), a 2xx JSON envelope whose
 /// `playabilityStatus` is a bot-check, or a 2xx body that is not a
 /// readable envelope at all (`unreadable_body_outcome`)? Used to
 /// decide whether a replayed visitor is worth dropping for a bare
 /// re-ask — replayed state is suspect under every wall shape.
-fn walled_by_bot(resp: &HttpResponse) -> bool {
-    if (200..300).contains(&resp.status) {
-        let body = resp
-            .body
-            .strip_prefix(b"\xEF\xBB\xBF")
-            .unwrap_or(&resp.body);
-        match serde_json::from_slice::<Value>(body) {
-            Ok(b) => classify_playability(&b).0 == Playability::BotCheck,
-            Err(_) => unreadable_body_outcome(body) == RungOutcome::Bot,
-        }
-    } else {
-        refusal_outcome(resp) == RungOutcome::Bot
+fn walled_by_bot(verdict: &PlayerVerdict) -> bool {
+    match verdict {
+        PlayerVerdict::Envelope(b) => classify_playability(b).0 == Playability::BotCheck,
+        PlayerVerdict::Outcome(o) => *o == RungOutcome::Bot,
     }
 }
 
@@ -723,8 +766,8 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // backoffs — a staged bot-backoff is the thing attestation
             // exists to break.
             if !attested {
-                if let Some((until, reason)) = load_backoff(&backoff_key).await? {
-                    if until > now {
+                match load_backoff(&backoff_key, now).await? {
+                    StoredBackoff::Active(reason) => {
                         dirty_backoffs[i] = true;
                         let outcome = outcome_for_reason(&reason);
                         if outcome == RungOutcome::Bot {
@@ -733,6 +776,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         outcomes[i] = Some(outcome);
                         continue;
                     }
+                    // An inert record (malformed or expired) still
+                    // marks the key dirty — it is garbage a `Done`
+                    // collects, where `Absent` needs no write.
+                    StoredBackoff::Stale => dirty_backoffs[i] = true,
+                    StoredBackoff::Absent => {}
                 }
             }
             let visitor_key = format!("visitor/{}", rung.kv_key());
@@ -756,7 +804,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // so the value would wall this rung on every later resolve
             // too, and the attested pass replays the same one.
             let mut dropped_visitor = false;
-            let resp = 'request: loop {
+            let verdict = 'request: loop {
                 let sent = http_request(player_request(
                     rung,
                     &p.video_id,
@@ -780,7 +828,8 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 if r.status == 401 && access_token.take().is_some() {
                     continue 'request;
                 }
-                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&r) {
+                let verdict = classify_response(&r);
+                if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&verdict) {
                     dropped_visitor = true;
                     // Drop the suspect state everywhere it can persist —
                     // all deletions are staged and commit on `done`, so
@@ -808,38 +857,18 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     rung_visitor = None;
                     continue 'request;
                 }
-                break 'request r;
+                break 'request verdict;
             };
-            if !(200..300).contains(&resp.status) {
-                let outcome = refusal_outcome(&resp);
-                // A 401 that carried the token was already re-asked
-                // bare above — every refusal reaching here is the
-                // rung's own and stages its backoff.
-                if let Some((reason, ms)) = backoff_for(outcome) {
-                    dirty_backoffs[i] = true;
-                    stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
-                }
-                outcomes[i] = Some(outcome);
-                if !attested && outcome == RungOutcome::Bot {
-                    bot_positions.push(i);
-                }
-                continue;
-            }
-            // A 2xx that is not a readable player envelope is this
-            // rung's own answer — the wall in transport form (markup
-            // interstitial, consent page, empty body) or a truncated
-            // envelope — never a reason to starve the rungs behind it.
-            // Booking it like the refusal path keeps an edge-shaped OK
-            // in the same taxonomy: Bot stages the backoff and the
-            // attested-replay slot; Transport marks weather.
-            let stripped = resp
-                .body
-                .strip_prefix(b"\xEF\xBB\xBF")
-                .unwrap_or(&resp.body);
-            let body: Value = match serde_json::from_slice(stripped) {
-                Ok(body) => body,
-                Err(_) => {
-                    let outcome = unreadable_body_outcome(&resp.body);
+            // A non-envelope verdict is this rung's own answer — the
+            // wall in transport form (a bare refusal, a markup
+            // interstitial or consent page answering OK, a truncated
+            // envelope) or plain transport weather — never a reason to
+            // starve the rungs behind it. A 401 that carried the token
+            // was already re-asked bare above, so every outcome
+            // reaching here is the rung's own and stages its backoff:
+            // Bot also books the attested-replay slot.
+            let body: Value = match verdict {
+                PlayerVerdict::Outcome(outcome) => {
                     if let Some((reason, ms)) = backoff_for(outcome) {
                         dirty_backoffs[i] = true;
                         stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
@@ -850,6 +879,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     }
                     continue;
                 }
+                PlayerVerdict::Envelope(b) => b,
             };
             // A parseable body is classified by whatever it carries —
             // an absent `playabilityStatus` is the parser's documented
