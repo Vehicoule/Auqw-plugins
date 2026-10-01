@@ -463,7 +463,7 @@ fn unescape_json_unicode(s: &str) -> String {
 /// `playabilityStatus` — a non-OK status plus the same reason markers
 /// `classify_playability` keys on. Anything else (an `error` envelope,
 /// an ambiguous prefix) is an API refusal, not the wall.
-fn truncated_bot_check(body: &[u8]) -> bool {
+pub(crate) fn truncated_bot_check(body: &[u8]) -> bool {
     let blob = String::from_utf8_lossy(body).to_lowercase();
     // Anchor on the quoted, colon-bound KEY — a bare `playabilitystatus`
     // substring inside a string value or a longer key (`xPlayabilityStatus`)
@@ -543,7 +543,7 @@ fn truncated_bot_check(body: &[u8]) -> bool {
 /// Does the body (sans a UTF-8 BOM — some stacks' emitters prepend
 /// one, and it must not make a valid envelope look non-JSON) begin
 /// like a JSON value?
-fn looks_json(body: &[u8]) -> bool {
+pub(crate) fn looks_json(body: &[u8]) -> bool {
     let body = body.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(body);
     body.iter()
         .find(|b| !b.is_ascii_whitespace())

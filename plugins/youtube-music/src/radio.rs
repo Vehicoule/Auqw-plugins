@@ -13,7 +13,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
-use auqw_guest_sdk::{http_request, GuestError};
+use auqw_guest_sdk::{http_request, GuestError, HttpResponse};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,9 +22,10 @@ use crate::candidates::{
     duration_ms_of, is_furniture, web_remix_context, web_remix_request, VISITOR_KEY,
 };
 use crate::guest::{
-    bad_payload, failed, is_video_id, kv_set_soft, load_visitor, payload_keys, warn,
+    bad_payload, failed, is_video_id, kv_set_soft, load_visitor, looks_json, payload_keys,
+    truncated_bot_check, warn,
 };
-use crate::parse::{has_whole_word_age, visitor_token, Playability};
+use crate::parse::{classify_playability, has_whole_word_age, visitor_token, Playability};
 
 const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
@@ -1907,6 +1908,37 @@ fn next_playability(status: Option<&NextPlayability>) -> Playability {
     Playability::Unavailable
 }
 
+/// The outcome a non-2xx/non-429 `next` refusal books — the same wall
+/// shapes `refusal_outcome` reads on the player path. A flagged IP's
+/// bare 403 is the abuse edge's HTML interstitial: the bot wall in
+/// transport form, terminal like its envelope twin, never transient
+/// weather. A JSON refusal body classifies by its `playabilityStatus`;
+/// anything else stays transport weather.
+fn next_refusal(resp: &HttpResponse) -> GuestError {
+    if resp.status != 403 {
+        return failed("transient", "next transport".into());
+    }
+    let body = resp
+        .body
+        .strip_prefix(b"\xEF\xBB\xBF")
+        .unwrap_or(&resp.body);
+    let wall = match (
+        looks_json(body),
+        serde_json::from_slice::<Value>(body)
+            .ok()
+            .map(|b| classify_playability(&b).0),
+    ) {
+        (false, _) | (_, Some(Playability::BotCheck)) => true,
+        (true, None) => truncated_bot_check(body),
+        _ => false,
+    };
+    if wall {
+        failed("provider-wall", "bot-check".into())
+    } else {
+        failed("transient", "next transport".into())
+    }
+}
+
 /// One InnerTube `next` page. The seed asks for the video's automix
 /// queue; a panel `playlistId` naming a different queue is not this
 /// seed's radio — like the player path answering a foreign video id,
@@ -1955,7 +1987,7 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
     match resp.status {
         s if (200..300).contains(&s) => {}
         429 => return Err(failed("rate-limit", "rate-limit".into())),
-        _ => return Err(failed("transient", "next transport".into())),
+        _ => return Err(next_refusal(&resp)),
     }
     // A 2xx `next` response must be a JSON envelope; the seed's
     // `playabilityStatus` (when upstream sends one) is classified by
@@ -2344,6 +2376,59 @@ mod tests {
         let out = h.invoke(seed_payload());
         let out = h.answer_host_error(&out, "permission-denied");
         assert_eq!(fail_kind(&out).0, "permission-denied");
+    }
+
+    /// The wall in transport form: a flagged IP's `next` is answered
+    /// with the abuse edge's interstitial before an envelope exists —
+    /// a bare non-JSON 403 is the same provider wall the player path
+    /// books, never retryable transport weather.
+    #[test]
+    fn transport_form_wall_is_provider_wall() {
+        for body in [
+            "<html><body>Our systems have detected unusual traffic</body></html>",
+            "<html>oops</html>",
+            "",
+        ] {
+            let mut h = Harness::new();
+            let out = h.invoke(seed_payload());
+            let out = h.answer(&out, 403, body);
+            assert_eq!(
+                fail_kind(&out),
+                (
+                    "provider-wall".to_string(),
+                    "provider-wall: bot-check".to_string()
+                ),
+                "{body}"
+            );
+        }
+        // A JSON refusal envelope classifies by its playabilityStatus —
+        // the bot check inside is the same wall.
+        let mut h = Harness::new();
+        let out = h.invoke(seed_payload());
+        let body = json!({
+            "playabilityStatus": {
+                "status": "LOGIN_REQUIRED",
+                "reason": "Sign in to confirm you're not a bot"
+            }
+        });
+        let out = h.answer(&out, 403, &body.to_string());
+        assert_eq!(fail_kind(&out).0, "provider-wall");
+        // A wall truncated mid-envelope still carries the marker.
+        let mut h = Harness::new();
+        let out = h.invoke(seed_payload());
+        let out = h.answer(
+            &out,
+            403,
+            "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot",
+        );
+        assert_eq!(fail_kind(&out).0, "provider-wall");
+        // Non-wall refusals stay transient weather.
+        for (status, body) in [(403u16, "{}"), (500u16, "<html>oops</html>")] {
+            let mut h = Harness::new();
+            let out = h.invoke(seed_payload());
+            let out = h.answer(&out, status, body);
+            assert_eq!(fail_kind(&out).0, "transient", "status {status}");
+        }
     }
 
     #[test]

@@ -508,7 +508,24 @@ fn feature_tail(artist: &str) -> Option<String> {
 /// the match on its own. But equal leads with *different* named
 /// collaborators disagree: "Rihanna feat. JAY-Z" is not "Rihanna
 /// feat. Drake", and serving one for the other returns wrong lyrics.
+/// The collaborator check runs before the full-norm early return —
+/// `norm` only sees ASCII-foldable text, so two different non-Latin
+/// tails can share one fold — and an un-foldable tail compares
+/// literally like `raw_title_eq`: an empty fold is never evidence
+/// between folded strings.
 pub fn artist_names_match(want: &str, got: &str) -> bool {
+    if let (Some(wt), Some(gt)) = (feature_tail(want), feature_tail(got)) {
+        let wtn = norm(&wt);
+        let gtn = norm(&gt);
+        let tails_agree = if wtn.is_empty() || gtn.is_empty() {
+            raw_title_eq(&wt, &gt)
+        } else {
+            wtn == gtn
+        };
+        if !tails_agree {
+            return false;
+        }
+    }
     let w = norm(want);
     let g = norm(got);
     if !w.is_empty() && w == g {
@@ -516,17 +533,7 @@ pub fn artist_names_match(want: &str, got: &str) -> bool {
     }
     let wp = norm(&primary_artist(want));
     let gp = norm(&primary_artist(got));
-    if wp.is_empty() || wp != gp {
-        return false;
-    }
-    match (feature_tail(want), feature_tail(got)) {
-        (Some(wt), Some(gt)) => {
-            let wtn = norm(&wt);
-            let gtn = norm(&gt);
-            wtn.is_empty() || gtn.is_empty() || wtn == gtn
-        }
-        _ => true,
-    }
+    !wp.is_empty() && wp == gp
 }
 
 /// Byte index of the first ASCII-case-insensitive `pat` in `hay` —
@@ -991,6 +998,43 @@ mod tests {
         ] {
             assert!(!artist_names_match(a, b), "{a} vs {b}");
         }
+    }
+
+    /// A non-Latin collaborator tail is still a *named* collaborator —
+    /// it folds to nothing under `norm`, so the disagreement gate must
+    /// compare it literally (the `raw_title_eq` idiom) and must run
+    /// before the full-norm early return: two different non-Latin
+    /// guests fold to the same `rihannafeat` norm.
+    #[test]
+    fn artist_names_match_rejects_non_latin_featured_partners() {
+        for (a, b) in [
+            // Equal full norms — the tail check must not be skipped by
+            // the early return.
+            ("Rihanna feat. 米津玄師", "Rihanna feat. 別の人"),
+            // A foldable guest against an un-foldable one: an empty
+            // fold is not agreement evidence.
+            ("Rihanna feat. JAY-Z", "Rihanna feat. 別の人"),
+            ("Rihanna feat. 米津玄師", "Rihanna feat. Drake"),
+            // Fully un-foldable credits: same lead fold, different
+            // literal acts and guests.
+            ("別の人 feat. 米津玄師", "別の人 feat. ある人"),
+        ] {
+            assert!(!artist_names_match(a, b), "{a} vs {b}");
+        }
+        for (a, b) in [
+            // The same literal guest still agrees, foldable or not.
+            ("Rihanna feat. 米津玄師", "Rihanna feat. 米津玄師"),
+            // A tail on only one side stays a lead-artist match.
+            ("Rihanna feat. 別の人", "Rihanna"),
+        ] {
+            assert!(artist_names_match(a, b), "{a} vs {b}");
+        }
+        // The served-record gate exercises the same path.
+        assert!(!names_query(
+            &rec("Roads", Some("Rihanna feat. 別の人"), true),
+            "Roads",
+            Some("Rihanna feat. 米津玄師")
+        ));
     }
 
     /// A minute tag beyond u64 arithmetic saturates instead of
