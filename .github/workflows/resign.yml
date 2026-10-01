@@ -5,10 +5,14 @@ name: resign
 # the Auqw repo pins `keyId`, so a release signed elsewhere can never
 # sync until provenance.key_id matches again).
 #
-# Requires the AUQW_PLUGINS_ED25519_KEY repo secret: the keypair JSON
+# Requires the AUQW_PLUGINS_ED25519_KEY secret: the keypair JSON
 # ({public_key_pem, private_key_pem} — the same JSON tooling/sign.mjs
-# reads via --key-file). Dispatch against the branch carrying the
-# release dir.
+# reads via --key-file). MANUAL STEP: the secret must live in a GitHub
+# Environment named "release-signing" whose deployment branches are
+# restricted to the default branch — a repo-level secret is readable by
+# a workflow_dispatch run on ANY ref, and that run's yaml is
+# branch-controlled, so it could exfiltrate the key or sign a forged
+# release. Dispatch against the default branch carrying the release dir.
 
 on:
   workflow_dispatch:
@@ -25,6 +29,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # The canonical key must never meet branch-controlled code: the job
+    # runs only on the default branch, and the release-signing
+    # environment's own deployment-branch restriction keeps the secret
+    # unreadable on any other ref even if this yaml is edited there.
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    environment: release-signing
     env:
       PLUGIN: ${{ inputs.plugin }}
       VERSION: ${{ inputs.version }}
@@ -48,18 +58,57 @@ jobs:
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "version must be semver x.y.z" >&2; exit 1; }
 
-      - name: pin the signer to the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      # Reproduce the artifact exactly like ci.yml does — same pinned
+      # toolchain, same cache, same per-crate build.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+
+      - name: reproduce the reviewed artifact
         run: |
-          # The canonical key must never meet branch-controlled code:
-          # dispatch on a writable branch would run that branch's
-          # sign.mjs with the private key, so a modified signer could
-          # exfiltrate it. The signer's bytes must equal the default
-          # branch's before the key is even materialized.
-          git fetch --depth=1 origin "$DEFAULT_BRANCH"
-          git show "FETCH_HEAD:tooling/sign.mjs" | cmp -s - tooling/sign.mjs \
-            || { echo 'tooling/sign.mjs differs from the default branch — refusing to run it with the release key' >&2; exit 1; }
+          # Sign only bytes a reviewed build produced: rebuild the
+          # plugin like ci.yml (same --remap-path-prefix RUSTFLAGS, one
+          # crate per invocation so features never unify across
+          # plugins) and require the release wasm to be the same bytes.
+          # A forged (wasm, manifest) pair whose digest was recomputed
+          # over the forged wasm passes sign.mjs's internal checks but
+          # fails here — before the canonical key is even materialized.
+          # The crate + artifact names derive from the plugin id the
+          # same way tooling/build.sh derives them.
+          export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot"
+          cargo build --target wasm32-unknown-unknown --release -p "auqw-$PLUGIN"
+          BUILT="target/wasm32-unknown-unknown/release/auqw_$(printf '%s' "$PLUGIN" | tr '-' '_').wasm"
+          RELEASED="releases/$PLUGIN/$VERSION/$PLUGIN-$VERSION.wasm"
+          test -f "$RELEASED" || { echo "release artifact $RELEASED missing" >&2; exit 1; }
+          echo "built:   $(sha256sum "$BUILT" | cut -d' ' -f1)"
+          echo "release: $(sha256sum "$RELEASED" | cut -d' ' -f1)"
+          [ "$(sha256sum "$BUILT" | cut -d' ' -f1)" = "$(sha256sum "$RELEASED" | cut -d' ' -f1)" ] \
+            || { echo "release wasm differs from the reviewed build — refusing to sign" >&2; exit 1; }
+
+      - name: require the shipped manifest to be the reviewed one
+        run: |
+          # The sandbox grant is read from the shipped manifest, so a
+          # release manifest that diverges from the reviewed source
+          # manifest can attest elevated permissions under the
+          # canonical signature. When the source manifest still names
+          # the dispatched version, the shipped manifest must be its
+          # exact bytes; when it has moved on, the wasm check above is
+          # the binding one (and already fails for a source tree that
+          # no longer builds this release).
+          SOURCE="plugins/$PLUGIN/manifest.json"
+          RELEASED="releases/$PLUGIN/$VERSION/plugin.manifest.json"
+          test -f "$SOURCE" || { echo "source manifest $SOURCE missing" >&2; exit 1; }
+          test -f "$RELEASED" || { echo "release manifest $RELEASED missing" >&2; exit 1; }
+          SRC_VERSION="$(node -e '
+            const m = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+            process.stdout.write(m.version ?? "");
+          ' "$SOURCE")"
+          if [ "$SRC_VERSION" = "$VERSION" ]; then
+            cmp -s "$SOURCE" "$RELEASED" \
+              || { echo "release manifest diverges from the reviewed $SOURCE" >&2; exit 1; }
+          fi
 
       - name: materialize the canonical key
         env:
