@@ -438,6 +438,37 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_survives_a_failed_log_call() {
+        // The log channel's own failure must never displace the typed
+        // verdict: the warn request answered `host_error` still leaves
+        // `rate-limit`, not the channel's `transient`.
+        let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
+        let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
+        assert_eq!(out["kind"], "log", "{out}");
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&out),
+            "error": {"kind": "transient", "message": "log channel down"},
+        }));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "rate-limit", "{out}");
+    }
+
+    #[test]
+    fn cancelled_log_call_propagates_over_rate_limit() {
+        // Terminal kinds outrank the typed verdict: `cancelled` is the
+        // abort signal, never a rate-limit.
+        let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
+        let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
+        assert_eq!(out["kind"], "log", "{out}");
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&out),
+            "error": {"kind": "cancelled", "message": "invocation stopped"},
+        }));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "cancelled", "{out}");
+    }
+
+    #[test]
     fn server_and_other_errors_are_transient() {
         for status in [500_u16, 503, 418] {
             let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));

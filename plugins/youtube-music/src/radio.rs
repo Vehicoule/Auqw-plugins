@@ -3,8 +3,11 @@
 //! `playback.candidates` uses. A `{source_ref}` payload seeds the
 //! `RDAMVM<videoId>` queue; a `{continuation}` payload fetches the next
 //! page through the opaque token a previous result carried. One `next`
-//! call per invocation — the guest never loops upstream, and a page
-//! without a `continuations` block is the honest terminal state
+//! call per invocation — except an empty page still arming a
+//! continuation, which is chased in-guest a bounded number of hops:
+//! relayed raw it arms the app's tail with a station that may never
+//! terminate, an anomaly the caller should never see. A page without
+//! a `continuations` block is the honest terminal state
 //! (`continuation: null`).
 
 use std::borrow::Cow;
@@ -1943,17 +1946,25 @@ fn next_refusal(resp: &HttpResponse) -> GuestError {
     }
 }
 
-/// One InnerTube `next` page. The seed asks for the video's automix
-/// queue; a panel `playlistId` naming a different queue is not this
-/// seed's radio — like the player path answering a foreign video id,
-/// it counts as unavailable rather than a substituted mix.
-pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
-    let (p, access_token) = parse_radio_payload(payload)?;
-    let visitor = load_visitor(VISITOR_KEY).await?;
+/// Empty pages followed while their `continuations` block stays live.
+/// A provider answering an endless run of item-less pages is an
+/// upstream anomaly, not a station — past this bound the invocation
+/// fails `transient` rather than relaying another armed page.
+const EMPTY_PAGE_CHASE_MAX: u32 = 4;
+
+/// One `next` request through the authorized path: terminal host kinds
+/// propagate, everything else degrades to `transient`; a 401 drops the
+/// session token for the rest of the invocation and re-asks bare once,
+/// matching the ladder's drop rule.
+async fn next_call(
+    body: &Value,
+    visitor: Option<&str>,
+    access_token: &mut Option<String>,
+) -> Result<HttpResponse, GuestError> {
     let mut resp = match http_request(web_remix_request(
         NEXT_URL,
-        next_body(&p),
-        visitor.as_deref(),
+        body.clone(),
+        visitor,
         access_token.as_deref(),
     ))
     .await
@@ -1968,16 +1979,10 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         Err(e) => return Err(e),
     };
     // A 401 proves the token dead — retry once bare so a stale token
-    // can't wall the seed, matching the ladder's drop rule.
+    // can't wall the page.
     if resp.status == 401 && access_token.is_some() {
-        resp = match http_request(web_remix_request(
-            NEXT_URL,
-            next_body(&p),
-            visitor.as_deref(),
-            None,
-        ))
-        .await
-        {
+        *access_token = None;
+        resp = match http_request(web_remix_request(NEXT_URL, body.clone(), visitor, None)).await {
             Ok(r) => r,
             Err(GuestError::Host { kind, message }) => match kind.as_str() {
                 "cancelled" | "permission-denied" | "invalid-response" => {
@@ -1989,56 +1994,95 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
         };
     }
     match resp.status {
-        s if (200..300).contains(&s) => {}
-        429 => return Err(failed("rate-limit", "rate-limit".into())),
-        _ => return Err(next_refusal(&resp)),
+        s if (200..300).contains(&s) => Ok(resp),
+        429 => Err(failed("rate-limit", "rate-limit".into())),
+        _ => Err(next_refusal(&resp)),
     }
-    // A 2xx `next` response must be a JSON envelope; the seed's
-    // `playabilityStatus` (when upstream sends one) is classified by
-    // the same taxonomy as the player path — a walled or unavailable
-    // seed fails honestly, never with a substituted queue.
-    let body: NextBody = serde_json::from_slice(&resp.body)
-        .map_err(|_| failed("invalid-response", "next body is not a JSON object".into()))?;
-    match next_playability(body.playability.as_ref()) {
-        Playability::Ok => {}
-        Playability::BotCheck => {
-            return Err(failed("provider-wall", "bot-check".into()));
-        }
-        Playability::SignInRequired | Playability::AgeRestricted => {
-            return Err(failed("auth-required", "sign-in-required".into()));
-        }
-        Playability::Unavailable => return Err(failed("no-result", "unavailable".into())),
-    }
-    if let Some(raw) = body
-        .response_context
-        .as_ref()
-        .and_then(|c| c.visitor_data.as_deref())
-        .filter(|s| !s.is_empty())
-    {
-        if let Some(visitor) = visitor_token(raw) {
-            kv_set_soft(VISITOR_KEY, Some(visitor.as_bytes())).await?;
-        } else {
-            warn("ignoring malformed visitor value").await?;
-        }
-    }
-    let panel = match &p {
-        RadioPayload::Seed(video_id) => {
-            let panel = seed_panel(&body)?;
-            if panel
-                .playlist_id
-                .as_deref()
-                .is_some_and(|pid| pid != format!("RDAMVM{video_id}"))
-            {
-                return Err(failed("no-result", "unavailable".into()));
+}
+
+/// One InnerTube `next` page. The seed asks for the video's automix
+/// queue; a panel `playlistId` naming a different queue is not this
+/// seed's radio — like the player path answering a foreign video id,
+/// it counts as unavailable rather than a substituted mix.
+pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
+    let (p, access_token) = parse_radio_payload(payload)?;
+    let visitor = load_visitor(VISITOR_KEY).await?;
+    let mut access_token = access_token;
+    let mut request_body = next_body(&p);
+    let mut seeded = false;
+    let mut chase = 0u32;
+    loop {
+        let resp = next_call(&request_body, visitor.as_deref(), &mut access_token).await?;
+        // A 2xx `next` response must be a JSON envelope; the page's
+        // `playabilityStatus` (when upstream sends one) is classified
+        // by the same taxonomy as the player path — a walled or
+        // unavailable page fails honestly, never with a substituted
+        // queue.
+        let body: NextBody = serde_json::from_slice(&resp.body)
+            .map_err(|_| failed("invalid-response", "next body is not a JSON object".into()))?;
+        match next_playability(body.playability.as_ref()) {
+            Playability::Ok => {}
+            Playability::BotCheck => {
+                return Err(failed("provider-wall", "bot-check".into()));
             }
-            panel
+            Playability::SignInRequired | Playability::AgeRestricted => {
+                return Err(failed("auth-required", "sign-in-required".into()));
+            }
+            Playability::Unavailable => return Err(failed("no-result", "unavailable".into())),
         }
-        RadioPayload::Continuation(_) => continuation_panel(&body)?,
-    };
-    Ok(json!({
-        "items": panel_items(panel),
-        "continuation": next_continuation(panel),
-    }))
+        if let Some(raw) = body
+            .response_context
+            .as_ref()
+            .and_then(|c| c.visitor_data.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(visitor) = visitor_token(raw) {
+                kv_set_soft(VISITOR_KEY, Some(visitor.as_bytes())).await?;
+            } else {
+                warn("ignoring malformed visitor value").await?;
+            }
+        }
+        let (items, continuation) = match &p {
+            RadioPayload::Seed(video_id) if !seeded => {
+                let panel = seed_panel(&body)?;
+                if panel
+                    .playlist_id
+                    .as_deref()
+                    .is_some_and(|pid| pid != format!("RDAMVM{video_id}"))
+                {
+                    return Err(failed("no-result", "unavailable".into()));
+                }
+                (panel_items(panel), next_continuation(panel))
+            }
+            _ => {
+                let panel = continuation_panel(&body)?;
+                (panel_items(panel), next_continuation(panel))
+            }
+        };
+        seeded = true;
+        // A page is honest while it carries items or declares the mix
+        // over. Empty but still armed is contradictory upstream
+        // output: relayed to the app it looks like a terminal page
+        // while secretly promising more — a station that never
+        // terminates. Chase the armed token in-guest, bounded; a
+        // chase that stays empty past the bound is upstream weather.
+        if !(items.is_empty() && continuation.is_some()) {
+            return Ok(json!({
+                "items": items,
+                "continuation": continuation,
+            }));
+        }
+        if chase >= EMPTY_PAGE_CHASE_MAX {
+            return Err(failed(
+                "transient",
+                "next pages stayed empty past the chase bound".into(),
+            ));
+        }
+        chase += 1;
+        request_body = next_body(&RadioPayload::Continuation(
+            continuation.unwrap_or_default(),
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -2299,6 +2343,88 @@ mod tests {
                         {"playlistId": format!("RDAMVM{VID}"), "contents": []}}}}}}]}}}},
         });
         let out = h.answer(&out, 200, &body.to_string());
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["items"].as_array().map(Vec::len), Some(0));
+        assert_eq!(out["result"]["continuation"], Value::Null);
+    }
+
+    /// An empty seed panel whose `continuations` block stays armed.
+    fn empty_seed_continued(token: &str) -> String {
+        json!({
+            "playabilityStatus": {"status": "OK"},
+            "contents": {"singleColumnMusicWatchNextResultsRenderer": {"tabbedRenderer":
+                {"watchNextTabbedResultsRenderer": {"tabs": [{"tabRenderer": {"content":
+                    {"musicQueueRenderer": {"content": {"playlistPanelRenderer":
+                        {"playlistId": format!("RDAMVM{VID}"), "contents": [],
+                         "continuations": [{"nextRadioContinuationData":
+                             {"continuation": token}}]}}}}}}]}}}},
+        })
+        .to_string()
+    }
+
+    /// An empty continuation page; a token keeps the tail armed,
+    /// `None` closes the mix.
+    fn empty_cont_page(token: Option<&str>) -> String {
+        json!({
+            "continuationContents": {"playlistPanelContinuation": {
+                "contents": [],
+                "continuations": match token {
+                    Some(t) => json!([{"nextContinuationData": {"continuation": t}}]),
+                    None => json!([]),
+                },
+            }},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn empty_page_with_live_continuation_is_chased() {
+        // Empty but still armed is contradictory output — not a
+        // terminal page. The guest follows the token instead of
+        // relaying a page that would stall the app's tail.
+        let mut h = Harness::new();
+        let out = h.invoke(seed_payload());
+        let out = h.answer(&out, 200, &empty_seed_continued("radio-cont-x1"));
+        // The chase re-asks the continuation verbatim — a paged
+        // request names no seed.
+        let body = body_of(&out);
+        assert_eq!(body["continuation"], "radio-cont-x1");
+        assert!(body.get("videoId").is_none());
+        let out = h.answer(&out, 200, CONT);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["continuation"], "radio-cont-002");
+        assert_eq!(out["result"]["items"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn empty_chase_is_bounded_and_fails_honestly() {
+        // A station that answers empty pages forever never returns a
+        // fake-terminal empty: past the bound the seed fails
+        // `transient` rather than minting a page that looks over.
+        let mut h = Harness::new();
+        let mut out = h.invoke(seed_payload());
+        out = h.answer(&out, 200, &empty_seed_continued("radio-cont-e0"));
+        for i in 0..EMPTY_PAGE_CHASE_MAX - 1 {
+            out = h.answer(
+                &out,
+                200,
+                &empty_cont_page(Some(&format!("radio-cont-e{i}"))),
+            );
+        }
+        // Still chasing — the last armed page's request is in flight.
+        assert_eq!(out["kind"], "http_request", "{out}");
+        let out = h.answer(&out, 200, &empty_cont_page(Some("radio-cont-ex")));
+        assert_eq!(fail_kind(&out).0, "transient");
+    }
+
+    #[test]
+    fn chased_empty_page_closing_is_done() {
+        // An armed-then-empty page that finally answers closed is the
+        // honest end — same terminal shape as an unarmed empty page.
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "continuation": "radio-cont-001" }));
+        let out = h.answer(&out, 200, &empty_cont_page(Some("radio-cont-e0")));
+        let out = h.answer(&out, 200, &empty_cont_page(None));
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["items"].as_array().map(Vec::len), Some(0));
         assert_eq!(out["result"]["continuation"], Value::Null);

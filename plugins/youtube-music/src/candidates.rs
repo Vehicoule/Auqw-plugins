@@ -471,58 +471,80 @@ pub(crate) fn is_furniture(text: &str) -> bool {
 /// Largest HTTPS thumbnail in the renderer by width×height: contract-
 /// legal URLs only (≤2048 chars), and dimensions serialize as null
 /// rather than schema-invalid zeros.
+fn artwork_thumbs(list: &[Value], best: &mut Option<(u64, Value)>) {
+    for t in list {
+        let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+        if !url.starts_with("https://") || url.len() > 2048 {
+            continue;
+        }
+        let w = t.get("width").and_then(Value::as_u64).unwrap_or(0);
+        let h = t.get("height").and_then(Value::as_u64).unwrap_or(0);
+        let area = w.saturating_mul(h);
+        if best.as_ref().is_none_or(|(a, _)| area > *a) {
+            *best = Some((
+                area,
+                json!({
+                    "url": url,
+                    "width": t.get("width").and_then(Value::as_u64).filter(|w| *w > 0),
+                    "height": t.get("height").and_then(Value::as_u64).filter(|h| *h > 0),
+                }),
+            ));
+        }
+    }
+}
+
+fn artwork_walk_obj(
+    o: &Map<String, Value>,
+    depth: usize,
+    nodes: &mut usize,
+    best: &mut Option<(u64, Value)>,
+) {
+    for (k, child) in o {
+        if k == "thumbnails" {
+            if let Value::Array(list) = child {
+                artwork_thumbs(list, best);
+            }
+        }
+        artwork_walk(child, depth + 1, nodes, best);
+    }
+}
+
+fn artwork_walk(v: &Value, depth: usize, nodes: &mut usize, best: &mut Option<(u64, Value)>) {
+    if depth > MAX_DEPTH || *nodes >= MAX_NODES {
+        return;
+    }
+    *nodes += 1;
+    match v {
+        Value::Object(o) => artwork_walk_obj(o, depth, nodes, best),
+        Value::Array(a) => {
+            for child in a {
+                artwork_walk(child, depth + 1, nodes, best);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `Value`-rooted entry kept for tests — production walks `&Map`
+/// roots through [`best_artwork_obj`] so a `Value::Object` re-wrap
+/// never deep-clones the renderer.
+#[cfg(test)]
 pub(crate) fn best_artwork(v: &Value) -> Option<Value> {
     let mut best: Option<(u64, Value)> = None;
     let mut nodes = 0usize;
-    fn walk(v: &Value, depth: usize, nodes: &mut usize, best: &mut Option<(u64, Value)>) {
-        if depth > MAX_DEPTH || *nodes >= MAX_NODES {
-            return;
-        }
-        *nodes += 1;
-        match v {
-            Value::Object(o) => {
-                for (k, child) in o {
-                    if k == "thumbnails" {
-                        if let Value::Array(list) = child {
-                            for t in list {
-                                let url = t.get("url").and_then(Value::as_str).unwrap_or("");
-                                if !url.starts_with("https://") || url.len() > 2048 {
-                                    continue;
-                                }
-                                let w = t.get("width").and_then(Value::as_u64).unwrap_or(0);
-                                let h = t.get("height").and_then(Value::as_u64).unwrap_or(0);
-                                let area = w.saturating_mul(h);
-                                if best.as_ref().is_none_or(|(a, _)| area > *a) {
-                                    *best = Some((
-                                        area,
-                                        json!({
-                                            "url": url,
-                                            "width": t
-                                                .get("width")
-                                                .and_then(Value::as_u64)
-                                                .filter(|w| *w > 0),
-                                            "height": t
-                                                .get("height")
-                                                .and_then(Value::as_u64)
-                                                .filter(|h| *h > 0),
-                                        }),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    walk(child, depth + 1, nodes, best);
-                }
-            }
-            Value::Array(a) => {
-                for child in a {
-                    walk(child, depth + 1, nodes, best);
-                }
-            }
-            _ => {}
-        }
-    }
-    walk(v, 0, &mut nodes, &mut best);
+    artwork_walk(v, 0, &mut nodes, &mut best);
+    best.map(|(_, art)| art)
+}
+
+/// The same scan rooted at a renderer map — `item_of` holds `&Map`
+/// and cloning it into a `Value` just to name the root one is a deep
+/// clone of every renderer the search walks.
+fn best_artwork_obj(o: &Map<String, Value>) -> Option<Value> {
+    let mut best: Option<(u64, Value)> = None;
+    // One node for the root object itself, matching `artwork_walk`'s
+    // accounting on a `Value::Object` at depth 0.
+    let mut nodes = 1usize;
+    artwork_walk_obj(o, 0, &mut nodes, &mut best);
     best.map(|(_, art)| art)
 }
 
@@ -533,8 +555,8 @@ fn item_of(r: &Map<String, Value>) -> Option<Value> {
     let flex = r
         .get("flexColumns")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let title = flex.first().and_then(text_of)?;
     // `trackMetadata.title` caps at 512 scalars — drop the row rather
     // than emit a contract-invalid result.
@@ -546,11 +568,9 @@ fn item_of(r: &Map<String, Value>) -> Option<Value> {
     let mut second_col_text: Option<String> = None;
     let mut album: Option<String> = None;
     let mut duration_ms: Option<u64> = None;
-    let mut columns: Vec<Value> = flex.iter().skip(1).cloned().collect();
-    if let Some(fixed) = r.get("fixedColumns").and_then(Value::as_array) {
-        columns.extend(fixed.iter().cloned());
-    }
-    for (ci, col) in columns.iter().enumerate() {
+    let fixed = r.get("fixedColumns").and_then(Value::as_array);
+    let columns = flex.iter().skip(1).chain(fixed.into_iter().flatten());
+    for (ci, col) in columns.enumerate() {
         for run in column_runs(col) {
             let Some(text) = run_text(run).map(str::trim).filter(|s| !s.is_empty()) else {
                 continue;
@@ -584,9 +604,7 @@ fn item_of(r: &Map<String, Value>) -> Option<Value> {
         }
     }
     let artist = artist.or(second_col_text);
-    let artwork = best_artwork(&Value::Object(r.clone()))
-        .into_iter()
-        .collect::<Vec<Value>>();
+    let artwork = best_artwork_obj(r).into_iter().collect::<Vec<Value>>();
     Some(json!({
         "source_ref": { "provider": "youtube-music", "kind": "track", "id": video_id },
         "title": title,

@@ -134,9 +134,9 @@ pub fn format_outcome(body: &Value) -> FormatOutcome {
     let formats = body
         .pointer("/streamingData/adaptiveFormats")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for format in &formats {
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    for format in formats {
         let mime = format.get("mimeType").and_then(Value::as_str).unwrap_or("");
         if !mime.starts_with("audio/") {
             continue;
@@ -271,14 +271,24 @@ pub fn pick_audio(body: &Value, options: PickOptions<'_>) -> Option<Picked> {
     })
 }
 
+/// `contentLength` rides out in the resolve result and positions the
+/// tail probe, so it is bounded on both ends. The ABI declares the
+/// field a u64 with no tighter max — this cap is the guest's own
+/// domain bound: an audio object past 4 GiB is outside what the
+/// manifest should claim, and the value stays inside u32 math
+/// downstream.
+const MAX_CONTENT_LENGTH: u64 = u32::MAX as u64;
+
 /// `contentLength` arrives as a JSON string on live responses; accept a
-/// number too so fixtures can use either shape.
+/// number too so fixtures can use either shape. An over-large claim
+/// saturates at the bound rather than riding out raw.
 fn content_length(format: &Value) -> Option<u64> {
     let v = format.get("contentLength")?;
     v.as_str()
         .and_then(|s| s.parse::<u64>().ok())
         .or_else(|| v.as_u64())
         .filter(|len| *len > 0)
+        .map(|len| len.min(MAX_CONTENT_LENGTH))
 }
 
 /// Pull `expire=<unix seconds>` out of the URL and convert to ms.
