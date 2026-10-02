@@ -1,7 +1,7 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:ac67247fc5b8851b6f7ad5eb8a2172fe3953743cf11b43e1f741236ff7759ad2",
+    "digest": "sha256:511805775d2636270a8e2a33a79f40d1af1d8e83892679d0a7aee16412f4d07e",
     "path": "dist/lyrics-lrclib.wasm"
   },
   "capabilities": [
