@@ -92,8 +92,9 @@ Each rung has a stable KV key (`VISIONOS`, `IOS`,
   warning.
 - `pot/aside` and `pot/aside/<video-id>` — `{until_ms}` JSON, the
   poToken mint cooldown (60 s). A miss that can only be the provider
-  (permission-denied, unreachable, 5xx, a tokenless 200) is remembered
-  globally; a refusal that can bind to the asked video (4xx) is
+  (permission-denied, unreachable, its own 429, 5xx, a tokenless 200)
+  is remembered globally; a refusal that can bind to the asked video
+  (other 4xx) is
   remembered under the video's own key so one video's refusal never
   suppresses another's mint. Inside the window `mint_once` returns
   without calling the provider; a successful mint clears both scopes
