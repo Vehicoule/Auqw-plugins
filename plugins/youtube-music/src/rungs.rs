@@ -1,5 +1,5 @@
 //! The client ladder: `VISIONOS`, `IOS`, the predecessor's proven-bare
-//! `ANDROID_VR` pins and a plain `ANDROID`, then three `ANDROID_VR`
+//! `ANDROID_VR` pins and a plain `ANDROID`, then more `ANDROID_VR`
 //! fallbacks. Client versions are load-bearing: newer IOS builds are
 //! served SABR-only. Pin, don't track upstream.
 
@@ -48,8 +48,10 @@ impl Rung {
 /// with no poToken — runs second so it is always reached whenever
 /// `VISIONOS` walls, before the attestable `IOS` is the second
 /// web-attestable rung (occasionally SABR-only on newer versions —
-/// hence the 20.10.4 pin), then `ANDROID_VR` 1.61.29, plain `ANDROID`,
-/// and the Oculus-pinned `ANDROID_VR` trio.
+/// hence the 20.10.4 pin), then `ANDROID_VR` 1.61.29, the newest
+/// plain-UA pin `ANDROID_VR` 1.62.27 (live-verified 2026-10 serving
+/// plain audio bare), plain `ANDROID`, and the Oculus-pinned
+/// `ANDROID_VR` trio.
 ///
 /// The bare pass always walks the whole ladder — a bot-check on an
 /// `ANDROID*` client demonstrates nothing attestation can fix (those
@@ -68,6 +70,13 @@ impl Rung {
 /// MWEB fails `UNPLAYABLE` either way. The resolve therefore runs the
 /// ladder bare first, then replays only the *attestable* bot-checked
 /// rungs with attestation — see `guest.rs`.
+///
+/// Second edge: `REDRAW_PLAYER_URL` is the same `player` call on
+/// `youtubei.googleapis.com` — Google API infrastructure rather than
+/// the `*.youtube.com` edge. Live-verified 2026-10: identical request
+/// shape, identical response. Wall and rate-limit decisions are
+/// per-edge, so the resolve's last remedy is a bare redraw of every
+/// weather-outcome rung on that edge — see `guest.rs`.
 ///
 /// Stream caps: any minted URL may be GVS-capped to a ~1 MiB served
 /// budget; enforcement is stochastic per-mint, not client-deterministic
@@ -128,6 +137,19 @@ pub const LADDER: &[Rung] = &[
         client_name_id: "28",
         client_version: "1.61.29",
         user_agent: "com.google.android.youtube/1.61.29 (Linux; U; Android 13; US) gzip",
+        context: || {
+            json!({
+                "gl": "US",
+                "hl": "en",
+            })
+        },
+    },
+    Rung {
+        name: "ANDROID_VR@1.62.27",
+        attestable: false,
+        client_name_id: "28",
+        client_version: "1.62.27",
+        user_agent: "com.google.android.youtube/1.62.27 (Linux; U; Android 13; US) gzip",
         context: || {
             json!({
                 "gl": "US",
@@ -210,6 +232,13 @@ pub const LADDER: &[Rung] = &[
 /// InnerTube API key — the same one every official client ships; a
 /// keyless `player` call reads as a forged request to the abuse edge.
 pub const PLAYER_URL: &str = "https://music.youtube.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
+
+/// The redraw pass's `player` endpoint: the same call on
+/// `youtubei.googleapis.com`. Verified 2026-10 to answer every ladder
+/// identity with the same `playabilityStatus` and format list — while
+/// being a different serving edge with its own wall/rate-limit
+/// verdicts, which is exactly what a second draw needs.
+pub const REDRAW_PLAYER_URL: &str = "https://youtubei.googleapis.com/youtubei/v1/player?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
 /// Append `pot=<token>` to a googlevideo stream URL. Non-googlevideo
 /// URLs and URLs already carrying `pot=` pass through unchanged. The
@@ -311,13 +340,16 @@ pub fn probe_request(rung: &Rung, url: &str, content_length: Option<u64>) -> Htt
 /// mint serves both contexts. `auth` is the app-held OAuth access
 /// token: when present it rides `Authorization: Bearer`, the
 /// session-trust header that lifts bot-check walls for account-backed
-/// sessions.
+/// sessions. `endpoint` is the `player` URL — `PLAYER_URL` for the
+/// bare and attested passes, `REDRAW_PLAYER_URL` for the
+/// alternate-edge redraw.
 pub fn player_request(
     rung: &Rung,
     video_id: &str,
     visitor_id: Option<&str>,
     pot: Option<&str>,
     auth: Option<&str>,
+    endpoint: &str,
 ) -> HttpRequest {
     let mut client = serde_json::Map::new();
     client.insert("clientName".into(), json!(rung.innertube_name()));
@@ -366,7 +398,7 @@ pub fn player_request(
     }
     HttpRequest {
         method: "POST".into(),
-        url: PLAYER_URL.into(),
+        url: endpoint.into(),
         headers,
         body: Some(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec())),
     }
