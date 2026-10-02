@@ -38,6 +38,13 @@ const CAPPED_BACKOFF_MS: u64 = 5_000;
 /// `ladder/last-good` — the `kv_key` of the rung that finished the
 /// last `done` resolve. A pure attempt-order hint: see `last_good`.
 const LAST_GOOD_KEY: &str = "ladder/last-good";
+/// `pot/aside` records the ms timestamp until which the poToken mint
+/// is skipped: a provider that just failed (503, denied, transient)
+/// decorates nothing when it degrades anyway, so the next resolve
+/// skips the serial call — one retry per window keeps the attested
+/// path open when the sidecar comes back.
+const POT_ASIDE_KEY: &str = "pot/aside";
+const POT_ASIDE_MS: u64 = 60_000;
 
 /// `ladder/last-edge` — which serving edge finished the last `done`
 /// resolve: "b" marks the redraw host as the one to open with. The
@@ -1224,7 +1231,14 @@ async fn mint_once(
         return Ok(pot.is_some());
     }
     *mint_attempted = true;
-    match pot_token(video_id).await {
+    // A still-warm aside short-circuits the call — a stale or
+    // malformed record falls through and earns a fresh probe.
+    if let Some(until) = pot_aside_until().await? {
+        if until > now_ms().await? {
+            return Ok(false);
+        }
+    }
+    let outcome = match pot_token(video_id).await {
         Ok(r) if r.status == 200 => {
             *pot = serde_json::from_slice::<Value>(&r.body).ok().and_then(|j| {
                 ["poToken", "po_token", "token"]
@@ -1246,6 +1260,32 @@ async fn mint_once(
             }
         }
         Err(e) => Err(e),
+    }?;
+    if outcome {
+        // A mint that landed clears any stale aside the failed
+        // resolves wrote.
+        kv_set_soft(POT_ASIDE_KEY, None).await?;
+    } else {
+        let until = now_ms().await?.saturating_add(POT_ASIDE_MS);
+        let record = serde_json::to_vec(&json!({ "until_ms": until })).unwrap_or_default();
+        kv_set_soft(POT_ASIDE_KEY, Some(&record)).await?;
+    }
+    Ok(outcome)
+}
+
+/// The `until_ms` inside a `pot/aside` record — a bare `{"until_ms":
+/// u64}` object; anything else is ignored (the call proceeds) rather
+/// than risking a wedge on a foreign write.
+async fn pot_aside_until() -> Result<Option<u64>, GuestError> {
+    match kv_get_soft(POT_ASIDE_KEY).await? {
+        Some(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(v) => Ok(v.get("until_ms").and_then(Value::as_u64)),
+            Err(_) => {
+                warn("ignoring malformed pot-aside KV value").await?;
+                Ok(None)
+            }
+        },
+        None => Ok(None),
     }
 }
 
@@ -2394,7 +2434,18 @@ mod tests {
         }
         assert_eq!(out["kind"], "http_request");
         let id = out["id"].as_u64().unwrap_or(u64::MAX);
-        let out = step(&http_response(id, 200, OK));
+        let mut out = step(&http_response(id, 200, OK));
+        // The pot/aside KV read rides between the pick and the mint.
+        loop {
+            match out["kind"].as_str().unwrap_or("") {
+                "kv_get" => {
+                    let id = out["id"].as_u64().unwrap_or(u64::MAX);
+                    out = step(&json!({"type":"kv_response","id":id,"value":null}));
+                }
+                "pot_token" => break,
+                other => panic!("unexpected kind {other}"),
+            }
+        }
         assert_eq!(out["kind"], "pot_token");
         assert_eq!(out["payload"]["content_binding"], VID);
     }
@@ -2416,6 +2467,10 @@ mod tests {
         assert_eq!(out["kind"], "kv_set");
         let id = out["id"].as_u64().unwrap_or(u64::MAX);
         out = step(&json!({ "type": "host_ok", "id": id }));
+        // Then the pot/aside KV read before the mint call.
+        assert_eq!(out["kind"], "kv_get");
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        out = step(&json!({"type":"kv_response","id":id,"value":null}));
         assert_eq!(out["kind"], "pot_token");
         assert_eq!(out["payload"]["content_binding"], VID);
     }
@@ -4336,5 +4391,72 @@ mod tests {
             let out = h.invoke(payload.clone());
             assert_eq!(fail_kind(&out).0, "invalid-response", "{payload}");
         }
+    }
+
+    #[test]
+    fn failed_mint_writes_pot_aside_and_next_resolve_skips_the_call() {
+        let mut h = Harness::new(); // Pot::Deny default
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+        // The denied mint is remembered for the window.
+        let aside = h.committed.get(POT_ASIDE_KEY).cloned().unwrap_or_default();
+        let v: Value = serde_json::from_slice(&aside).unwrap_or_default();
+        assert_eq!(v["until_ms"].as_u64(), Some(NOW + POT_ASIDE_MS));
+
+        // A second resolve inside the window pays no mint call —
+        // the aside short-circuits it before the provider is asked.
+        let out = h.invoke(json!({ "source_ref": VID }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+        // A resolve that never minted leaves the aside in force.
+        assert!(h.committed.contains_key(POT_ASIDE_KEY));
+
+        // Past the window the provider earns a fresh probe.
+        h.now = NOW + POT_ASIDE_MS + 1;
+        let out = h.invoke(json!({ "source_ref": VID }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 2);
+    }
+
+    #[test]
+    fn expired_aside_retries_and_a_successful_mint_clears_it() {
+        let mut h = Harness::new();
+        h.committed.insert(
+            POT_ASIDE_KEY.to_string(),
+            serde_json::to_vec(&json!({ "until_ms": NOW - 1 })).unwrap_or_default(),
+        );
+        h.pot = Pot::Token("tok-abc");
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+        assert!(!h.committed.contains_key(POT_ASIDE_KEY));
+    }
+
+    #[test]
+    fn malformed_aside_record_is_ignored() {
+        let mut h = Harness::new();
+        h.committed
+            .insert(POT_ASIDE_KEY.to_string(), b"{not json".to_vec());
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // The foreign write wedges nothing: the provider still earns
+        // its probe (and overwrites the record with a fresh aside).
+        assert_eq!(h.pot_calls, 1);
     }
 }
