@@ -435,12 +435,15 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
 /// Use is read off the module's data segments: the SDK's `host_call`
 /// kind strings are `&'static str` literals and live in rodata —
 /// `kv` → `kv_get`/`kv_set`, `pot-provider` → `pot_token`,
-/// `network:*` → `http_request`. (`resume` is the paginated-fetch
-/// continue call — only ever compiled in alongside `http_request`, so
-/// it witnesses nothing extra.) Granularity stops there: a `network:` entry binds a
-/// destination at fetch time, and the fetched URL comes from provider
-/// payloads rather than literals, so an unused *destination* is not
-/// statically decidable.
+/// `network:<dest>` → the guest must fetch (`http_request`) AND carry
+/// the destination literal — guests format their fetch URLs, so a
+/// declared host that never appears in rodata is dead scope. A
+/// wildcard destination (`*.host`) is exempt: its URLs arrive in
+/// provider payloads rather than literals. (`resume` is the
+/// paginated-fetch continue call — only ever compiled in alongside
+/// `http_request`, so it witnesses nothing extra.) A destination can
+/// still be over-granted at fetch time — granularity stops where the
+/// literals do.
 fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<(), String> {
     let mut segments: Vec<&[u8]> = Vec::new();
     for payload in Parser::new(0).parse_all(wasm) {
@@ -468,9 +471,15 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
             has("kv_get") || has("kv_set")
         } else if p == "pot-provider" {
             has("pot_token")
+        } else if let Some(dest) = p.strip_prefix("network:") {
+            // The guest must fetch at all, and a non-wildcard
+            // destination must appear as a literal (its URLs are
+            // formatted in the guest). Wildcards are exempt: their
+            // URLs arrive in provider payloads.
+            has("http_request") && (dest.contains('*') || has(dest))
         } else {
-            // network:<dest> — exercised iff the guest fetches at all.
-            has("http_request")
+            // Permission kinds without a statically-decidable use.
+            true
         };
         if !used {
             return Err(format!(
@@ -481,26 +490,47 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
     Ok(())
 }
 
+/// A capability no plugin can legitimately declare — probing it must
+/// yield the canonical dispatch fallback, proving the guest routes by
+/// capability name at all. Without the contract a guest that ignores
+/// `capability` and fails every request looks "served" for any
+/// declaration.
+const DISPATCH_SENTINEL: &str = "auqw.sentinel";
+
 /// A declared capability the guest does not serve is silent scope —
 /// the host would route invocations that always fail `not-applicable`.
 /// The dispatch match's string literals never reach the artifact (LLVM
 /// folds them into immediate compares), so the guest itself is asked:
 /// feed one `invoke` step per declared capability and read the first
-/// reply. Fuel is capped so a looped guest cannot hang the check.
+/// reply. The undeclared sentinel is probed first — its reply must be
+/// the canonical `not-applicable` fallback, or the probe cannot trust
+/// what a declared reply means. Fuel is capped so a looped guest
+/// cannot hang the check.
 fn check_capability_support(manifest: &serde_json::Value, wasm: &[u8]) -> Result<(), String> {
     let caps = manifest["capabilities"]
         .as_array()
         .ok_or_else(|| "manifest.capabilities must be an array".to_string())?;
+    if caps.is_empty() {
+        return Ok(());
+    }
     let mut config = wasmi::Config::default();
     config.consume_fuel(true);
     let engine = wasmi::Engine::new(&config);
     let module = wasmi::Module::new(&engine, wasm)
         .map_err(|e| format!("cannot load module for the capability probe: {e}"))?;
+    let sentinel = probe_capability(&engine, &module, DISPATCH_SENTINEL)?;
+    if !is_dispatch_fallback(&sentinel, DISPATCH_SENTINEL) {
+        return Err(format!(
+            "guest does not answer {DISPATCH_SENTINEL:?} with the not-applicable \
+             dispatch fallback — capability routing cannot be verified"
+        ));
+    }
     for cap in caps {
         let Some(name) = cap.as_str() else {
             return Err("manifest.capabilities entries must be strings".into());
         };
-        if !probe_capability(&engine, &module, name)? {
+        let reply = probe_capability(&engine, &module, name)?;
+        if is_dispatch_fallback(&reply, name) {
             return Err(format!(
                 "manifest.capabilities entry {name:?} is not implemented by the guest"
             ));
@@ -509,20 +539,28 @@ fn check_capability_support(manifest: &serde_json::Value, wasm: &[u8]) -> Result
     Ok(())
 }
 
+/// The reply every SDK dispatch produces for an unrouted capability:
+/// `fail` + `not-applicable` + `capability <name> not supported` (the
+/// SDK prefixes every error message with its kind). An
+/// implementation's *own* `not-applicable` (a provider/kind mismatch)
+/// carries a different message and is never confused for the fallback.
+fn is_dispatch_fallback(reply: &serde_json::Value, cap: &str) -> bool {
+    reply["type"].as_str() == Some("fail")
+        && reply["error"]["kind"].as_str() == Some("not-applicable")
+        && reply["error"]["message"].as_str()
+            == Some(&format!("not-applicable: capability {cap} not supported"))
+}
+
 /// One fresh instance per probe — an invocation's state does not carry
 /// across `handle` entries. Sends `{"type":"invoke",...,"payload":{}}`
-/// and reports `false` only when the guest's first reply is the
-/// dispatch fallback's `not-applicable` + `capability <name> not
-/// supported` pair. A served capability answers `invalid-response`
-/// (the empty payload fails its own schema first) or a host-call
-/// request; an implementation's *own* `not-applicable` (a provider/kind
-/// mismatch) carries a different message and is never confused for the
-/// fallback.
+/// and returns the guest's first reply. A served capability answers
+/// `invalid-response` (the empty payload fails its own schema first)
+/// or a host-call request.
 fn probe_capability(
     engine: &wasmi::Engine,
     module: &wasmi::Module,
     cap: &str,
-) -> Result<bool, String> {
+) -> Result<serde_json::Value, String> {
     const FUEL: u64 = 20_000_000;
     let mut store = wasmi::Store::new(engine, ());
     store
@@ -572,12 +610,8 @@ fn probe_capability(
     if out_end > data.len() {
         return Err("guest reply lies outside its linear memory".into());
     }
-    let reply: serde_json::Value = serde_json::from_slice(&data[out_ptr..out_end])
-        .map_err(|e| format!("guest reply is not JSON: {e}"))?;
-    let unserved = reply["type"].as_str() == Some("fail")
-        && reply["error"]["kind"].as_str() == Some("not-applicable")
-        && reply["error"]["message"].as_str() == Some(&format!("capability {cap} not supported"));
-    Ok(!unserved)
+    serde_json::from_slice(&data[out_ptr..out_end])
+        .map_err(|e| format!("guest reply is not JSON: {e}"))
 }
 
 #[cfg(test)]
@@ -792,7 +826,13 @@ mod tests {
 
     #[test]
     fn alignment_passes_when_claims_match_guest() {
-        let wasm = wasm_with_literals(&["playback.resolve", "http_request", "kv_get", "pot_token"]);
+        let wasm = wasm_with_literals(&[
+            "playback.resolve",
+            "http_request",
+            "x.test",
+            "kv_get",
+            "pot_token",
+        ]);
         assert_eq!(
             check_guest_alignment(
                 &manifest(
@@ -806,26 +846,52 @@ mod tests {
         );
     }
 
-    /// A module whose `handle` ignores the input and replies with the
-    /// given bytes — the probe tests' answer, staged at offset 1024.
-    fn wasm_replying(reply: &str) -> Vec<u8> {
-        let escaped = reply.replace('\\', "\\\\").replace('"', "\\\"");
+    /// The canonical reply an SDK dispatch gives an unrouted probe.
+    const FALLBACK_SENTINEL: &str = "{\"type\":\"fail\",\"error\":{\"kind\":\"not-applicable\",\
+        \"message\":\"not-applicable: capability auqw.sentinel not supported\"}}";
+
+    /// A module whose `handle` answers `sentinel_reply` when the probed
+    /// capability starts with `sentinel_first` and `other_reply`
+    /// otherwise — the capability name sits at a fixed offset inside
+    /// the serialized invoke step (located dynamically so serde_json's
+    /// key order cannot silently move it).
+    fn wasm_dispatcher(sentinel_first: u8, sentinel_reply: &str, other_reply: &str) -> Vec<u8> {
+        let step = serde_json::json!({
+            "type": "invoke",
+            "request_id": "auqw-validate",
+            "capability": "Q",
+            "payload": {},
+        })
+        .to_string();
+        let off = step.find('Q').unwrap_or_default();
+        let s_esc = sentinel_reply.replace('\\', "\\\\").replace('"', "\\\"");
+        let o_esc = other_reply.replace('\\', "\\\\").replace('"', "\\\"");
         wat::parse_str(format!(
             "(module
                 (memory (export \"memory\") 1)
-                (data (i32.const 1024) \"{escaped}\")
+                (data (i32.const 2048) \"{s_esc}\")
+                (data (i32.const 4096) \"{o_esc}\")
                 (func (export \"alloc\") (param i32) (result i32) (i32.const 16))
-                (func (export \"handle\") (param i32 i32) (result i64) (i64.const {})))",
-            (1024u64 << 32) | reply.len() as u64
+                (func (export \"handle\") (param i32 i32) (result i64)
+                    (select
+                        (i64.const {})
+                        (i64.const {})
+                        (i32.eq
+                            (i32.load8_u (i32.add (local.get 0) (i32.const {off})))
+                            (i32.const {sentinel_first})))))",
+            (2048u64 << 32) | sentinel_reply.len() as u64,
+            (4096u64 << 32) | other_reply.len() as u64,
         ))
         .unwrap_or_default()
     }
 
     #[test]
     fn capability_probe_detects_dispatch_fallback() {
-        let wasm = wasm_replying(
+        let wasm = wasm_dispatcher(
+            b'a',
+            FALLBACK_SENTINEL,
             "{\"type\":\"fail\",\"error\":{\"kind\":\"not-applicable\",\
-             \"message\":\"capability bogus.cap not supported\"}}",
+             \"message\":\"not-applicable: capability bogus.cap not supported\"}}",
         );
         assert!(
             check_capability_support(&manifest("0.3.0", "[\"bogus.cap\"]", "[]"), &wasm)
@@ -836,27 +902,64 @@ mod tests {
     #[test]
     fn capability_probe_accepts_served_replies() {
         // A served capability fails the empty payload with its own
-        // error kind, not the dispatch fallback's.
+        // error kind, a host-call request, or a result — and an
+        // implementation's own not-applicable (a provider/kind
+        // mismatch) is not the dispatch fallback.
         for reply in [
             "{\"type\":\"fail\",\"error\":{\"kind\":\"invalid-response\",\"message\":\"payload: missing\"}}",
             "{\"type\":\"kv_get\",\"id\":1,\"key\":\"x\"}",
             "{\"type\":\"done\",\"result\":{}}",
+            "{\"type\":\"fail\",\"error\":{\"kind\":\"not-applicable\",\"message\":\"ref is not a deezer track ref\"}}",
         ] {
-            let wasm = wasm_replying(reply);
+            let wasm = wasm_dispatcher(b'a', FALLBACK_SENTINEL, reply);
             assert_eq!(
                 check_capability_support(&manifest("0.3.0", "[\"playback.resolve\"]", "[]"), &wasm),
                 Ok(()),
                 "{reply}"
             );
         }
-        // An implementation's own not-applicable (a provider/kind
-        // mismatch) is not the dispatch fallback.
-        let wasm = wasm_replying(
-            "{\"type\":\"fail\",\"error\":{\"kind\":\"not-applicable\",\
-             \"message\":\"ref is not a deezer track ref\"}}",
+    }
+
+    #[test]
+    fn capability_probe_rejects_absent_dispatch_contract() {
+        // A guest that ignores `capability` and fails uniformly has no
+        // routing — without the sentinel check every declaration would
+        // look served.
+        let wasm = wasm_dispatcher(
+            b'a',
+            "{\"type\":\"fail\",\"error\":{\"kind\":\"invalid-response\",\"message\":\"bad payload\"}}",
+            "{\"type\":\"fail\",\"error\":{\"kind\":\"invalid-response\",\"message\":\"bad payload\"}}",
         );
+        assert!(check_capability_support(
+            &manifest("0.3.0", "[\"playback.resolve\"]", "[]"),
+            &wasm
+        )
+        .is_err_and(|e| e.contains("cannot be verified")));
+    }
+
+    #[test]
+    fn alignment_checks_network_destination_literals() {
+        // A declared non-wildcard destination must appear as a literal.
+        let wasm = wasm_with_literals(&["http_request", "api.deezer.com"]);
+        assert!(check_guest_alignment(
+            &manifest("0.3.0", "[]", "[\"network:itunes.apple.com\"]"),
+            &wasm
+        )
+        .is_err_and(|e| e.contains("itunes.apple.com")));
         assert_eq!(
-            check_capability_support(&manifest("0.3.0", "[\"catalog.entity\"]", "[]"), &wasm),
+            check_guest_alignment(
+                &manifest("0.3.0", "[]", "[\"network:api.deezer.com\"]"),
+                &wasm
+            ),
+            Ok(())
+        );
+        // Wildcard destinations ride on payload URLs — undecidable.
+        let wasm = wasm_with_literals(&["http_request"]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest("0.3.0", "[]", "[\"network:*.googlevideo.com\"]"),
+                &wasm
+            ),
             Ok(())
         );
     }
