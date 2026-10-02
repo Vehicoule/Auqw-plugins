@@ -23,17 +23,18 @@ accepts the legacy 11-character video-id string or a
 - `resume_offset` (null/absent or u64): validated seam input for the
   Slice 1.5 re-mint path; byte pumping itself is Slice 1.5-owned.
 
-It walks an eight-rung, version-pinned client ladder. The static
+It walks a nine-rung, version-pinned client ladder. The static
 fallback order is:
 
 1. `VISIONOS` 1.02
 2. `ANDROID_VR` 1.57.29
 3. `IOS` 20.10.4
 4. `ANDROID_VR` 1.61.29
-5. `ANDROID` 20.19.36
-6. `ANDROID_VR` 1.61.48
-7. `ANDROID_VR` 1.60.19
-8. `ANDROID_VR` 1.43.32
+5. `ANDROID_VR` 1.62.27
+6. `ANDROID` 20.19.36
+7. `ANDROID_VR` 1.61.48
+8. `ANDROID_VR` 1.60.19
+9. `ANDROID_VR` 1.43.32
 
 Once a resolve has finished, the winning rung's key is kept under
 `ladder/last-good` and leads the next resolve's attempt order (the
@@ -190,9 +191,22 @@ URL; `cancelled` propagates. The one token serves two consumers:
   Live-verified 2026-09: VISIONOS and IOS return full format lists
   attested where bare requests answer `LOGIN_REQUIRED`; ANDROID_VR
   stays walled (VR needs DroidGuard, not BotGuard). With no POT
-  provider configured the replay never runs and an all-walled ladder
-  stays terminal as before — one locally-denied `pot_token` call is the only
-  added cost.
+  provider configured the replay never runs — the resolve falls
+  through to the second-edge redraw below.
+
+The last remedy before a terminal wall verdict is the **redraw
+pass**: every rung whose verdict is per-request weather — a bot
+wall, a 429 window, a capped mint, a transport miss — is re-asked
+bare on `youtubei.googleapis.com`, the same `player` call on a
+different serving edge with independent wall and rate-limit
+decisions (live-verified 2026-10: identical request shape,
+identical response). Walls attestation never replayed and walls it
+failed to lift both redraw; deterministic verdicts (sign-in, age,
+unavailable, restricted formats, proven no-audio) are edge-agnostic
+and never redrawn. The redraw rides the freshest visitorData the
+invocation harvested — never a visitor this invocation already
+dropped as walled — and one dropped re-ask per rung still applies.
+A stored backoff never suppresses an edge-B draw.
 
 Measured 2026-09-19: `pot=` did not lift a capped IOS mint — serving
 caps are enforced independently of attestation — but the same token
@@ -259,12 +273,15 @@ enforces the destination allowlist on every request, so a target off
 the allowlist (or a second redirect) is capped without a fetch —
 before the verdict lands. A
 bot-check never ends the bare pass — every
-rung gets its bare try — and the walled web-attestable rungs
+rung gets its bare try — the walled web-attestable rungs
 (`VISIONOS`/`IOS`) then get one attested replay each when a POT
-provider minted,
-and `transient` (`bot-check`) only when the wall holds anyway. A
+provider minted, and every weather-outcome rung gets one bare
+second-edge redraw,
+and `transient` (`bot-check`) or `provider-wall` lands only when
+the wall holds through all of it. A
 replay's verdict overwrites the rung's `Bot` record — a rung attested
-to SABR-only counts toward `unsupported`, not `bot-check`.
+to SABR-only counts toward `unsupported`, not `bot-check` — and a
+redraw's verdict overwrites it the same way.
 `cancelled`
 propagates immediately; `permission-denied`/`invalid-response` host
 errors are terminal; a `rate-limit` host error stages the rate-limit

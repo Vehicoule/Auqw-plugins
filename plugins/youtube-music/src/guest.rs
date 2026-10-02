@@ -678,6 +678,23 @@ fn backoff_for(outcome: RungOutcome) -> Option<(&'static str, u64)> {
     }
 }
 
+/// Is this rung's verdict worth a second draw on the alternate edge?
+/// Every redrawn outcome is per-request stochastic — the wall, the 429
+/// window, the mint cap, plain transport weather — where a different
+/// serving edge is an independent draw. Deterministic verdicts
+/// (sign-in, age, unavailable, restricted formats, a proven
+/// no-audio answer) are edge-agnostic: redrawing them would be a
+/// provably wasted request.
+fn redraw_worthy(outcome: Option<RungOutcome>) -> bool {
+    matches!(
+        outcome,
+        Some(RungOutcome::Bot)
+            | Some(RungOutcome::RateLimited)
+            | Some(RungOutcome::Capped)
+            | Some(RungOutcome::Transport)
+    )
+}
+
 /// The end of a pick: `Done` resolves, `Advance` records the outcome
 /// and the rung continues.
 enum PickOutcome {
@@ -705,6 +722,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // only the attestable ones. Includes backoff-derived entries: a
     // staged bot-backoff is exactly what attestation is for.
     let mut bot_positions: Vec<usize> = Vec::new();
+    // Visitor keys this invocation dropped as walled — their staged
+    // deletes don't read back through `load_visitor`, so the redraw
+    // pass consults this set instead of replaying a poisoned value.
+    let mut dropped_keys: Vec<String> = Vec::new();
     let mut pin_seen = false;
     let mut pin_missing = false;
     let mut mint_attempted = false;
@@ -720,12 +741,15 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // authenticated requests repeatedly.
     let mut access_token = p.access_token.clone();
 
-    // Two passes over the ladder. Pass 1 runs bare — free on a clean
-    // IP. Pass 2 replays only the bot-checked rungs with the shared
-    // video-bound poToken in `serviceIntegrityDimensions`, the wall's
-    // documented remedy; it fires only when a provider minted, so a
-    // guest with no POT provider pays one locally-denied `pot_token`
-    // call and keeps today's terminal behavior.
+    // Up to three passes over the ladder. Pass 0 runs bare — free on
+    // a clean IP. Pass 1 replays only the bot-checked rungs with the
+    // shared video-bound poToken in `serviceIntegrityDimensions`, the
+    // wall's documented remedy; it fires only when a provider minted.
+    // Pass 2 is the no-attestation remedy: every rung whose verdict is
+    // still per-request weather (bot wall, 429, capped mint, transport)
+    // is redrawn bare on `REDRAW_PLAYER_URL` — a different serving edge
+    // with independent wall decisions, carrying the freshest visitor
+    // the walls themselves minted.
     //
     // Attempt order is the `ladder/last-good` hint — the rung that
     // finished the previous resolve — followed by the rest of the
@@ -749,23 +773,33 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // write.
     let mut dirty_backoffs = vec![false; LADDER.len()];
 
-    for pass in 0..2u8 {
+    let mut pass = 0u8;
+    'passes: loop {
         let attested = pass == 1;
+        let redraw = pass == 2;
         'rung: for &i in &order {
             let rung = &LADDER[i];
-            // Pass 2 replays only rungs attestation can lift — a
+            // Pass 1 replays only rungs attestation can lift — a
             // non-attestable client's bot-check is permanent (its wall
             // needs DroidGuard, which a BotGuard mint never produces),
             // so replaying it would be a provably wasted request.
             if attested && (!rung.attestable || !bot_positions.contains(&i)) {
                 continue;
             }
+            // Pass 2 redraws whatever still reads as weather — walls
+            // attestation never replayed or failed to lift, 429s,
+            // capped mints, transport misses. Deterministic verdicts
+            // are edge-agnostic and never redrawn.
+            if redraw && !redraw_worthy(outcomes[i]) {
+                continue;
+            }
             let backoff_key = format!("backoff/{}/{}", p.video_id, rung.kv_key());
             // Backoff before the visitor read: a skipped rung costs one
-            // KV read, not two. The attested pass deliberately ignores
-            // backoffs — a staged bot-backoff is the thing attestation
-            // exists to break.
-            if !attested {
+            // KV read, not two. The remedy passes deliberately ignore
+            // backoffs — a staged backoff is the thing they exist to
+            // break (a bot-backoff for attestation, any weather record
+            // for the second edge).
+            if pass == 0 {
                 match load_backoff(&backoff_key, now).await? {
                     StoredBackoff::Active(reason) => {
                         dirty_backoffs[i] = true;
@@ -785,8 +819,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             }
             let visitor_key = format!("visitor/{}", rung.kv_key());
             // A fresh cross-rung visitor shadows the stored value —
-            // skip the read entirely when one exists.
-            let kv_visitor = if fresh_visitor.is_some() {
+            // skip the read entirely when one exists. A key this
+            // invocation already dropped as walled is poisoned: its
+            // staged delete can't be read back yet, so skip the read
+            // rather than replay the burned value on the new edge.
+            let kv_visitor = if fresh_visitor.is_some() || dropped_keys.contains(&visitor_key) {
                 None
             } else {
                 load_visitor(&visitor_key).await?
@@ -811,6 +848,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     rung_visitor.as_deref(),
                     if attested { pot.as_deref() } else { None },
                     access_token.as_deref(),
+                    if redraw {
+                        crate::rungs::REDRAW_PLAYER_URL
+                    } else {
+                        crate::rungs::PLAYER_URL
+                    },
                 ))
                 .await;
                 let r = match sent {
@@ -847,10 +889,12 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     //   token under its source rung's key and the next
                     //   invocation would replay it there.
                     kv_set_soft(&visitor_key, None).await?;
+                    dropped_keys.push(visitor_key.clone());
                     if fresh_visitor.take().is_some() {
                         if let Some(home) = fresh_visitor_key.take() {
                             if home != visitor_key {
                                 kv_set_soft(&home, None).await?;
+                                dropped_keys.push(home);
                             }
                         }
                     }
@@ -874,7 +918,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
                     }
                     outcomes[i] = Some(outcome);
-                    if !attested && outcome == RungOutcome::Bot {
+                    if pass == 0 && outcome == RungOutcome::Bot {
                         bot_positions.push(i);
                     }
                     continue;
@@ -922,7 +966,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     )
                     .await?;
                     outcomes[i] = Some(RungOutcome::Bot);
-                    if !attested {
+                    if pass == 0 {
                         bot_positions.push(i);
                     }
                     continue;
@@ -1051,16 +1095,28 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 FormatOutcome::NoAudio => outcomes[i] = Some(RungOutcome::NoAudio),
             }
         }
-        // Escalation: bot-checks accumulate a remedy pass. One shared
-        // mint — the same video-bound token also decorates picked URLs
-        // via `finish_pick`. A denied/failed mint keeps today's
-        // terminal outcome.
-        if attested || !bot_positions.iter().any(|&r| LADDER[r].attestable) {
-            break;
-        }
-        if !mint_once(&mut mint_attempted, &mut pot, &p.video_id).await? {
-            break;
-        }
+        // Escalation: bot-checks accumulate the attested pass first —
+        // one shared mint, the same video-bound token also decorates
+        // picked URLs via `finish_pick`. When attestation cannot run
+        // (no attestable wall, denied/failed mint) or ran and walls
+        // still stand, the redraw pass gives every weather outcome a
+        // second draw on the alternate edge before the resolve turns
+        // terminal.
+        pass = match pass {
+            0 => {
+                if bot_positions.iter().any(|&r| LADDER[r].attestable)
+                    && mint_once(&mut mint_attempted, &mut pot, &p.video_id).await?
+                {
+                    1
+                } else if outcomes.iter().any(|o| redraw_worthy(*o)) {
+                    2
+                } else {
+                    break 'passes;
+                }
+            }
+            1 if outcomes.iter().any(|o| redraw_worthy(*o)) => 2,
+            _ => break 'passes,
+        };
     }
     // The taxonomy reads the ladder in static rung order — `order`
     // scheduled requests only.
@@ -1596,10 +1652,11 @@ mod tests {
             (Some("28"), Some("1.57.29")) => 1,
             (Some("5"), Some("20.10.4")) => 2,
             (Some("28"), Some("1.61.29")) => 3,
-            (Some("3"), Some("20.19.36")) => 4,
-            (Some("28"), Some("1.61.48")) => 5,
-            (Some("28"), Some("1.60.19")) => 6,
-            (Some("28"), Some("1.43.32")) => 7,
+            (Some("28"), Some("1.62.27")) => 4,
+            (Some("3"), Some("20.19.36")) => 5,
+            (Some("28"), Some("1.61.48")) => 6,
+            (Some("28"), Some("1.60.19")) => 7,
+            (Some("28"), Some("1.43.32")) => 8,
             other => panic!("unexpected rung headers {other:?} in {out}"),
         }
     }
@@ -1688,7 +1745,7 @@ mod tests {
     fn last_rung_success_reports_client() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for rung in 1..=7usize {
+        for rung in 1..=8usize {
             out = feed(&mut h, &out, SABR);
             assert_eq!(rung_of(&out), rung);
         }
@@ -1983,9 +2040,14 @@ mod tests {
     fn probe_429_reports_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
+            out = h.answer(&out, 429, "");
+        }
+        // Rate-limited mints are weather too — the redraw pass re-asks
+        // each on the second edge.
+        for _ in 0..9 {
             out = h.answer(&out, 429, "");
         }
         assert_eq!(
@@ -1998,9 +2060,12 @@ mod tests {
     fn probe_5xx_is_transport() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
+            out = h.answer(&out, 503, "");
+        }
+        for _ in 0..9 {
             out = h.answer(&out, 503, "");
         }
         assert_eq!(
@@ -2091,7 +2156,7 @@ mod tests {
         for _ in 1..LADDER.len() {
             out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         }
-        // Pass 2 replays only attestable walled rungs — VISIONOS (0)
+        // Pass 1 replays only attestable walled rungs — VISIONOS (0)
         // and IOS (2) — carrying the PoT.
         for expected in [0usize, 2] {
             assert_eq!(rung_of(&out), expected);
@@ -2101,6 +2166,12 @@ mod tests {
             )
             .unwrap_or_default();
             assert!(body.contains("serviceIntegrityDimensions"));
+            out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        }
+        // Attestation failed to lift the wall — the redraw pass re-asks
+        // every walled rung bare on the second edge.
+        for _ in 0..LADDER.len() {
+            assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         }
         assert_eq!(
@@ -2113,7 +2184,15 @@ mod tests {
     fn all_capped_fails_streams_capped() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer(&out, 403, "");
+        }
+        // Capped mints are per-mint stochastic — each earns a redraw on
+        // the second edge, mint and probe again.
+        for _ in 0..9 {
+            assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
@@ -2146,9 +2225,15 @@ mod tests {
     fn bot_check_on_every_rung_is_terminal() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        // No early exit: the bare pass walks every rung, so a fully
-        // walled IP costs the whole ladder before failing.
+        // No early exit: the bare pass walks every rung, then the
+        // no-mint redraw re-asks each wall on the second edge — a
+        // fully walled IP costs the whole ladder twice before
+        // failing.
         for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
+        for _ in 0..LADDER.len() {
+            assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, BOT);
         }
         assert_eq!(
@@ -2323,10 +2408,10 @@ mod tests {
         out = feed(&mut h, &out, BOT); // VISIONOS
         out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29
         out = feed(&mut h, &out, BOT); // IOS
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
-        // The mint fires and pass 2 replays rung 0 attested (rung 1's
+        // The mint fires and pass 1 replays rung 0 attested (rung 1's
         // wall needs DroidGuard — never replayed).
         assert_eq!(rung_of(&out), 0);
         let body = body_of(&out);
@@ -2387,8 +2472,8 @@ mod tests {
         // `error` envelope) is not the wall — it must not book Bot.
         let out = h.answer(&out, 403, "{\"error\":{\"message\":\"not a bot\",");
         let out = h.answer(&out, 403, "{\"error\":{\"code\":403,");
-        // Two truncated refusals must not trip the 2-strike bot
-        // budget — the ladder continues bare to rung 2.
+        // Two truncated refusals must not trip anything — the
+        // ladder continues bare to rung 2.
         assert_eq!(rung_of(&out), 2);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
@@ -2437,7 +2522,7 @@ mod tests {
         // Non-attestable walls never end the bare pass — the
         // ladder is walked out, then rung 0 replays attested.
         let mut out = out;
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(rung_of(&out), 0);
@@ -2473,7 +2558,7 @@ mod tests {
         // Non-attestable walls never end the bare pass — the
         // ladder is walked out, then rung 0 replays attested.
         let mut out = out;
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(rung_of(&out), 0);
@@ -2507,7 +2592,7 @@ mod tests {
         // Non-attestable walls never end the bare pass — the
         // ladder is walked out, then rung 0 replays attested.
         let mut out = out;
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(rung_of(&out), 0);
@@ -2551,7 +2636,7 @@ mod tests {
         // Non-attestable walls never end the bare pass — the
         // ladder is walked out, then rung 0 replays attested.
         let mut out = out;
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(rung_of(&out), 0);
@@ -2586,7 +2671,7 @@ mod tests {
         // Walls never end the bare pass — the rest of the ladder still
         // runs, then pass 2 replays rung 0 attested after the mint.
         let mut out = out;
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(rung_of(&out), 0);
@@ -2627,8 +2712,9 @@ mod tests {
         out = feed(&mut h, &out, SABR); // IOS — re-harvests the visitor
         out = feed(&mut h, &out, BOT); // ANDROID_VR@1.61.29 — no budget spend
         out = feed(&mut h, &out, BOT); // ANDROID_VR@1.61.29 bare — no budget spend
+        out = feed(&mut h, &out, UNPLAYABLE); // ANDROID_VR@1.62.27
         out = feed(&mut h, &out, UNPLAYABLE); // ANDROID
-        assert_eq!(rung_of(&out), 5);
+        assert_eq!(rung_of(&out), 6);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
@@ -2646,7 +2732,7 @@ mod tests {
         };
         let out = begin(&mut h);
         let mut out = feed(&mut h, &out, BOT);
-        for _ in 0..7 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, BOT);
         }
         // Attested replay of rung 0 then rung 2 (non-attestable walls
@@ -2654,7 +2740,13 @@ mod tests {
         assert_eq!(rung_of(&out), 0);
         let out = feed(&mut h, &out, BOT);
         assert_eq!(rung_of(&out), 2);
-        let out = feed(&mut h, &out, BOT);
+        let mut out = feed(&mut h, &out, BOT);
+        // Attestation spent, walls stand: the last remedy is the bare
+        // redraw of every walled rung on the second edge.
+        for _ in 0..9 {
+            assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+            out = feed(&mut h, &out, BOT);
+        }
         assert_eq!(
             fail_kind(&out),
             ("provider-wall".to_string(), "bot-check".to_string())
@@ -2679,7 +2771,7 @@ mod tests {
         // The rung-2 wall replayed the fresh visitor SABR harvested —
         // it is re-asked once bare before the outcome is recorded.
         out = feed(&mut h, &out, BOT);
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, SABR);
         }
         assert_eq!(rung_of(&out), 0);
@@ -2694,12 +2786,18 @@ mod tests {
 
     #[test]
     fn bot_wall_without_provider_keeps_terminal_shape() {
-        // No POT provider: the second bare bot-check still ends the
-        // resolve with the same typed failure — one locally-denied
-        // `pot_token` call is the only added cost.
+        // No POT provider: attestation is skipped and the wall still
+        // ends the resolve with the same typed failure — but only
+        // after the second-edge redraw spent its draws. One
+        // locally-denied `pot_token` call plus the redraw are the only
+        // added costs.
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
+        for _ in 0..LADDER.len() {
+            assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, BOT);
         }
         assert_eq!(
@@ -2731,7 +2829,7 @@ mod tests {
         assert_eq!(rung_of(&out), 1);
         let mut out = feed(&mut h, &out, BOT);
         out = feed(&mut h, &out, BOT);
-        for _ in 0..5 {
+        for _ in 0..6 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         // Pass 2 replays rung 0 first despite its stored backoff.
@@ -2752,7 +2850,7 @@ mod tests {
     fn all_sabr_fails_unsupported_sabr() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, SABR);
         }
         assert_eq!(
@@ -2765,7 +2863,7 @@ mod tests {
     fn all_ciphered_fails_unsupported_ciphered() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, CIPHERED);
         }
         assert_eq!(
@@ -2783,12 +2881,20 @@ mod tests {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, BOT);
-        for _ in 0..7 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, SABR);
         }
         // The single bare bot-check does not end the pass, so the
-        // ladder ran to exhaustion; the denied mint ends attestation.
+        // ladder ran to exhaustion; the denied mint ends attestation
+        // and hands the wall to the second-edge redraw.
         assert_eq!(h.pot_calls, 1);
+        assert_eq!(rung_of(&out), 0);
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        // The redraw rides SABR's fresh visitor — the wall drops it
+        // and re-asks once bare, the same healing the primary edge
+        // gets.
+        let out = feed(&mut h, &out, BOT);
+        let out = feed(&mut h, &out, BOT);
         assert_eq!(
             fail_kind(&out),
             ("provider-wall".to_string(), "bot-check".to_string())
@@ -2800,9 +2906,12 @@ mod tests {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
         out = h.answer(&out, 500, "{}");
-        for _ in 0..7 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, SABR);
         }
+        // Transport is weather too — the rung redraws on the second edge.
+        assert_eq!(rung_of(&out), 0);
+        let out = h.answer(&out, 500, "{}");
         assert_eq!(
             fail_kind(&out),
             ("transient".to_string(), "transport".to_string())
@@ -2815,9 +2924,12 @@ mod tests {
         let mut out = begin(&mut h);
         out = feed(&mut h, &out, UNPLAYABLE);
         out = h.answer(&out, 429, "{}");
-        for _ in 0..6 {
+        for _ in 0..7 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
+        // The 429 earns a second-edge redraw before the verdict lands.
+        assert_eq!(rung_of(&out), 1);
+        let out = h.answer(&out, 429, "{}");
         assert_eq!(
             fail_kind(&out),
             ("rate-limit".to_string(), "rate-limit".to_string())
@@ -2828,7 +2940,7 @@ mod tests {
     fn unavailable_ladder_fails_no_result() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
         assert_eq!(
@@ -2872,7 +2984,10 @@ mod tests {
     fn host_rate_limit_on_every_rung_fails_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
+            out = h.answer_host_error(&out, "rate-limit");
+        }
+        for _ in 0..9 {
             out = h.answer_host_error(&out, "rate-limit");
         }
         assert_eq!(
@@ -2914,7 +3029,7 @@ mod tests {
         // Every rung answering the wrong video -> honest no-result.
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, &wrong);
         }
         assert_eq!(
@@ -3103,6 +3218,7 @@ mod tests {
             "IOS",
             "ANDROID_VR@1.57.29",
             "ANDROID_VR@1.61.29",
+            "ANDROID_VR@1.62.27",
             "ANDROID",
             "ANDROID_VR@1.61.48",
             "ANDROID_VR@1.60.19",
@@ -3115,8 +3231,14 @@ mod tests {
                     .into_bytes(),
             );
         }
-        // Every rung skipped -> fail without a single HTTP call.
-        let out = h.invoke(json!({ "source_ref": VID }));
+        // Every rung is backoff-skipped on the primary edge — but a
+        // stored backoff never suppresses the second-edge redraw, so
+        // the failure lands only after each rung's googleapis draw
+        // rate-limits too.
+        let mut out = h.invoke(json!({ "source_ref": VID }));
+        for _ in 0..9 {
+            out = h.answer_host_error(&out, "rate-limit");
+        }
         assert_eq!(
             fail_kind(&out),
             ("rate-limit".to_string(), "rate-limit".to_string())
@@ -3164,9 +3286,12 @@ mod tests {
         // rung 0: 429 stages a backoff; the rest of the ladder serves
         // unplayable -> `fail` discards the staged write by contract.
         let mut out = h.answer(&out, 429, "{}");
-        for _ in 0..7 {
+        for _ in 0..8 {
             out = feed(&mut h, &out, UNPLAYABLE);
         }
+        // The 429 redraws on the second edge; the same verdict stands.
+        assert_eq!(rung_of(&out), 0);
+        let out = h.answer(&out, 429, "{}");
         assert_eq!(fail_kind(&out).0, "rate-limit");
         assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
         assert!(h.staged.is_empty());
@@ -3253,8 +3378,8 @@ mod tests {
         h.committed
             .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
         let mut out = h.invoke(json!({ "source_ref": VID }));
-        assert_eq!(rung_of(&out), 7);
-        for expected in [0usize, 1, 2, 3, 4, 5, 6] {
+        assert_eq!(rung_of(&out), 8);
+        for expected in [0usize, 1, 2, 3, 4, 5, 6, 7] {
             out = feed(&mut h, &out, SABR);
             assert_eq!(rung_of(&out), expected);
         }
@@ -3275,12 +3400,15 @@ mod tests {
         h.committed
             .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
         let mut out = h.invoke(json!({ "source_ref": VID }));
-        assert_eq!(rung_of(&out), 7);
+        assert_eq!(rung_of(&out), 8);
         out = h.answer(&out, 403, "<html><body>sorry</body></html>");
-        for expected in 0..7usize {
+        for expected in 0..8usize {
             assert_eq!(rung_of(&out), expected);
             out = feed(&mut h, &out, UNPLAYABLE);
         }
+        // The hinted rung's wall earns its second-edge redraw.
+        assert_eq!(rung_of(&out), 8);
+        let out = h.answer(&out, 403, "<html><body>sorry</body></html>");
         assert_eq!(
             fail_kind(&out),
             ("provider-wall".to_string(), "bot-check".to_string())
@@ -3296,9 +3424,9 @@ mod tests {
         h.committed
             .insert("ladder/last-good".into(), b"ANDROID_VR@1.43.32".to_vec());
         let mut out = h.invoke(json!({ "source_ref": VID }));
-        assert_eq!(rung_of(&out), 7);
+        assert_eq!(rung_of(&out), 8);
         out = feed(&mut h, &out, CIPHERED);
-        for expected in 0..7usize {
+        for expected in 0..8usize {
             assert_eq!(rung_of(&out), expected);
             out = feed(&mut h, &out, SABR);
         }
@@ -3438,7 +3566,10 @@ mod tests {
     fn pinned_resolve_preserves_transport_failures() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
-        for _ in 0..8 {
+        for _ in 0..9 {
+            out = h.answer_host_error(&out, "transient");
+        }
+        for _ in 0..9 {
             out = h.answer_host_error(&out, "transient");
         }
         assert_eq!(fail_kind(&out).0, "transient");
@@ -3446,19 +3577,21 @@ mod tests {
 
     #[test]
     fn pinned_resolve_preserves_uninspectable_player_outcomes() {
-        for (body, attempts, expected) in [
-            (BOT, 8, "provider-wall"),
+        for (body, attempts, redraws, expected) in [
+            (BOT, 9, 9, "provider-wall"),
             (
                 r#"{"playabilityStatus":{"status":"LOGIN_REQUIRED"}}"#,
-                8,
+                9,
+                0,
                 "auth-required",
             ),
-            (SABR, 8, "unsupported"),
-            (CIPHERED, 8, "unsupported"),
-            (UNPLAYABLE, 8, "no-result"),
+            (SABR, 9, 0, "unsupported"),
+            (CIPHERED, 9, 0, "unsupported"),
+            (UNPLAYABLE, 9, 0, "no-result"),
             (
                 r#"{"playabilityStatus":{"status":"OK"},"streamingData":{"adaptiveFormats":[{"itag":140,"mimeType":"audio/mp4","url":"http://example.test/audio"}]}}"#,
-                8,
+                9,
+                0,
                 "no-result",
             ),
         ] {
@@ -3467,8 +3600,89 @@ mod tests {
             for _ in 0..attempts {
                 out = feed(&mut h, &out, body);
             }
+            // Weather outcomes redraw once each on the second edge.
+            for _ in 0..redraws {
+                out = feed(&mut h, &out, body);
+            }
             assert_eq!(fail_kind(&out).0, expected, "{body}");
         }
+    }
+
+    #[test]
+    fn redraw_on_second_edge_lifts_the_wall() {
+        // The wall is a per-edge verdict: every rung bot-checks on
+        // music.youtube.com, no provider mints, and the redraw pass
+        // re-asks each wall bare on youtubei.googleapis.com — where
+        // rung 0's draw resolves.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
+        // The denied mint paid once; the redraw leads with last-good
+        // order's first rung on the second edge.
+        assert_eq!(h.pot_calls, 1);
+        assert_eq!(rung_of(&out), 0);
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        assert!(header_of(&out, "X-Goog-Api-Format-Version").is_some());
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "VISIONOS");
+        // The recovering rung takes the last-good hint.
+        assert_eq!(
+            h.committed.get("ladder/last-good").map(Vec::as_slice),
+            Some(b"VISIONOS".as_slice())
+        );
+    }
+
+    #[test]
+    fn redraw_skips_deterministic_verdicts() {
+        // Only weather earns the second draw: the walled rung is
+        // redrawn while its sign-in/unavailable neighbours stay
+        // settled.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, UNPLAYABLE); // VISIONOS — deterministic
+        out = feed(&mut h, &out, BOT); // ANDROID_VR@1.57.29 — weather
+        for _ in 0..7 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        // Exactly one redrawn rung — the walled one.
+        assert_eq!(rung_of(&out), 1);
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
+        // The wall's verdict survives nowhere — the redraw's pick is
+        // the rung's real answer, and no mint was spent (no attestable
+        // wall ever stood).
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn redraw_does_not_replay_a_dropped_visitor() {
+        // A visitor already burned on edge A must not ride edge B: the
+        // dropped key is read as absent for the redraw, not replayed
+        // from the pre-commit store.
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/VISIONOS".into(), b"persisted-visitor".to_vec());
+        let mut out = begin(&mut h);
+        // Rung 0 walls under the replayed visitor -> bare re-ask ->
+        // still walled; the rest of the ladder is unplayable.
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        out = h.answer(&out, 403, "<html><body>sorry</body></html>");
+        for _ in 0..8 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        // The redraw of rung 0 carries no visitor header.
+        assert_eq!(rung_of(&out), 0);
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None);
     }
 
     #[test]
@@ -3482,7 +3696,13 @@ mod tests {
         let mut out = begin(&mut h);
         out = h.answer(&out, 403, "{\"error\":{\"code\":403}}");
         assert_eq!(rung_of(&out), 1);
-        for _ in 0..7 {
+        for _ in 0..8 {
+            out = feed(&mut h, &out, BOT);
+        }
+        // The denied mint skips attestation; the redraw pass re-asks
+        // rung 0's transport miss then every wall on the second edge.
+        out = h.answer(&out, 403, "{\"error\":{\"code\":403}}");
+        for _ in 0..8 {
             out = feed(&mut h, &out, BOT);
         }
         assert_eq!(
@@ -3495,7 +3715,7 @@ mod tests {
     fn pin_itag_missing_everywhere_is_expired_resource() {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 774 }));
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, OK);
             if out["type"] == "host_request" && out["payload"]["method"] == "GET" {
                 panic!("a missing pin must never reach the probe");
@@ -3613,13 +3833,20 @@ mod tests {
         // every probe refuses -> capped weather, not a missing resource.
         out = feed(&mut h, &out, &ok_without_itag(251));
         assert_eq!(rung_of(&out), 1);
-        for rung in 1..8usize {
+        for rung in 1..9usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            if rung < 7 {
+            if rung < 8 {
                 assert_eq!(rung_of(&out), rung + 1);
             }
+        }
+        // The capped mints are weather: each redraws on the second
+        // edge — new mint, same refusal.
+        for _ in 1..9usize {
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer(&out, 403, "");
         }
         assert_eq!(
             fail_kind(&out),
@@ -3632,7 +3859,7 @@ mod tests {
         let mut h = Harness::new();
         let mut out = h.invoke(json!({ "source_ref": VID, "pin_itag": 251 }));
         // No rung carries itag 251 -> the requested pin is unavailable.
-        for _ in 0..8 {
+        for _ in 0..9 {
             out = feed(&mut h, &out, &ok_without_itag(251));
         }
         assert_eq!(
