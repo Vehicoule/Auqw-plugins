@@ -39,10 +39,13 @@ const CAPPED_BACKOFF_MS: u64 = 5_000;
 /// last `done` resolve. A pure attempt-order hint: see `last_good`.
 const LAST_GOOD_KEY: &str = "ladder/last-good";
 /// `pot/aside` records the ms timestamp until which the poToken mint
-/// is skipped: a provider that just failed (503, denied, transient)
-/// decorates nothing when it degrades anyway, so the next resolve
-/// skips the serial call — one retry per window keeps the attested
-/// path open when the sidecar comes back.
+/// is skipped: a provider that just failed decorates nothing when it
+/// degrades anyway, so the next resolve skips the serial call — one
+/// retry per window keeps the attested path open when the sidecar
+/// comes back. Provider-side weather (denied, unreachable, 5xx, a
+/// malformed 200) is remembered globally; a refusal that can bind to
+/// a video (4xx) goes under `pot/aside/<video>` so one video's
+/// refusal never suppresses another's mint.
 const POT_ASIDE_KEY: &str = "pot/aside";
 const POT_ASIDE_MS: u64 = 60_000;
 
@@ -1231,14 +1234,14 @@ async fn mint_once(
         return Ok(pot.is_some());
     }
     *mint_attempted = true;
-    // A still-warm aside short-circuits the call — a stale or
-    // malformed record falls through and earns a fresh probe.
-    if let Some(until) = pot_aside_until().await? {
-        if until > now_ms().await? {
-            return Ok(false);
-        }
+    // A still-warm aside at either scope short-circuits the call —
+    // stale or malformed records fall through and earn a fresh probe.
+    if pot_aside_active(POT_ASIDE_KEY).await?
+        || pot_aside_active(&format!("{POT_ASIDE_KEY}/{video_id}")).await?
+    {
+        return Ok(false);
     }
-    let outcome = match pot_token(video_id).await {
+    let (outcome, miss) = match pot_token(video_id).await {
         Ok(r) if r.status == 200 => {
             *pot = serde_json::from_slice::<Value>(&r.body).ok().and_then(|j| {
                 ["poToken", "po_token", "token"]
@@ -1247,45 +1250,80 @@ async fn mint_once(
                     .filter(|token| !token.is_empty())
                     .map(str::to_string)
             });
-            Ok(pot.is_some())
+            // A 200 with no usable token is the provider's own
+            // contract shape — it can't be video-specific.
+            (pot.is_some(), PotMiss::Global)
         }
-        Ok(_) => Ok(false),
+        // Server-side weather can't bind to a video; a client refusal
+        // can — scope it so the next video's mint is unaffected.
+        Ok(r) => (
+            false,
+            if r.status >= 500 {
+                PotMiss::Global
+            } else {
+                PotMiss::Video
+            },
+        ),
         Err(GuestError::Host { kind, message }) => {
             if kind == "cancelled" {
-                Err(GuestError::Host { kind, message })
-            } else {
-                // unsupported / permission-denied / transient mint
-                // failures degrade to no token.
-                Ok(false)
+                return Err(GuestError::Host { kind, message });
             }
+            // denied / unsupported / transient mint failures degrade
+            // to no token — the sidecar never saw a binding, so the
+            // miss can only be provider-wide.
+            (false, PotMiss::Global)
         }
-        Err(e) => Err(e),
-    }?;
+        Err(e) => return Err(e),
+    };
     if outcome {
-        // A mint that landed clears any stale aside the failed
-        // resolves wrote.
+        // A mint that landed clears any stale aside a failed resolve
+        // wrote — at both scopes it can see.
         kv_set_soft(POT_ASIDE_KEY, None).await?;
+        kv_set_soft(&format!("{POT_ASIDE_KEY}/{video_id}"), None).await?;
     } else {
+        let key = match miss {
+            PotMiss::Global => POT_ASIDE_KEY.to_string(),
+            PotMiss::Video => format!("{POT_ASIDE_KEY}/{video_id}"),
+        };
         let until = now_ms().await?.saturating_add(POT_ASIDE_MS);
         let record = serde_json::to_vec(&json!({ "until_ms": until })).unwrap_or_default();
-        kv_set_soft(POT_ASIDE_KEY, Some(&record)).await?;
+        kv_set_soft(&key, Some(&record)).await?;
     }
     Ok(outcome)
 }
 
-/// The `until_ms` inside a `pot/aside` record — a bare `{"until_ms":
-/// u64}` object; anything else is ignored (the call proceeds) rather
-/// than risking a wedge on a foreign write.
-async fn pot_aside_until() -> Result<Option<u64>, GuestError> {
-    match kv_get_soft(POT_ASIDE_KEY).await? {
-        Some(bytes) => match serde_json::from_slice::<Value>(&bytes) {
-            Ok(v) => Ok(v.get("until_ms").and_then(Value::as_u64)),
-            Err(_) => {
-                warn("ignoring malformed pot-aside KV value").await?;
-                Ok(None)
+/// Where a degraded mint books its aside.
+enum PotMiss {
+    /// Provider-side weather — suppresses mints for every video.
+    Global,
+    /// A refusal that can bind to the asked video — suppresses only
+    /// that video's mints.
+    Video,
+}
+
+/// Whether a `pot/aside` record at `key` is still in force. The record
+/// must be exactly `{"until_ms": u64}` — extra fields, wrong types,
+/// or malformed bytes are warned-and-ignored (the provider is probed
+/// fresh) rather than letting foreign state suppress mints.
+async fn pot_aside_active(key: &str) -> Result<bool, GuestError> {
+    match kv_get_soft(key).await? {
+        Some(bytes) => {
+            let until = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| {
+                let o = v.as_object()?;
+                if o.len() != 1 {
+                    return None;
+                }
+                o.get("until_ms")?.as_u64()
+            });
+            match until {
+                Some(u) => Ok(u > now_ms().await?),
+                None => {
+                    warn("ignoring malformed pot-aside KV value").await?;
+                    Ok(false)
+                }
             }
-        },
-        None => Ok(None),
+        }
+        None => Ok(false),
     }
 }
 
@@ -1569,6 +1607,8 @@ mod tests {
         Token(&'static str),
         /// `host_error` cancelled — must propagate.
         Cancelled,
+        /// A non-200 HTTP status with an empty body.
+        Status(u16),
     }
 
     /// A fake host: answers now/kv/log/pot itself and stops at every
@@ -1686,6 +1726,7 @@ mod tests {
                                 out = match self.pot {
                                     Pot::Deny => step(&host_error(id, "permission-denied")),
                                     Pot::Cancelled => step(&host_error(id, "cancelled")),
+                                    Pot::Status(s) => step(&http_response(id, s, "")),
                                     Pot::Token(t) => step(&http_response(
                                         id,
                                         200,
@@ -2467,10 +2508,18 @@ mod tests {
         assert_eq!(out["kind"], "kv_set");
         let id = out["id"].as_u64().unwrap_or(u64::MAX);
         out = step(&json!({ "type": "host_ok", "id": id }));
-        // Then the pot/aside KV read before the mint call.
-        assert_eq!(out["kind"], "kv_get");
-        let id = out["id"].as_u64().unwrap_or(u64::MAX);
-        out = step(&json!({"type":"kv_response","id":id,"value":null}));
+        // Then the pot/aside KV reads (global, then video) before the
+        // mint call.
+        loop {
+            match out["kind"].as_str().unwrap_or("") {
+                "kv_get" => {
+                    let id = out["id"].as_u64().unwrap_or(u64::MAX);
+                    out = step(&json!({"type":"kv_response","id":id,"value":null}));
+                }
+                "pot_token" => break,
+                other => panic!("unexpected kind {other}"),
+            }
+        }
         assert_eq!(out["kind"], "pot_token");
         assert_eq!(out["payload"]["content_binding"], VID);
     }
@@ -4458,5 +4507,69 @@ mod tests {
         // The foreign write wedges nothing: the provider still earns
         // its probe (and overwrites the record with a fresh aside).
         assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn extra_fields_make_the_aside_record_inert() {
+        // A record carrying anything beyond `until_ms` is a foreign
+        // write — it must not suppress mints.
+        let mut h = Harness::new();
+        h.committed.insert(
+            POT_ASIDE_KEY.to_string(),
+            serde_json::to_vec(&json!({
+                "until_ms": NOW + POT_ASIDE_MS,
+                "unexpected": true,
+            }))
+            .unwrap_or_default(),
+        );
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn video_refusal_marks_only_its_own_videos_aside() {
+        let mut h = Harness::new();
+        h.pot = Pot::Status(400);
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+        // A 4xx can bind to the asked video — it books the scoped key
+        // and never the global one.
+        assert!(!h.committed.contains_key(POT_ASIDE_KEY));
+        assert!(h.committed.contains_key(&format!("{POT_ASIDE_KEY}/{VID}")));
+
+        // The same video inside the window skips its mint…
+        let out = h.invoke(json!({ "source_ref": VID }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+
+        // …but another video's mint is unaffected — its own refusal
+        // is the only thing that can suppress it.
+        h.pot = Pot::Token("tok-2");
+        let out = h.invoke(json!({ "source_ref": "othervideo1" }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 2);
+
+        // And the first video's aside still holds after a foreign
+        // success — a mint clears only the scopes it can see.
+        let out = h.invoke(json!({ "source_ref": VID }));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 2);
     }
 }
