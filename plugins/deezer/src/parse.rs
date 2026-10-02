@@ -87,6 +87,23 @@ pub fn has_next(v: &Value) -> bool {
         .is_some_and(|s| !s.is_empty())
 }
 
+/// The next page's `index` from the envelope's `next` link — Deezer's
+/// offset advances by the rows it returned, which a short page shows
+/// is not always `index + limit`. `None` when no `next` is advertised;
+/// a `next` without a parseable index falls back to `off` plus the
+/// rows actually returned so the page boundary never skips rows.
+pub fn next_index(v: &Value, off: u64) -> Option<u64> {
+    let next = v.as_object()?.get("next").and_then(Value::as_str)?;
+    if next.is_empty() {
+        return None;
+    }
+    Some(
+        next.split(['&', '?'])
+            .find_map(|seg| seg.strip_prefix("index=").and_then(|n| n.parse().ok()))
+            .unwrap_or_else(|| off + data_list(v).map(|d| d.len() as u64).unwrap_or(0)),
+    )
+}
+
 /// The object's own `id` must equal `want` — a different id is
 /// `Ok(false)` (upstream answered a different resource); a missing or
 /// unparsable id is `invalid-response`.
@@ -382,7 +399,11 @@ pub fn playlist_page(v: &Value, want_id: &str) -> Result<Option<EntityPage>, Gue
                 .filter_map(|r| track_row(r, None, None))
                 .map(|r| to_metadata(&r))
                 .collect();
-            if u64_field(o, "nb_tracks").is_some_and(|nb| (rows.len() as u64) < nb) {
+            // `nb_tracks` can under-report what `tracks.next` still
+            // holds — either signal marks the listing truncated.
+            if u64_field(o, "nb_tracks").is_some_and(|nb| (rows.len() as u64) < nb)
+                || o.get("tracks").is_some_and(has_next)
+            {
                 complete = false;
             }
         }
@@ -437,7 +458,9 @@ pub fn album_page(v: &Value, want_id: &str) -> Result<Option<EntityPage>, GuestE
                 .filter_map(|r| track_row(r, genre.as_deref(), release_year))
                 .map(|r| to_metadata(&r))
                 .collect();
-            if u64_field(o, "nb_tracks").is_some_and(|nb| (rows.len() as u64) < nb) {
+            if u64_field(o, "nb_tracks").is_some_and(|nb| (rows.len() as u64) < nb)
+                || o.get("tracks").is_some_and(has_next)
+            {
                 complete = false;
             }
         }

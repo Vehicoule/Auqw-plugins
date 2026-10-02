@@ -26,7 +26,7 @@ const API: &str = "https://api.deezer.com";
 /// rejected.
 const SEARCH_LIMIT_MAX: u64 = 25;
 /// Result kinds the guest serves, in fetch order — the track backbone
-/// first so the legacy surface never waits on an entity rail.
+/// leads, then the entity rails.
 const SEARCH_KINDS: &[&str] = &["track", "artist", "album", "playlist"];
 /// Entity rails cap in a mixed query; explicit `kinds` asks get the
 /// request's own `limit`.
@@ -223,8 +223,9 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
     let scoped = obj.contains_key("kinds");
 
     // The continuation token is this guest's own JSON map of
-    // kind → next `index` for offset paging; a missing entry restarts
-    // that kind at 0. Foreign or malformed tokens are payload errors.
+    // kind → next `index` for offset paging — `null` marks a kind that
+    // exhausted, a missing entry restarts that kind at 0. Foreign or
+    // malformed tokens are payload errors.
     let offsets: Map<String, Value> = match obj.get("continuation") {
         None => Map::new(),
         Some(Value::String(token)) => {
@@ -235,7 +236,7 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
                 .ok_or_else(|| bad_payload("continuation is not a valid token"))?;
             if !m
                 .iter()
-                .all(|(k, v)| SEARCH_KINDS.contains(&k.as_str()) && v.is_u64())
+                .all(|(k, v)| SEARCH_KINDS.contains(&k.as_str()) && (v.is_u64() || v.is_null()))
             {
                 return Err(bad_payload("continuation is not a valid token"));
             }
@@ -246,12 +247,25 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
 
     let mut items: Vec<Value> = Vec::new();
     let mut entities: Vec<Value> = Vec::new();
-    let mut more = Map::new();
+    // Done markers carry across pages — a kind that exhausted stays
+    // exhausted and never refetches to repeat its first page beside
+    // deeper rails.
+    let mut more: Map<String, Value> = offsets
+        .iter()
+        .filter(|(_, v)| v.is_null())
+        .map(|(k, _)| (k.clone(), Value::Null))
+        .collect();
     let mut first_failure: Option<GuestError> = None;
+    let mut fetched = 0usize;
     let mut failures = 0usize;
     let q = encode::percent_encode(&query);
 
     for kind in &kinds {
+        // A done kind keeps its marker and never refetches.
+        if offsets.get(*kind).is_some_and(Value::is_null) {
+            continue;
+        }
+        fetched += 1;
         let off = offsets.get(*kind).and_then(Value::as_u64).unwrap_or(0);
         let page = if *kind == "track" || scoped {
             limit
@@ -280,11 +294,13 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
                     .map(|mut r| entities.append(&mut r)),
             }
             .map(|()| {
-                // A `next` link marks a deeper page for this kind —
-                // recorded only once the rows it carried parsed.
-                if parse::has_next(&v) {
-                    more.insert(kind.to_string(), json!(off + page));
-                }
+                // The link's own `index` is the next offset — a short
+                // page advances by fewer rows than `limit`, so `off +
+                // page` would skip rows. No `next` marks the kind done.
+                match parse::next_index(&v, off) {
+                    Some(idx) => more.insert(kind.to_string(), json!(idx)),
+                    None => more.insert(kind.to_string(), Value::Null),
+                };
             }),
             Ok(http::Outcome::NotFound) => Err(failed(
                 "transient",
@@ -307,8 +323,8 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
             warn("deezer search section unavailable").await?;
         }
     }
-    // Every requested kind failing is a failure, not an empty page.
-    if failures == kinds.len() {
+    // Every fetched kind failing is a failure, not an empty page.
+    if fetched > 0 && failures == fetched {
         return Err(first_failure.unwrap_or_else(|| failed("transient", "deezer search".into())));
     }
 
@@ -316,9 +332,11 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
         "items": items,
         "entities": entities,
         "top_hit": top_hit(&query, &entities, &items),
-        "continuation": match more.is_empty() {
-            true => Value::Null,
-            false => json!(serde_json::to_string(&more).unwrap_or_default()),
+        // Only a pending offset keeps the page alive — a token of pure
+        // done-markers is the honest end, same as an empty one.
+        "continuation": match more.values().any(Value::is_u64) {
+            true => json!(serde_json::to_string(&more).unwrap_or_default()),
+            false => Value::Null,
         },
         "storefront": Value::Null,
     }))
@@ -839,12 +857,16 @@ mod tests {
         assert_eq!(entities[3]["subtitle"], "Deezer");
         // No exact title match → no hero.
         assert_eq!(out["result"]["top_hit"], Value::Null);
-        // The artist fixture advertises `next` — its offset rides the
-        // continuation alone.
-        assert_eq!(
-            out["result"]["continuation"].as_str(),
-            Some(r#"{"artist":10}"#)
-        );
+        // The artist fixture's own `next` advertises index 2 — the
+        // offset the token carries, not `off + limit`. Kinds that
+        // exhausted ride as done markers so they never refetch.
+        let token: Value =
+            serde_json::from_str(out["result"]["continuation"].as_str().unwrap_or_default())
+                .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
+        assert_eq!(token["artist"], 2, "{token}");
+        for kind in ["track", "album", "playlist"] {
+            assert_eq!(token[kind], Value::Null, "{kind}: {token}");
+        }
     }
 
     /// `kinds` scopes the ask: one endpoint, the request's own limit,
@@ -964,6 +986,48 @@ mod tests {
         let out = step(&http_ok(req_id(&out), EMPTY));
         assert_eq!(out["type"], "done", "{out}");
         assert_eq!(out["result"]["continuation"], Value::Null);
+    }
+
+    /// A `null` entry marks a kind done: it never refetches on later
+    /// pages, and when nothing stays pending the page ends the
+    /// continuation honestly.
+    #[test]
+    fn search_continuation_skips_done_kinds() {
+        let token = r#"{"track":null,"artist":2}"#;
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["track", "artist"], "continuation": token}),
+        );
+        // The one and only call is the artist rail at its offset —
+        // track's done marker skips its fetch entirely.
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(
+            url, "https://api.deezer.com/search/artist?q=x&limit=10&index=2",
+            "{url}"
+        );
+        let out = step(&http_ok(req_id(&out), EMPTY));
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["continuation"], Value::Null);
+    }
+
+    /// Done markers carry across pages — a kind exhausted on an
+    /// earlier page stays marked while a deeper rail keeps paging.
+    #[test]
+    fn search_continuation_carries_done_markers() {
+        let token = r#"{"track":null,"artist":2}"#;
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["track", "artist"], "continuation": token}),
+        );
+        let out = step(&http_ok(req_id(&out), SEARCH_ARTIST));
+        assert_eq!(out["type"], "done", "{out}");
+        let next: Value =
+            serde_json::from_str(out["result"]["continuation"].as_str().unwrap_or_default())
+                .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
+        assert_eq!(next["artist"], 2, "{next}");
+        assert_eq!(next["track"], Value::Null, "{next}");
     }
 
     /// Foreign or malformed tokens are payload errors, never a
@@ -1645,6 +1709,23 @@ mod tests {
         );
         let body = r#"{"id":908622995,"type":"playlist","title":"T","nb_tracks":50,
             "tracks":{"data":[{"id":1,"type":"track","title":"Only One"}]}}"#;
+        let out = step(&http_ok(req_id(&out), body));
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false);
+        assert_eq!(items_of(&out).len(), 1);
+    }
+
+    /// `tracks.next` marks the listing truncated even when `nb_tracks`
+    /// agrees with the rows delivered.
+    #[test]
+    fn entity_playlist_tracks_next_incomplete() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "deezer", "kind": "playlist", "id": "908622995"}}),
+        );
+        let body = r#"{"id":908622995,"type":"playlist","title":"T","nb_tracks":1,
+            "tracks":{"data":[{"id":1,"type":"track","title":"Only One"}],
+            "next":"https://api.deezer.com/playlist/908622995/tracks?index=1"}}"#;
         let out = step(&http_ok(req_id(&out), body));
         assert_eq!(out["type"], "done", "{out}");
         assert_eq!(out["result"]["complete"], false);

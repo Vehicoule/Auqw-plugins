@@ -32,7 +32,7 @@
     "explicit_lyrics": false,
     "explicit_content_lyrics": 0,
     "explicit_content_cover": 2,
-    "preview": "https://cdnt-preview.dzcdn.net/api/1/1/f/d/0/0/fd0ad7464f8aba5aea5c1070f6ec49c4.mp3?hdnea=exp~acl~hmac=aaaa",
+    "preview": "https://cdnt-preview.dzcdn.net/roads.mp3?hdnea=exp~hmac=iiii",
     "md5_image": "5942b88996f33c82790023d5d99395d3",
     "artist": {
      "id": 1069,
@@ -61,7 +61,7 @@
     "duration": 350,
     "rank": 390309,
     "explicit_lyrics": false,
-    "preview": "https://cdnt-preview.dzcdn.net/api/1/1/d/7/d/0/d7d6ea7efa1dc121689d8b402895f7fb.mp3?hdnea=exp~hmac=bbbb",
+    "preview": "https://cdnt-preview.dzcdn.net/roadslive.mp3?hdnea=exp~hmac=jjjj",
     "artist": {
      "id": 1069,
      "name": "Portishead",
