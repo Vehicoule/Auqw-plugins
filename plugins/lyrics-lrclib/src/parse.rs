@@ -153,26 +153,20 @@ pub fn ranked<'a>(
         (Some(want), Some(got)) => artist_names_match(want, got),
         (Some(_), None) => false,
     };
-    // An empty fold is never evidence *between folded strings*: a
-    // non-Latin query title norms to "" and would collide with any
-    // equally-empty record title. Literal (trimmed, case-insensitive)
-    // equality still counts — a record titled identically to the
-    // query names it even when neither side survives `norm`.
-    let title_is = |r: &Record, want: &str, want_raw: &str| {
-        if want.is_empty() {
-            raw_title_eq(&r.title, want_raw)
-        } else {
-            norm(&r.title) == *want
-        }
-    };
+    // Titles compare under the same fold-or-literal agreement rule
+    // as names: an empty fold is never evidence *between folded
+    // strings*, and an equal fold is not evidence when un-foldable
+    // letters remain — a record titled "梅 remix" is not "桜 remix"
+    // despite both norming to `remix`.
+    let title_is = |r: &Record, want_raw: &str| names_agree(&r.title, want_raw);
     let mut keyed: Vec<(u8, u8, u8, &'a Record)> = records
         .iter()
         .map(|r| {
-            let name_tier = if title_is(r, &want_title, title) && artist_ok(r) {
+            let name_tier = if title_is(r, title) && artist_ok(r) {
                 0
-            } else if title_is(r, &want_title, title) {
+            } else if title_is(r, title) {
                 1
-            } else if want_cleaned != want_title && title_is(r, &want_cleaned, &cleaned) {
+            } else if want_cleaned != want_title && title_is(r, &cleaned) {
                 2
             } else {
                 3
@@ -212,28 +206,14 @@ fn raw_title_eq(a: &str, b: &str) -> bool {
 /// `instrumental` only answers the query when the record names it —
 /// anything less is a tier miss, not a verdict on the track.
 pub fn names_query(r: &Record, title: &str, artist: Option<&str>) -> bool {
-    let got = norm(&r.title);
-    let title_hit = if got.is_empty() {
-        // Both sides folded away (non-Latin): only a literal title
-        // match, raw or against the cleaned query, names the query.
-        raw_title_eq(&r.title, title) || raw_title_eq(&r.title, &clean_title(title))
-    } else {
-        // The record's own decorations are transparent too: "Roads
-        // (Remastered 2011)" names the track Roads. The cleaned-record
-        // comparison demands a nonempty normalized form — an empty fold
-        // would equate every non-Latin query with every non-Latin
-        // record once a video suffix cleans away; those fall back to
-        // the literal comparison instead.
-        let cleaned_record = clean_title(&r.title);
-        let cleaned_norm = norm(&cleaned_record);
-        got == norm(title)
-            || got == norm(&clean_title(title))
-            || if cleaned_norm.is_empty() {
-                raw_title_eq(&cleaned_record, title)
-            } else {
-                cleaned_norm == norm(title)
-            }
-    };
+    // Title evidence runs the shared fold-or-literal agreement: the
+    // record's own decorations are transparent too ("Roads
+    // (Remastered 2011)" names the track Roads), and an equal fold is
+    // never evidence when un-foldable letters remain — "梅 remix" is
+    // not "桜 remix" under either's cleaned form.
+    let title_hit = names_agree(&r.title, title)
+        || names_agree(&r.title, &clean_title(title))
+        || names_agree(&clean_title(&r.title), title);
     if !title_hit {
         return false;
     }
@@ -526,9 +506,10 @@ pub fn artist_names_match(want: &str, got: &str) -> bool {
     names_agree(&primary_artist(want), &primary_artist(got))
 }
 
-/// The fold-or-literal agreement rule: nonempty ASCII folds compare
-/// by key plus non-Latin remnant; an empty fold on either side demotes
-/// to the literal `raw_title_eq` compare.
+/// The fold-or-literal agreement rule — shared by the artist and
+/// title compares: nonempty ASCII folds compare by key plus non-Latin
+/// remnant; an empty fold on either side demotes to the literal
+/// `raw_title_eq` compare.
 fn names_agree(want: &str, got: &str) -> bool {
     let w = norm(want);
     let g = norm(got);
@@ -789,6 +770,37 @@ mod tests {
         assert!(!names_query(&decorated_other, "夜の歌", None));
         let decorated_same = rec("夜の歌 (Lyric Video)", None, true);
         assert!(names_query(&decorated_same, "夜の歌", None));
+    }
+
+    /// An equal ASCII fold is not evidence when un-foldable letters
+    /// remain on the title path either: "桜 remix" and "梅 remix"
+    /// share the `remix` fold but are different songs — the title
+    /// compares carry the same non-Latin remnant check the artist
+    /// compare already enforced.
+    #[test]
+    fn non_latin_title_remnant_decides_equal_folds() {
+        // The remnant-differing row never claims a name tier — it
+        // must not preempt the real match behind it in provider
+        // order.
+        let records = [
+            rec("梅 remix", Some("Band"), false),
+            rec("桜 remix", Some("Band"), false),
+        ];
+        let first = ranked(&records, "桜 remix", Some("Band"), None)
+            .first()
+            .map(|r| r.title.as_str());
+        assert_eq!(first, Some("桜 remix"));
+        // `names_query`: the equal-fold record is not the queried
+        // track — a confident wrong-serve, the same outcome the
+        // artist-side remnant fix prevents.
+        assert!(!names_query(&rec("梅 remix", None, true), "桜 remix", None));
+        assert!(names_query(&rec("桜 remix", None, true), "桜 remix", None));
+        // The cleaned-record compare carries the remnant check too.
+        assert!(!names_query(
+            &rec("梅 remix (Remastered 2011)", None, true),
+            "桜 remix",
+            None
+        ));
     }
 
     /// A duration-matching record outranks a same-name sibling outside
