@@ -5,12 +5,14 @@
 //!
 //! Per-rung state lives in the host KV namespace: `visitor/<rung-key>`
 //! replays that client's last `responseContext.visitorData`,
-//! `backoff/<video-id>/<rung-key>` skips a rung that recently failed,
-//! and `ladder/last-good` leads the next resolve's attempt order with
-//! the rung that finished the last one. `kv_set` stages writes the
-//! host commits only on `done` — a failed resolve rolls its staged
-//! visitors/backoffs back by contract. KV is advisory: transient store
-//! errors degrade to the empty-store behavior, never a wedge.
+//! `backoff/<edge>/<video-id>/<rung-key>` skips a rung that recently
+//! failed on that serving edge, `ladder/last-good` leads the next
+//! resolve's attempt order with the rung that finished the last one,
+//! and `ladder/last-edge` opens the next resolve on the edge that
+//! served it. `kv_set` stages writes the host commits only on `done`
+//! — a failed resolve rolls its staged visitors/backoffs back by
+//! contract. KV is advisory: transient store errors degrade to the
+//! empty-store behavior, never a wedge.
 
 use auqw_guest_sdk::{
     http_request, kv_get, kv_set, log, now_ms, pot_token, GuestError, GuestFuture, HttpResponse,
@@ -36,6 +38,12 @@ const CAPPED_BACKOFF_MS: u64 = 5_000;
 /// `ladder/last-good` — the `kv_key` of the rung that finished the
 /// last `done` resolve. A pure attempt-order hint: see `last_good`.
 const LAST_GOOD_KEY: &str = "ladder/last-good";
+
+/// `ladder/last-edge` — which serving edge finished the last `done`
+/// resolve: "b" marks the redraw host as the one to open with. The
+/// hint self-corrects on the next success either way, so a stale
+/// value costs at most one wrongly-ordered resolve.
+const LAST_EDGE_KEY: &str = "ladder/last-edge";
 
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
@@ -323,8 +331,8 @@ pub(crate) async fn load_visitor(key: &str) -> Result<Option<String>, GuestError
 /// record may carry.
 const BACKOFF_REASONS: &[&str] = &["bot-check", "rate-limit", "transport", "capped"];
 
-/// What a `backoff/<video>/<rung>` KV read found. A record that
-/// exists but is not in force — expired, or bytes that fail the
+/// What a `backoff/<edge>/<video>/<rung>` KV read found. A record
+/// that exists but is not in force — expired, or bytes that fail the
 /// record shape — is inert state a finishing rung still collects, so
 /// it marks the key dirty where a truly absent key does not.
 enum StoredBackoff {
@@ -391,6 +399,22 @@ async fn last_good() -> Result<Option<String>, GuestError> {
             Ok(key) if LADDER.iter().any(|r| r.kv_key() == key) => Ok(Some(key)),
             _ => {
                 warn("ignoring a stale last-good rung KV value").await?;
+                Ok(None)
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+/// The edge the previous successful resolve finished on — "a" the
+/// primary InnerTube host, "b" the redraw host. Anything else is a
+/// foreign write: ignored, never a wedge.
+async fn last_edge() -> Result<Option<String>, GuestError> {
+    match kv_get_soft(LAST_EDGE_KEY).await? {
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(tag) if tag == "a" || tag == "b" => Ok(Some(tag)),
+            _ => {
+                warn("ignoring a stale last-edge KV value").await?;
                 Ok(None)
             }
         },
@@ -759,6 +783,12 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // flagged carrier IP converge on the one client that serves it
     // bare instead of re-walking dead rungs on every resolve.
     let last_good = last_good().await?;
+    // Which edge finished the previous resolve — a "b" hint opens the
+    // walk on the redraw host, where a sustained wall already proved
+    // edge A dead. The hint is advisory only: whatever it picks, the
+    // first success rewrites it, so it can never wedge.
+    let last_edge = last_edge().await?;
+    let primary_b = last_edge.as_deref() == Some("b");
     let hint = last_good
         .as_deref()
         .and_then(|key| LADDER.iter().position(|r| r.kv_key() == key));
@@ -767,7 +797,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
         order.push(i);
     }
     order.extend((0..LADDER.len()).filter(|i| hint != Some(*i)));
-    // Rungs whose `backoff/<video>` key the resolve touched — an
+    // Rungs whose `backoff/<edge>` key the resolve touched — an
     // in-force record it skipped past or one it staged. A finishing
     // rung clears its key only in those cases; a clean run needs no
     // write.
@@ -777,6 +807,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     'passes: loop {
         let attested = pass == 1;
         let redraw = pass == 2;
+        // The edge this pass's requests ride: passes 0/1 stay on one
+        // host (attestation replays the rung on the edge that walled
+        // it) and the redraw rides the other. "b" primary means the
+        // previous resolve's redraw winner opens first this time.
+        let edge = if redraw != primary_b { "b" } else { "a" };
         'rung: for &i in &order {
             let rung = &LADDER[i];
             // Pass 1 replays only rungs attestation can lift — a
@@ -793,18 +828,22 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             if redraw && !redraw_worthy(outcomes[i]) {
                 continue;
             }
-            let backoff_key = format!("backoff/{}/{}", p.video_id, rung.kv_key());
+            // Backoffs are edge-scoped: a redraw cooldown must never
+            // shadow the primary edge's record — the other edge can
+            // recover long before it expires.
+            let backoff_key = format!("backoff/{}/{}/{}", edge, p.video_id, rung.kv_key());
             // Backoff before the visitor read: a skipped rung costs one
-            // KV read, not two. The remedy passes deliberately ignore
-            // backoffs — a staged backoff is the thing they exist to
-            // break (a bot-backoff for attestation, any weather record
-            // for the second edge).
-            if pass == 0 {
+            // KV read, not two. Each edge honors only its own records —
+            // the redraw's 429 must not extend the primary edge's skip,
+            // and the attested pass deliberately ignores them all: a
+            // staged bot-backoff is the thing attestation exists to
+            // break.
+            if !attested {
                 match load_backoff(&backoff_key, now).await? {
                     StoredBackoff::Active(reason) => {
                         dirty_backoffs[i] = true;
                         let outcome = outcome_for_reason(&reason);
-                        if outcome == RungOutcome::Bot {
+                        if pass == 0 && outcome == RungOutcome::Bot {
                             bot_positions.push(i);
                         }
                         outcomes[i] = Some(outcome);
@@ -848,7 +887,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     rung_visitor.as_deref(),
                     if attested { pot.as_deref() } else { None },
                     access_token.as_deref(),
-                    if redraw {
+                    if edge == "b" {
                         crate::rungs::REDRAW_PLAYER_URL
                     } else {
                         crate::rungs::PLAYER_URL
@@ -1030,6 +1069,14 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                                     if last_good.as_deref() != Some(rung.kv_key()) {
                                         kv_set_soft(LAST_GOOD_KEY, Some(rung.kv_key().as_bytes()))
                                             .await?;
+                                    }
+                                    // Same for the serving edge: a
+                                    // redraw winner opens the next
+                                    // resolve's primary pass so a
+                                    // sustained wall doesn't cost the
+                                    // dead edge's walk every time.
+                                    if last_edge.as_deref() != Some(edge) {
+                                        kv_set_soft(LAST_EDGE_KEY, Some(edge.as_bytes())).await?;
                                     }
                                     return Ok(result);
                                 }
@@ -2292,8 +2339,8 @@ mod tests {
             "type": "invoke", "request_id": "t1", "capability": "playback.resolve",
             "payload": { "source_ref": VID },
         }));
-        // now → kv(last-good) → kv(backoff) → kv(visitor) → player.
-        for _ in 0..4 {
+        // now → kv(last-good) → kv(last-edge) → kv(backoff) → kv(visitor) → player.
+        for _ in 0..5 {
             let id = out["id"].as_u64().unwrap_or(u64::MAX);
             out = match out["kind"].as_str().unwrap_or("") {
                 "now_ms" => step(&json!({"type":"now_response","id":id,"now_ms":NOW})),
@@ -2430,8 +2477,10 @@ mod tests {
         assert_eq!(h.pot_calls, 1);
         // The recovered rung's staged bot-backoff was cleared; the
         // still-walled rung's persists.
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
-        assert!(h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+        assert!(!h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/VISIONOS")));
+        assert!(h.committed.contains_key(&format!("backoff/a/{VID}/IOS")));
     }
 
     #[test]
@@ -2690,8 +2739,10 @@ mod tests {
         assert_eq!(h.pot_calls, 1);
         // The recovered rung's staged bot-backoff was cleared; the
         // still-walled rung's persists.
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
-        assert!(h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+        assert!(!h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/VISIONOS")));
+        assert!(h.committed.contains_key(&format!("backoff/a/{VID}/IOS")));
     }
 
     #[test]
@@ -2817,7 +2868,7 @@ mod tests {
             ..Harness::new()
         };
         h.committed.insert(
-            format!("backoff/{VID}/VISIONOS"),
+            format!("backoff/a/{VID}/VISIONOS"),
             json!({ "until_ms": NOW + 60_000, "reason": "bot-check" })
                 .to_string()
                 .into_bytes(),
@@ -2843,7 +2894,9 @@ mod tests {
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
         // Recovery erased the stale backoff.
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(!h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/VISIONOS")));
     }
 
     #[test]
@@ -2971,7 +3024,7 @@ mod tests {
         assert_eq!(out["type"], "done");
         let stored: Value = serde_json::from_slice(
             h.committed
-                .get(&format!("backoff/{VID}/VISIONOS"))
+                .get(&format!("backoff/a/{VID}/VISIONOS"))
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
         )
@@ -3200,7 +3253,7 @@ mod tests {
     fn stored_backoff_skips_rung_without_player_call() {
         let mut h = Harness::new();
         h.committed.insert(
-            format!("backoff/{VID}/VISIONOS"),
+            format!("backoff/a/{VID}/VISIONOS"),
             json!({ "until_ms": NOW + 60_000, "reason": "rate-limit" })
                 .to_string()
                 .into_bytes(),
@@ -3225,7 +3278,7 @@ mod tests {
             "ANDROID_VR@1.43.32",
         ] {
             h.committed.insert(
-                format!("backoff/{VID}/{rung}"),
+                format!("backoff/a/{VID}/{rung}"),
                 json!({ "until_ms": NOW + 60_000, "reason": "rate-limit" })
                     .to_string()
                     .into_bytes(),
@@ -3249,7 +3302,7 @@ mod tests {
     fn expired_backoff_does_not_skip() {
         let mut h = Harness::new();
         h.committed.insert(
-            format!("backoff/{VID}/VISIONOS"),
+            format!("backoff/a/{VID}/VISIONOS"),
             json!({ "until_ms": NOW - 1, "reason": "rate-limit" })
                 .to_string()
                 .into_bytes(),
@@ -3269,14 +3322,14 @@ mod tests {
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
-        let Some(stored) = h.committed.get(&format!("backoff/{VID}/VISIONOS")) else {
+        let Some(stored) = h.committed.get(&format!("backoff/a/{VID}/VISIONOS")) else {
             panic!("rung-0 backoff must commit on done");
         };
         let stored: Value = serde_json::from_slice(stored).unwrap_or_default();
         assert_eq!(stored["reason"], "rate-limit");
         assert_eq!(stored["until_ms"], NOW + 60_000);
         // The successful rung's own backoff key was cleared.
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/IOS")));
+        assert!(!h.committed.contains_key(&format!("backoff/a/{VID}/IOS")));
     }
 
     #[test]
@@ -3293,7 +3346,9 @@ mod tests {
         assert_eq!(rung_of(&out), 0);
         let out = h.answer(&out, 429, "{}");
         assert_eq!(fail_kind(&out).0, "rate-limit");
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(!h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/VISIONOS")));
         assert!(h.staged.is_empty());
     }
 
@@ -3361,7 +3416,7 @@ mod tests {
         h.committed
             .insert("ladder/last-good".into(), b"ANDROID_VR@1.57.29".to_vec());
         h.committed.insert(
-            format!("backoff/{VID}/ANDROID_VR@1.57.29"),
+            format!("backoff/a/{VID}/ANDROID_VR@1.57.29"),
             json!({ "until_ms": NOW + 60_000, "reason": "bot-check" })
                 .to_string()
                 .into_bytes(),
@@ -3686,6 +3741,141 @@ mod tests {
     }
 
     #[test]
+    fn redraw_win_persists_the_winning_edge() {
+        // A sustained wall must not cost the dead edge's walk on every
+        // later resolve: the redraw winner is written back so the next
+        // resolve opens on the serving edge.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            h.committed.get("ladder/last-edge").map(Vec::as_slice),
+            Some(b"b".as_slice())
+        );
+    }
+
+    #[test]
+    fn last_edge_hint_opens_on_the_redraw_host() {
+        // The "b" hint moves the redraw host into the primary passes'
+        // slot: rung 0's first request goes to youtubei.googleapis.com
+        // and the attested pass would replay on that same edge.
+        let mut h = Harness::new();
+        h.committed.insert("ladder/last-edge".into(), b"b".to_vec());
+        let out = begin(&mut h);
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        // The hint is already correct — no rewrite.
+        assert_eq!(
+            h.committed.get("ladder/last-edge").map(Vec::as_slice),
+            Some(b"b".as_slice())
+        );
+    }
+
+    #[test]
+    fn a_wall_on_the_hinted_edge_redraws_the_primary_host() {
+        // With "b" primary, the redraw pass is the mirror image: walls
+        // on the redraw host are re-asked on music.youtube.com.
+        let mut h = Harness::new();
+        h.committed.insert("ladder/last-edge".into(), b"b".to_vec());
+        let mut out = begin(&mut h);
+        for _ in 0..LADDER.len() {
+            out = feed(&mut h, &out, BOT);
+        }
+        // Denied mint skips attestation; the redraw rides edge A.
+        assert!(url_of(&out).starts_with("https://music.youtube.com/"));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            h.committed.get("ladder/last-edge").map(Vec::as_slice),
+            Some(b"a".as_slice())
+        );
+    }
+
+    #[test]
+    fn edge_b_backoff_never_skips_edge_a() {
+        // The reviewer's scenario: a cooldown staged on the second
+        // edge must not suppress the same rung's bare shot on the
+        // primary edge — the edges cool independently.
+        let mut h = Harness::new();
+        h.committed.insert(
+            format!("backoff/b/{VID}/VISIONOS"),
+            json!({ "until_ms": NOW + 60_000, "reason": "rate-limit" })
+                .to_string()
+                .into_bytes(),
+        );
+        let out = begin(&mut h);
+        assert!(url_of(&out).starts_with("https://music.youtube.com/"));
+    }
+
+    #[test]
+    fn each_edge_stages_its_own_backoff() {
+        // A transport miss on each edge stages two independent records:
+        // edge A's under `backoff/a/...`, the redraw's under
+        // `backoff/b/...` — neither shadows the other. Staged writes
+        // commit only on `done`, so the second redraw rung wins.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        out = h.answer(&out, 403, "{\"error\":{\"code\":403}}"); // rung 0, edge A
+        for _ in 0..8 {
+            out = feed(&mut h, &out, BOT);
+        }
+        // Denied mint skips attestation; the redraw re-asks rung 0's
+        // transport miss on edge B first.
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        out = h.answer(&out, 403, "{\"error\":{\"code\":403}}"); // rung 0, edge B
+        assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert!(h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/VISIONOS")));
+        assert!(h
+            .committed
+            .contains_key(&format!("backoff/b/{VID}/VISIONOS")));
+        assert_eq!(
+            h.committed.get("ladder/last-edge").map(Vec::as_slice),
+            Some(b"b".as_slice())
+        );
+    }
+
+    #[test]
+    fn redraw_honors_its_own_edges_backoff() {
+        // A live edge-B cooldown suppresses only the redraw's re-ask:
+        // the rung walks edge A bare, then stays parked on the second
+        // edge instead of re-hammering a cooled rung.
+        let mut h = Harness::new();
+        h.committed.insert(
+            format!("backoff/b/{VID}/ANDROID_VR@1.57.29"),
+            json!({ "until_ms": NOW + 60_000, "reason": "bot-check" })
+                .to_string()
+                .into_bytes(),
+        );
+        let mut out = begin(&mut h);
+        out = feed(&mut h, &out, UNPLAYABLE); // rung 0 — deterministic
+        out = feed(&mut h, &out, BOT); // rung 1 — wall on edge A
+        for _ in 0..7 {
+            out = feed(&mut h, &out, UNPLAYABLE);
+        }
+        // Denied mint skips attestation; the redraw reads the stored
+        // edge-B record and ends the resolve instead of re-asking.
+        assert_eq!(out["type"], "fail");
+    }
+
+    #[test]
     fn mixed_transport_then_wall_stays_retryable() {
         // Rung 0 books Transport (a JSON-403 the parser can't read as a
         // playability verdict), rungs 1-7 all bot-check. The ladder's
@@ -3941,7 +4131,7 @@ mod tests {
         ] {
             let mut h = Harness::new();
             h.committed
-                .insert(format!("backoff/{VID}/VISIONOS"), value.into_bytes());
+                .insert(format!("backoff/a/{VID}/VISIONOS"), value.into_bytes());
             // Ignored backoff -> rung 0 still gets its player call.
             let out = begin(&mut h);
             assert_eq!(rung_of(&out), 0, "{name}");
@@ -3964,7 +4154,7 @@ mod tests {
         assert_eq!(rung_of(&out), 1);
         let staged: Value = serde_json::from_slice(
             h.staged
-                .get(&format!("backoff/{VID}/VISIONOS"))
+                .get(&format!("backoff/a/{VID}/VISIONOS"))
                 .and_then(|v| v.as_deref())
                 .unwrap_or_default(),
         )
@@ -4034,7 +4224,9 @@ mod tests {
         assert_eq!(out["result"]["client"], "VISIONOS");
         // The 401 blamed the token, not the rung — no backoff was
         // staged against `backoff/<vid>/VISIONOS`.
-        assert!(!h.committed.contains_key(&format!("backoff/{VID}/VISIONOS")));
+        assert!(!h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/VISIONOS")));
     }
 
     #[test]
@@ -4058,7 +4250,7 @@ mod tests {
         assert_eq!(out["result"]["client"], "ANDROID_VR@1.57.29");
         let stored: Value = serde_json::from_slice(
             h.committed
-                .get(&format!("backoff/{VID}/VISIONOS"))
+                .get(&format!("backoff/a/{VID}/VISIONOS"))
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
         )
@@ -4080,7 +4272,7 @@ mod tests {
         assert_eq!(out["type"], "done");
         let stored: Value = serde_json::from_slice(
             h.committed
-                .get(&format!("backoff/{VID}/VISIONOS"))
+                .get(&format!("backoff/a/{VID}/VISIONOS"))
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
         )
