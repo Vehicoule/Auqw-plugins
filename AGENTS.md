@@ -1,16 +1,16 @@
 # Agent guidelines
 
-Owns: how AI agents (and humans) work in these repositories. [conventions.md](conventions.md) owns naming and structure; [coding-rules.md](coding-rules.md) owns language rules. These docs are copied by hand into `AGENTS.md` at each repo root — the docs here stay authoritative.
+Owns: how AI agents (and humans) work in these repositories. [conventions.md](https://github.com/Vehicoule/auqw-docs/blob/main/contributing/conventions.md) owns naming and structure; [coding-rules.md](https://github.com/Vehicoule/auqw-docs/blob/main/contributing/coding-rules.md) owns language rules. These docs are copied by hand into `AGENTS.md` at each repo root — the source in `auqw-docs` stays authoritative; relative links below are rewritten for this repo's layout.
 
 ## Before you work
 
-1. Read [README.md](../README.md), [product.md](../product.md), and [decisions.md](../decisions.md). The decision log is the source of truth for what is settled — never re-litigate a Decided row in code; change it in the log first, with rationale.
-2. Work in slice units ([plan.md](../plan/plan.md)). Open the slice file; implement against its work breakdown; close its exit gates. If a task isn't in a slice, it isn't work — it's scope creep (risk R4).
+1. Read [README.md](README.md), [product.md](https://github.com/Vehicoule/auqw-docs/blob/main/product.md), and [decisions.md](https://github.com/Vehicoule/Auqw/blob/main/docs/decisions.md). The decision log (in the Auqw repo — this repo carries no copy) is the source of truth for what is settled — never re-litigate a Decided row in code; change it in the log first, with rationale.
+2. Work in slice units ([plan.md](https://github.com/Vehicoule/auqw-docs/blob/main/plan/plan.md)). Open the slice file; implement against its work breakdown; close its exit gates. If a task isn't in a slice, it isn't work — it's scope creep (risk R4).
 3. When a plan doc is ambiguous, stop and surface the ambiguity (issue or comment) instead of guessing architecture. Small local choices (naming, test structure) are yours; boundary choices are not.
 
 ## Non-negotiables
 
-- **Greenfield:** no code, schemas, or shims copied from the predecessor projects. Their docs are reference material only ([history.md](../history.md)).
+- **Greenfield:** no code, schemas, or shims copied from the predecessor projects. Their docs are reference material only ([history.md](https://github.com/Vehicoule/auqw-docs/blob/main/history.md)).
 - **A slice is not done until the phone plays sound through the new code path** (Slice 4: the desktop).
 - **Never mark an exit gate passed without evidence.** Evidence = command output, measurement, or a recorded journey on a real target. Simulator/emulator/dev-server results are labeled provisional.
 - **Never bypass the sandbox:** no ambient network, filesystem, or credential access for plugin guests; budgets and the import allowlist are not suggestions.
@@ -20,8 +20,8 @@ Owns: how AI agents (and humans) work in these repositories. [conventions.md](co
 ## Workflow
 
 1. Pick the current slice's next open item.
-2. Branch per [conventions.md](conventions.md) (trunk-based, `s<slice>/topic`).
-3. Implement per [coding-rules.md](coding-rules.md); run the full local gate (fmt, lint, typecheck, tests) before committing.
+2. Branch per [conventions.md](https://github.com/Vehicoule/auqw-docs/blob/main/contributing/conventions.md) (trunk-based, `s<slice>/topic`).
+3. Implement per [coding-rules.md](https://github.com/Vehicoule/auqw-docs/blob/main/contributing/coding-rules.md); run the full local gate (fmt, lint, typecheck, tests) before committing.
 4. CI must be green before merge; required checks are non-overridable.
 5. Update the slice file: check off gates **only** with an evidence note appended to the file's `## Evidence` section (date, target, command/journey, result, numbers).
 
