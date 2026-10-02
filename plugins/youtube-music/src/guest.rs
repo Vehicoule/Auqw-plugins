@@ -50,6 +50,9 @@ const LAST_EDGE_KEY: &str = "ladder/last-edge";
 /// three calls — player, probe, one redirect re-probe — so a remedy
 /// pass emits a request only while that chain still fits; past the
 /// bound the rung would die mid-draw `budget-exceeded` either way.
+/// In-flight re-asks (401 token-drop, walled-visitor drop) hold the
+/// same bound: they run only while the probe chain behind them still
+/// has room.
 const HTTP_CALL_BUDGET: u32 = 32;
 const RUNG_CHAIN_CALLS: u32 = 3;
 
@@ -927,7 +930,14 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         continue 'rung;
                     }
                 };
-                if r.status == 401 && access_token.take().is_some() {
+                // Re-asks consume from the same budget — one only runs
+                // while the probe chain behind it still fits, else the
+                // rung keeps this verdict rather than dying mid-draw.
+                if r.status == 401
+                    && access_token.is_some()
+                    && http_calls + RUNG_CHAIN_CALLS <= HTTP_CALL_BUDGET
+                {
+                    access_token.take();
                     continue 'request;
                 }
                 let verdict = classify_response(&r);
@@ -959,7 +969,13 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         }
                     }
                     rung_visitor = None;
-                    continue 'request;
+                    // Same budget bound as the 401 re-ask: the bare
+                    // re-ask runs only while the probe chain behind it
+                    // still fits — the drop bookkeeping commits either
+                    // way.
+                    if http_calls + RUNG_CHAIN_CALLS <= HTTP_CALL_BUDGET {
+                        continue 'request;
+                    }
                 }
                 break 'request verdict;
             };

@@ -70,15 +70,26 @@ Each rung has a stable KV key (`VISIONOS`, `IOS`,
   or merely shadowed) and, when the sent value was the fresh cross-rung
   one, the entry it was harvested under — so a poisoned visitor can't
   wall a rung on every later resolve.
-- `backoff/<video-id>/<rung-key>` — `{until_ms, reason}` JSON. A rung
-  whose backoff is still in force is skipped (no player call) but its
-  reason still participates in the final failure taxonomy — a stored
-  `rate-limit` answers `rate-limit`. Failed rungs stage backoffs:
-  bot-check 45 s, rate-limit 60 s, transport 5 s, capped probe 5 s; a
-  successful rung clears its own key only when the resolve touched it.
+- `backoff/<edge>/<video-id>/<rung-key>` — `{until_ms, reason}` JSON,
+  scoped to the serving edge (`a` the primary host, `b` the redraw
+  host) so one edge's cooldown can never shadow the other's: an edge
+  that 429s recovers independently of the wall the other is still
+  serving. A rung whose backoff on *this pass's edge* is still in
+  force is skipped (no player call) but its reason still participates
+  in the final failure taxonomy — a stored `rate-limit` answers
+  `rate-limit`. Failed rungs stage backoffs on the edge they failed
+  on: bot-check 45 s, rate-limit 60 s, transport 5 s, capped probe 5
+  s; a successful rung clears its own key only when the resolve
+  touched it.
 - `ladder/last-good` — the `kv_key` of the rung that finished the last
   resolve; it leads the next attempt order. A value naming no current
   rung is ignored with a warning.
+- `ladder/last-edge` — `a` or `b`, the edge that finished the last
+  resolve. A `b` hint opens the next resolve's primary passes on the
+  redraw host (the redraw pass mirrors to the primary host), so a
+  sustained wall stops costing the dead edge's walk. It self-corrects
+  on the next success either way; anything else is ignored with a
+  warning.
 
 The KV namespace is advisory state: a non-terminal host error on a
 read degrades to the empty-store answer and a dropped write is
@@ -206,7 +217,11 @@ unavailable, restricted formats, proven no-audio) are edge-agnostic
 and never redrawn. The redraw rides the freshest visitorData the
 invocation harvested — never a visitor this invocation already
 dropped as walled — and one dropped re-ask per rung still applies.
-A stored backoff never suppresses an edge-B draw.
+A stored backoff suppresses a draw only on its own edge — the
+redraw honors a live edge-B record rather than re-hammering a
+cooled rung, and a remedy rung (attested or redrawn) opens only
+while its full request chain still fits the host's 32-call HTTP
+budget.
 
 Measured 2026-09-19: `pot=` did not lift a capped IOS mint — serving
 caps are enforced independently of attestation — but the same token
