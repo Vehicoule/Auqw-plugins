@@ -90,6 +90,16 @@ Each rung has a stable KV key (`VISIONOS`, `IOS`,
   sustained wall stops costing the dead edge's walk. It self-corrects
   on the next success either way; anything else is ignored with a
   warning.
+- `pot/aside` and `pot/aside/<video-id>` — `{until_ms}` JSON, the
+  poToken mint cooldown (60 s). A miss that can only be the provider
+  (permission-denied, unreachable, its own 429, 5xx, a tokenless 200)
+  is remembered globally; a refusal that can bind to the asked video
+  (other 4xx) is
+  remembered under the video's own key so one video's refusal never
+  suppresses another's mint. Inside the window `mint_once` returns
+  without calling the provider; a successful mint clears both scopes
+  it can see. The record must be exactly one key — anything else is
+  ignored with a warning.
 
 The KV namespace is advisory state: a non-terminal host error on a
 read degrades to the empty-store answer and a dropped write is
