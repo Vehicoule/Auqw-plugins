@@ -1054,6 +1054,25 @@ mod tests {
         assert_eq!(out["result"]["continuation"], Value::Null);
     }
 
+    /// A stale index in `next` yields to the rows the page actually
+    /// carried — repeated indices don't truncate a nonempty rail.
+    #[test]
+    fn search_repeated_next_index_advances_by_rows() {
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["artist"], "continuation": "{\"artist\":10}"}),
+        );
+        let body = r#"{"data":[{"id":1,"type":"artist","name":"A"}],
+            "next":"https://api.deezer.com/search/artist?q=x&index=10"}"#;
+        let out = step(&http_ok(req_id(&out), body));
+        assert_eq!(out["type"], "done", "{out}");
+        let token: Value =
+            serde_json::from_str(out["result"]["continuation"].as_str().unwrap_or_default())
+                .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
+        assert_eq!(token["artist"], 11, "{token}");
+    }
+
     /// Foreign or malformed tokens are payload errors, never a
     /// request.
     #[test]

@@ -92,17 +92,23 @@ pub fn has_next(v: &Value) -> bool {
 /// is not always `index + limit`. `None` when no `next` is advertised;
 /// a `next` without a parseable index falls back to `off` plus the
 /// rows actually returned so the page boundary never skips rows. An
-/// offset that doesn't move forward is still `None`: a self-referential
-/// token would refetch the same page forever, so a stuck rail ends.
+/// index that doesn't move forward yields to the row count instead —
+/// the delivered rows are always a forward offset; only a page that
+/// cannot advance at all returns `None`, and a stuck rail ends rather
+/// than refetching itself forever.
 pub fn next_index(v: &Value, off: u64) -> Option<u64> {
     let next = v.as_object()?.get("next").and_then(Value::as_str)?;
     if next.is_empty() {
         return None;
     }
-    let idx = next
-        .split(['&', '?'])
-        .find_map(|seg| seg.strip_prefix("index=").and_then(|n| n.parse().ok()))
-        .unwrap_or_else(|| off + data_list(v).map(|d| d.len() as u64).unwrap_or(0));
+    let parsed = next.split(['&', '?']).find_map(|seg| {
+        seg.strip_prefix("index=")
+            .and_then(|n| n.parse::<u64>().ok())
+    });
+    let idx = match parsed {
+        Some(i) if i > off => i,
+        _ => off + data_list(v).map(|d| d.len() as u64).unwrap_or(0),
+    };
     if idx > off {
         Some(idx)
     } else {
