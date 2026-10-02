@@ -1420,9 +1420,6 @@ async fn finish_pick(
     if resp.status / 100 == 3 {
         let target = header_value(&resp.headers, "location").map(str::to_owned);
         if let Some(target) = target.filter(|t| t.starts_with("https://") && is_googlevideo(t)) {
-            // The follow is optional chain spend: it emits only while
-            // a call remains, else the rung keeps the unresolved 3xx
-            // and books capped like a foreign target.
             if *http_calls < HTTP_CALL_BUDGET {
                 probe_url = target;
                 *http_calls += 1;
@@ -1430,6 +1427,13 @@ async fn finish_pick(
                     Ok(r) => resp = r,
                     Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
                 }
+            } else {
+                // An allowlisted hop the budget cannot follow leaves
+                // the chain unresolved — inconclusive, budget-limited
+                // weather, never a provider cap. A foreign or absent
+                // target below stays 3xx and books capped: that IS
+                // evidence the mint cannot serve.
+                return Ok(PickOutcome::Advance(RungOutcome::Transport));
             }
         }
     }
@@ -1445,32 +1449,36 @@ async fn finish_pick(
     let mut verdict = probe_verdict(&resp, picked.content_length);
     // A response still in 3xx is a redirect that never resolved: the
     // target rode outside the allowlist or the hop chain did not
-    // close (or the follow did not fit the budget). Re-probing that
-    // URL over the fallback window could only "hit" a URL playback
-    // cannot actually follow — the rung is a capped mint, full stop.
-    // The re-probe is itself optional chain spend: with no call left
-    // the hinted miss's verdict stands.
+    // close. Re-probing that URL over the fallback window could only
+    // "hit" a URL playback cannot actually follow — the rung is a
+    // capped mint, full stop.
     if verdict == Some(RungOutcome::Capped)
         && picked.content_length.is_some()
         && resp.status / 100 != 3
-        && *http_calls < HTTP_CALL_BUDGET
     {
-        *http_calls += 1;
-        resp = match http_request(probe_request(rung, &probe_url, None)).await {
-            Ok(r) => r,
-            Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
-        };
-        verdict = probe_verdict(&resp, None);
-        // A `bytes */0` refusal technically hits the EOF arm while
-        // describing an empty object nothing can play — a capped
-        // rung, not a zero-length result. Any other hit proves the
-        // window's span, not the hinted length, so the result reports
-        // the served `Content-Range` total — the edge's own size
-        // evidence — rather than the hint that just lied.
-        if verdict.is_none() && served_total(&resp) == Some(0) {
-            verdict = Some(RungOutcome::Capped);
+        // The re-probe is itself optional chain spend — when it does
+        // not fit, the hinted miss stands unverified: an inconclusive,
+        // budget-limited attempt, not a provider cap.
+        if *http_calls < HTTP_CALL_BUDGET {
+            *http_calls += 1;
+            resp = match http_request(probe_request(rung, &probe_url, None)).await {
+                Ok(r) => r,
+                Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
+            };
+            verdict = probe_verdict(&resp, None);
+            // A `bytes */0` refusal technically hits the EOF arm while
+            // describing an empty object nothing can play — a capped
+            // rung, not a zero-length result. Any other hit proves the
+            // window's span, not the hinted length, so the result reports
+            // the served `Content-Range` total — the edge's own size
+            // evidence — rather than the hint that just lied.
+            if verdict.is_none() && served_total(&resp) == Some(0) {
+                verdict = Some(RungOutcome::Capped);
+            } else {
+                content_length = served_total(&resp);
+            }
         } else {
-            content_length = served_total(&resp);
+            verdict = Some(RungOutcome::Transport);
         }
     }
     match verdict {
@@ -2249,6 +2257,83 @@ mod tests {
         out = answer_probe_206(&mut h, &out);
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["client"], "ANDROID_VR@1.43.32");
+    }
+
+    /// Drive rungs 0-6 through the four-call worst chain (28 calls),
+    /// then rung 7 through a two-call 5xx probe — leaves exactly two
+    /// calls for rung 8's minimal chain. (A 429 here would book
+    /// rate-limit weather, which the ladder-error taxonomy promotes
+    /// over everything else and masks what rung 8 recorded.)
+    fn drive_to_last_rung(h: &mut Harness) -> Value {
+        let mut out = begin(h);
+        for i in 0..7 {
+            assert_eq!(rung_of(&out), i);
+            out = feed(h, &out, OK);
+            probe_of(&out);
+            out = h.answer_headers(
+                &out,
+                302,
+                &[("Location", "https://rr9.googlevideo.com/alt")],
+                0,
+            );
+            out = h.answer(&out, 416, "");
+            out = answer_fallback_416(h, &out);
+        }
+        assert_eq!(rung_of(&out), 7);
+        out = feed(h, &out, OK);
+        probe_of(&out);
+        let out = h.answer(&out, 500, "");
+        assert_eq!(rung_of(&out), 8);
+        out
+    }
+
+    #[test]
+    fn unaffordable_fallback_books_inconclusive_transport() {
+        // Rung 8 enters with two calls left; its player and hinted
+        // probe spend both, so the hint's miss cannot earn the repair
+        // re-probe — an inconclusive, budget-limited attempt, not a
+        // provider cap. No fallback GET ever emits.
+        let mut h = Harness::new();
+        let mut out = drive_to_last_rung(&mut h);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        out = h.answer(&out, 416, "");
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "transient", "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transport"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn unaffordable_redirect_follow_books_inconclusive_transport() {
+        // Same two-call window, but the hinted probe's 302 names an
+        // allowlisted target the budget cannot follow — the chain
+        // stays unresolved, which is inconclusive weather, not a
+        // foreign mint's cap.
+        let mut h = Harness::new();
+        let mut out = drive_to_last_rung(&mut h);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        out = h.answer_headers(
+            &out,
+            302,
+            &[("Location", "https://rr9.googlevideo.com/alt")],
+            0,
+        );
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "transient", "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transport"),
+            "{out}"
+        );
     }
 
     /// Strip `contentLength` so the probe falls back to a fixed window.
