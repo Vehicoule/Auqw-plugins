@@ -45,6 +45,14 @@ const LAST_GOOD_KEY: &str = "ladder/last-good";
 /// value costs at most one wrongly-ordered resolve.
 const LAST_EDGE_KEY: &str = "ladder/last-edge";
 
+/// The host's per-invocation HTTP budget (`max_http_calls` in
+/// `plugin-host/src/budgets.rs`). A rung attempt's worst chain is
+/// three calls — player, probe, one redirect re-probe — so a remedy
+/// pass emits a request only while that chain still fits; past the
+/// bound the rung would die mid-draw `budget-exceeded` either way.
+const HTTP_CALL_BUDGET: u32 = 32;
+const RUNG_CHAIN_CALLS: u32 = 3;
+
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,6 +810,10 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     // rung clears its key only in those cases; a clean run needs no
     // write.
     let mut dirty_backoffs = vec![false; LADDER.len()];
+    // Player + probe emissions this resolve, counted against the
+    // host's HTTP budget so a remedy pass never opens a rung chain
+    // that can't finish inside it.
+    let mut http_calls = 0u32;
 
     let mut pass = 0u8;
     'passes: loop {
@@ -826,6 +838,14 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // capped mints, transport misses. Deterministic verdicts
             // are edge-agnostic and never redrawn.
             if redraw && !redraw_worthy(outcomes[i]) {
+                continue;
+            }
+            // A remedy request needs its whole chain inside the host's
+            // 32-call HTTP budget — pass 0's worst case (9 player +
+            // 9 probes + re-probes) can leave so little that a redrawn
+            // rung would never reach its probe. Emit only what fits;
+            // the skipped rungs keep their pass-0 verdict.
+            if (attested || redraw) && http_calls + RUNG_CHAIN_CALLS > HTTP_CALL_BUDGET {
                 continue;
             }
             // Backoffs are edge-scoped: a redraw cooldown must never
@@ -881,6 +901,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // too, and the attested pass replays the same one.
             let mut dropped_visitor = false;
             let verdict = 'request: loop {
+                http_calls += 1;
                 let sent = http_request(player_request(
                     rung,
                     &p.video_id,
@@ -1051,6 +1072,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                                 &mut mint_attempted,
                                 &mut pot,
                                 &p.video_id,
+                                &mut http_calls,
                             )
                             .await?
                             {
@@ -1221,6 +1243,7 @@ async fn finish_pick(
     mint_attempted: &mut bool,
     pot: &mut Option<String>,
     video_id: &str,
+    http_calls: &mut u32,
 ) -> Result<PickOutcome, GuestError> {
     let _ = mint_once(mint_attempted, pot, video_id).await?;
     if let Some(token) = pot.as_deref() {
@@ -1233,6 +1256,7 @@ async fn finish_pick(
     if !is_googlevideo(&picked.url) {
         return Ok(PickOutcome::Advance(RungOutcome::Capped));
     }
+    *http_calls += 1;
     let mut resp = match http_request(probe_request(rung, &picked.url, picked.content_length)).await
     {
         Ok(r) => r,
@@ -1251,6 +1275,7 @@ async fn finish_pick(
     if resp.status / 100 == 3 {
         let target = header_value(&resp.headers, "location").map(str::to_owned);
         if let Some(target) = target.filter(|t| t.starts_with("https://") && is_googlevideo(t)) {
+            *http_calls += 1;
             match http_request(probe_request(rung, &target, picked.content_length)).await {
                 Ok(r) => resp = r,
                 Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
@@ -2237,8 +2262,11 @@ mod tests {
             out = h.answer(&out, 403, "");
         }
         // Capped mints are per-mint stochastic — each earns a redraw on
-        // the second edge, mint and probe again.
-        for _ in 0..9 {
+        // the second edge, mint and probe again. Pass 0 already spent
+        // 18 calls of the 32-call HTTP budget, so only the redraws
+        // whose full chain (player + probe + re-probe) still fits are
+        // emitted: six of nine.
+        for _ in 0..6 {
             assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, OK);
             probe_of(&out);
@@ -4032,8 +4060,10 @@ mod tests {
             }
         }
         // The capped mints are weather: each redraws on the second
-        // edge — new mint, same refusal.
-        for _ in 1..9usize {
+        // edge — new mint, same refusal. Seventeen calls spent on
+        // pass 0 leaves room inside the 32-call budget for seven of
+        // the eight redraws (each needs its three-call chain).
+        for _ in 1..8usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
