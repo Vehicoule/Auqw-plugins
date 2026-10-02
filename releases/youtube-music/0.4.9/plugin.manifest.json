@@ -1,0 +1,22 @@
+{
+  "abi": "0.3.0",
+  "artifact": {
+    "digest": "sha256:1865e1a3aed405326a9f13149ee5c69828671db22944b7ccdbc76e7a01d3c5cf",
+    "path": "dist/youtube-music.wasm"
+  },
+  "capabilities": [
+    "playback.resolve",
+    "playback.candidates",
+    "radio.seed",
+    "catalog.suggest"
+  ],
+  "id": "youtube-music",
+  "permissions": [
+    "network:music.youtube.com",
+    "network:youtubei.googleapis.com",
+    "network:*.googlevideo.com",
+    "pot-provider",
+    "kv"
+  ],
+  "version": "0.4.9"
+}
