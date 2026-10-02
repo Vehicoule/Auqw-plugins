@@ -5,8 +5,10 @@
 //! Checks artifact size (<= 5 MiB), full module validity, zero imports,
 //! no start section, and the required exports (`memory`, `alloc`,
 //! `handle`) with exact signatures; enforces the manifest schema
-//! (`sdk/contract/manifest.schema.json`); computes the artifact's
-//! sha256 and verifies or updates `manifest.artifact.digest`.
+//! (`sdk/contract/manifest.schema.json`) plus the manifest-vs-guest
+//! alignment (declared capabilities served, granted permissions used);
+//! computes the artifact's sha256 and verifies or updates
+//! `manifest.artifact.digest`.
 //!
 //! Deliberately independent of the auqw host crate: a duplicated
 //! inspection is the intended cost of keeping the repos decoupled.
@@ -62,6 +64,14 @@ fn main() -> ExitCode {
         }
     };
     if let Err(e) = check_manifest(&manifest) {
+        eprintln!("validate: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = check_guest_alignment(&manifest, &wasm) {
+        eprintln!("validate: {e}");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = check_capability_support(&manifest, &wasm) {
         eprintln!("validate: {e}");
         return ExitCode::FAILURE;
     }
@@ -418,6 +428,158 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+/// A permission the guest never exercises is silent scope — the
+/// sandbox grant is read from the manifest, so granting beyond what the
+/// code uses asks the host for authority it cannot spend.
+///
+/// Use is read off the module's data segments: the SDK's `host_call`
+/// kind strings are `&'static str` literals and live in rodata —
+/// `kv` → `kv_get`/`kv_set`, `pot-provider` → `pot_token`,
+/// `network:*` → `http_request`. (`resume` is the paginated-fetch
+/// continue call — only ever compiled in alongside `http_request`, so
+/// it witnesses nothing extra.) Granularity stops there: a `network:` entry binds a
+/// destination at fetch time, and the fetched URL comes from provider
+/// payloads rather than literals, so an unused *destination* is not
+/// statically decidable.
+fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<(), String> {
+    let mut segments: Vec<&[u8]> = Vec::new();
+    for payload in Parser::new(0).parse_all(wasm) {
+        if let Payload::DataSection(reader) = payload.map_err(|e| format!("data section: {e}"))? {
+            for segment in reader {
+                let segment = segment.map_err(|e| format!("data section: {e}"))?;
+                segments.push(segment.data);
+            }
+        }
+    }
+    let has = |needle: &str| {
+        segments
+            .iter()
+            .any(|seg| seg.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    };
+
+    let perms = manifest["permissions"]
+        .as_array()
+        .ok_or_else(|| "manifest.permissions must be an array".to_string())?;
+    for perm in perms {
+        let Some(p) = perm.as_str() else {
+            return Err("manifest.permissions entries must be strings".into());
+        };
+        let used = if p == "kv" {
+            has("kv_get") || has("kv_set")
+        } else if p == "pot-provider" {
+            has("pot_token")
+        } else {
+            // network:<dest> — exercised iff the guest fetches at all.
+            has("http_request")
+        };
+        if !used {
+            return Err(format!(
+                "manifest.permissions entry {p:?} is granted but the guest never uses it"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A declared capability the guest does not serve is silent scope —
+/// the host would route invocations that always fail `not-applicable`.
+/// The dispatch match's string literals never reach the artifact (LLVM
+/// folds them into immediate compares), so the guest itself is asked:
+/// feed one `invoke` step per declared capability and read the first
+/// reply. Fuel is capped so a looped guest cannot hang the check.
+fn check_capability_support(manifest: &serde_json::Value, wasm: &[u8]) -> Result<(), String> {
+    let caps = manifest["capabilities"]
+        .as_array()
+        .ok_or_else(|| "manifest.capabilities must be an array".to_string())?;
+    let mut config = wasmi::Config::default();
+    config.consume_fuel(true);
+    let engine = wasmi::Engine::new(&config);
+    let module = wasmi::Module::new(&engine, wasm)
+        .map_err(|e| format!("cannot load module for the capability probe: {e}"))?;
+    for cap in caps {
+        let Some(name) = cap.as_str() else {
+            return Err("manifest.capabilities entries must be strings".into());
+        };
+        if !probe_capability(&engine, &module, name)? {
+            return Err(format!(
+                "manifest.capabilities entry {name:?} is not implemented by the guest"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One fresh instance per probe — an invocation's state does not carry
+/// across `handle` entries. Sends `{"type":"invoke",...,"payload":{}}`
+/// and reports `false` only when the guest's first reply is the
+/// dispatch fallback's `not-applicable` + `capability <name> not
+/// supported` pair. A served capability answers `invalid-response`
+/// (the empty payload fails its own schema first) or a host-call
+/// request; an implementation's *own* `not-applicable` (a provider/kind
+/// mismatch) carries a different message and is never confused for the
+/// fallback.
+fn probe_capability(
+    engine: &wasmi::Engine,
+    module: &wasmi::Module,
+    cap: &str,
+) -> Result<bool, String> {
+    const FUEL: u64 = 20_000_000;
+    let mut store = wasmi::Store::new(engine, ());
+    store
+        .set_fuel(FUEL)
+        .map_err(|e| format!("cannot cap probe fuel: {e}"))?;
+    let linker = wasmi::Linker::new(engine);
+    let instance = linker
+        .instantiate_and_start(&mut store, module)
+        .map_err(|e| format!("cannot instantiate guest: {e}"))?;
+    let memory = instance
+        .get_memory(&store, "memory")
+        .ok_or_else(|| "missing memory export".to_string())?;
+    let alloc = instance
+        .get_typed_func::<u32, u32>(&store, "alloc")
+        .map_err(|e| format!("guest alloc is not callable: {e}"))?;
+    let handle = instance
+        .get_typed_func::<(u32, u32), u64>(&store, "handle")
+        .map_err(|e| format!("guest handle is not callable: {e}"))?;
+
+    let invoke = serde_json::json!({
+        "type": "invoke",
+        "request_id": "auqw-validate",
+        "capability": cap,
+        "payload": {},
+    });
+    let input =
+        serde_json::to_vec(&invoke).map_err(|e| format!("cannot serialize probe step: {e}"))?;
+    let len = u32::try_from(input.len()).map_err(|_| "probe step too large".to_string())?;
+    let ptr = alloc
+        .call(&mut store, len)
+        .map_err(|e| format!("guest alloc trapped: {e}"))?;
+    let start = usize::try_from(ptr).unwrap_or(usize::MAX);
+    let end = start.saturating_add(input.len());
+    if end > memory.data(&store).len() {
+        return Err("guest alloc returned an out-of-bounds pointer".into());
+    }
+    memory.data_mut(&mut store)[start..end].copy_from_slice(&input);
+    let packed = handle
+        .call(&mut store, (ptr, len))
+        .map_err(|e| format!("guest handle trapped while probing {cap:?}: {e}"))?;
+    let out_ptr = usize::try_from(packed >> 32).unwrap_or(usize::MAX);
+    let out_len = usize::try_from(packed & 0xffff_ffff).unwrap_or(usize::MAX);
+    let data = memory.data(&store);
+    let Some(out_end) = out_ptr.checked_add(out_len) else {
+        return Err("guest reply lies outside its linear memory".into());
+    };
+    if out_end > data.len() {
+        return Err("guest reply lies outside its linear memory".into());
+    }
+    let reply: serde_json::Value = serde_json::from_slice(&data[out_ptr..out_end])
+        .map_err(|e| format!("guest reply is not JSON: {e}"))?;
+    let unserved = reply["type"].as_str() == Some("fail")
+        && reply["error"]["kind"].as_str() == Some("not-applicable")
+        && reply["error"]["message"].as_str() == Some(&format!("capability {cap} not supported"));
+    Ok(!unserved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +769,130 @@ mod tests {
             )),
             Ok(())
         );
+    }
+
+    /// A module whose data segments carry each given literal — the
+    /// shape capability names and host-call kinds take in a real guest.
+    fn wasm_with_literals(literals: &[&str]) -> Vec<u8> {
+        let data = literals
+            .iter()
+            .enumerate()
+            .map(|(i, s)| format!("(data (i32.const {}) \"{s}\")", i * 1024))
+            .collect::<Vec<_>>()
+            .join("\n            ");
+        wat::parse_str(format!(
+            "(module
+                (memory (export \"memory\") 1)
+                {data}
+                (func (export \"alloc\") (param i32) (result i32) (i32.const 0))
+                (func (export \"handle\") (param i32 i32) (result i64) (i64.const 0)))"
+        ))
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn alignment_passes_when_claims_match_guest() {
+        let wasm = wasm_with_literals(&["playback.resolve", "http_request", "kv_get", "pot_token"]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest(
+                    "0.3.0",
+                    "[\"playback.resolve\"]",
+                    "[\"network:x.test\",\"kv\",\"pot-provider\"]"
+                ),
+                &wasm
+            ),
+            Ok(())
+        );
+    }
+
+    /// A module whose `handle` ignores the input and replies with the
+    /// given bytes — the probe tests' answer, staged at offset 1024.
+    fn wasm_replying(reply: &str) -> Vec<u8> {
+        let escaped = reply.replace('\\', "\\\\").replace('"', "\\\"");
+        wat::parse_str(format!(
+            "(module
+                (memory (export \"memory\") 1)
+                (data (i32.const 1024) \"{escaped}\")
+                (func (export \"alloc\") (param i32) (result i32) (i32.const 16))
+                (func (export \"handle\") (param i32 i32) (result i64) (i64.const {})))",
+            (1024u64 << 32) | reply.len() as u64
+        ))
+        .unwrap_or_default()
+    }
+
+    #[test]
+    fn capability_probe_detects_dispatch_fallback() {
+        let wasm = wasm_replying(
+            "{\"type\":\"fail\",\"error\":{\"kind\":\"not-applicable\",\
+             \"message\":\"capability bogus.cap not supported\"}}",
+        );
+        assert!(
+            check_capability_support(&manifest("0.3.0", "[\"bogus.cap\"]", "[]"), &wasm)
+                .is_err_and(|e| e.contains("bogus.cap"))
+        );
+    }
+
+    #[test]
+    fn capability_probe_accepts_served_replies() {
+        // A served capability fails the empty payload with its own
+        // error kind, not the dispatch fallback's.
+        for reply in [
+            "{\"type\":\"fail\",\"error\":{\"kind\":\"invalid-response\",\"message\":\"payload: missing\"}}",
+            "{\"type\":\"kv_get\",\"id\":1,\"key\":\"x\"}",
+            "{\"type\":\"done\",\"result\":{}}",
+        ] {
+            let wasm = wasm_replying(reply);
+            assert_eq!(
+                check_capability_support(&manifest("0.3.0", "[\"playback.resolve\"]", "[]"), &wasm),
+                Ok(()),
+                "{reply}"
+            );
+        }
+        // An implementation's own not-applicable (a provider/kind
+        // mismatch) is not the dispatch fallback.
+        let wasm = wasm_replying(
+            "{\"type\":\"fail\",\"error\":{\"kind\":\"not-applicable\",\
+             \"message\":\"ref is not a deezer track ref\"}}",
+        );
+        assert_eq!(
+            check_capability_support(&manifest("0.3.0", "[\"catalog.entity\"]", "[]"), &wasm),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn alignment_rejects_unused_permissions() {
+        let wasm = wasm_with_literals(&["playback.resolve", "http_request"]);
+        for perm in ["kv", "pot-provider"] {
+            assert!(
+                check_guest_alignment(
+                    &manifest("0.3.0", "[\"playback.resolve\"]", &format!("[\"{perm}\"]")),
+                    &wasm
+                )
+                .is_err_and(|e| e.contains(perm)),
+                "{perm}"
+            );
+        }
+        // kv_set alone satisfies the kv grant; pot_token alone the pot grant.
+        let wasm = wasm_with_literals(&["playback.resolve", "http_request", "kv_set", "pot_token"]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest(
+                    "0.3.0",
+                    "[\"playback.resolve\"]",
+                    "[\"kv\",\"pot-provider\"]"
+                ),
+                &wasm
+            ),
+            Ok(())
+        );
+        // A network grant with no fetch host call is dead scope.
+        let wasm = wasm_with_literals(&["playback.resolve", "kv_get"]);
+        assert!(check_guest_alignment(
+            &manifest("0.3.0", "[\"playback.resolve\"]", "[\"network:x.test\"]"),
+            &wasm
+        )
+        .is_err_and(|e| e.contains("network:x.test")));
     }
 }

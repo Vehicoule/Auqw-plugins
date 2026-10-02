@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,6 +82,88 @@ test('sign + verify round-trip a valid plugin', () => {
     rmSync(releaseDir, { recursive: true, force: true });
     const parent = join(RELEASES, 'sign-test');
     if (existsSync(parent) && readdirSync(parent).length === 0) rmSync(parent, { recursive: true });
+  }
+});
+
+const cleanup = (dir, releaseDir) => {
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(releaseDir, { recursive: true, force: true });
+  const parent = join(releaseDir, '..');
+  if (existsSync(parent) && readdirSync(parent).length === 0) rmSync(parent, { recursive: true });
+};
+
+test('--force re-mints provenance + signature without touching artifact bytes', () => {
+  const dir = makePlugin();
+  const keyFile = join(dir, 'key.json');
+  const releaseDir = join(RELEASES, 'sign-test', '0.0.1');
+  try {
+    run(['keygen', '--key-file', keyFile]);
+    assert.equal(run(['sign', dir, '--key-file', keyFile]).status, 0);
+    const wasmSha = sha256(readFileSync(join(releaseDir, 'sign-test-0.0.1.wasm')));
+    const manifestSha = sha256(readFileSync(join(releaseDir, 'plugin.manifest.json')));
+    const s = run(['sign', dir, '--key-file', keyFile, '--force']);
+    assert.equal(s.status, 0, s.stderr);
+    assert.equal(sha256(readFileSync(join(releaseDir, 'sign-test-0.0.1.wasm'))), wasmSha);
+    assert.equal(sha256(readFileSync(join(releaseDir, 'plugin.manifest.json'))), manifestSha);
+    const v = run(['verify', releaseDir, '--key-file', keyFile]);
+    assert.equal(v.status, 0, v.stderr);
+  } finally {
+    cleanup(dir, releaseDir);
+  }
+});
+
+test('--force refuses to swap artifact or manifest bytes', () => {
+  const dir = makePlugin();
+  const keyFile = join(dir, 'key.json');
+  const releaseDir = join(RELEASES, 'sign-test', '0.0.1');
+  try {
+    run(['keygen', '--key-file', keyFile]);
+    run(['sign', dir, '--key-file', keyFile]);
+    const evil = Buffer.from('wasm-bytes-evil');
+    writeFileSync(join(dir, 'dist', 'sign-test.wasm'), evil);
+    const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'));
+    manifest.artifact.digest = sha256(evil);
+    writeFileSync(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+    const s = run(['sign', dir, '--key-file', keyFile, '--force']);
+    assert.equal(s.status, 1);
+    assert.match(s.stderr, /cannot swap artifact bytes/);
+  } finally {
+    cleanup(dir, releaseDir);
+  }
+});
+
+test('--expect-digest pins the staged artifact', () => {
+  const dir = makePlugin();
+  const keyFile = join(dir, 'key.json');
+  const releaseDir = join(RELEASES, 'sign-test', '0.0.1');
+  try {
+    run(['keygen', '--key-file', keyFile]);
+    const bad = run(['sign', dir, '--key-file', keyFile, '--expect-digest', `sha256:${'0'.repeat(64)}`]);
+    assert.equal(bad.status, 1);
+    assert.match(bad.stderr, /expect-digest/);
+    const wasmSha = sha256(readFileSync(join(dir, 'dist', 'sign-test.wasm')));
+    const good = run(['sign', dir, '--key-file', keyFile, '--expect-digest', wasmSha]);
+    assert.equal(good.status, 0, good.stderr);
+  } finally {
+    cleanup(dir, releaseDir);
+  }
+});
+
+test('--print-manifest-digest ends stdout with the bare manifest sha256', () => {
+  const dir = makePlugin();
+  const keyFile = join(dir, 'key.json');
+  const releaseDir = join(RELEASES, 'sign-test', '0.0.1');
+  try {
+    run(['keygen', '--key-file', keyFile]);
+    const s = run(['sign', dir, '--key-file', keyFile, '--print-manifest-digest']);
+    assert.equal(s.status, 0, s.stderr);
+    const last = s.stdout.trim().split('\n').pop();
+    const manifestSha = sha256(readFileSync(join(releaseDir, 'plugin.manifest.json')));
+    assert.equal(last, manifestSha);
+    const prov = JSON.parse(readFileSync(join(releaseDir, 'provenance.json'), 'utf8'));
+    assert.equal(prov.manifest_sha256, manifestSha);
+  } finally {
+    cleanup(dir, releaseDir);
   }
 });
 
