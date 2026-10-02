@@ -1,0 +1,21 @@
+{
+  "name": "deezer catalog.entity — playlist page",
+  "plugin": "deezer",
+  "capability": "catalog.entity",
+  "request": { "ref": { "provider": "deezer", "kind": "playlist", "id": "908622995" } },
+  "upstreams": [
+    {
+      "url_contains": "api.deezer.com/playlist/908622995",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/playlist.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "entity": { "kind": "playlist", "title": "Trip-Hop Classics", "subtitle": "Deezer" },
+      "items": [{ "title": "Roads" }]
+    },
+    "max_http_calls": 1
+  }
+}

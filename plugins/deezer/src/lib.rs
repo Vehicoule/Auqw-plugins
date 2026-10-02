@@ -3,9 +3,12 @@
 //!
 //! The guest returns raw provider metadata as `trackMetadata` —
 //! version labels and candidate scoring are the application's job.
-//! `catalog.entity` returns composite pages: an album page carries its
-//! track listing; an artist page carries the artist's top tracks plus
-//! album list, all as `items` rows under their own `source_ref` kind.
+//! `catalog.search` serves the track backbone plus `entities` rails
+//! (artists, albums, playlists) with a tagged `top_hit` hero and an
+//! offset-paging `continuation` token. `catalog.entity` returns
+//! composite pages: album and playlist pages carry their track
+//! listings; an artist page carries top tracks plus `related` rails
+//! (discography and related artists) — entity rows never ride `items`.
 //! `complete` is `false` whenever a page section is truncated or a
 //! section request failed; a failed section never fabricates rows.
 //! `preview` URLs are never emitted: this guest declares no
@@ -22,9 +25,16 @@ const API: &str = "https://api.deezer.com";
 /// Deezer caps search pages at 25 rows — larger asks are clamped, not
 /// rejected.
 const SEARCH_LIMIT_MAX: u64 = 25;
-/// Page sizes for the artist composite's two sections.
+/// Result kinds the guest serves, in fetch order — the track backbone
+/// first so the legacy surface never waits on an entity rail.
+const SEARCH_KINDS: &[&str] = &["track", "artist", "album", "playlist"];
+/// Entity rails cap in a mixed query; explicit `kinds` asks get the
+/// request's own `limit`.
+const ENTITY_MIX_LIMIT: u64 = 10;
+/// Page sizes for the artist composite's sections.
 const ARTIST_TOP_LIMIT: u64 = 50;
 const ARTIST_ALBUMS_LIMIT: u64 = 50;
+const ARTIST_RELATED_LIMIT: u64 = 25;
 /// `catalog.metadata` fetches one page per ref and the host admits
 /// 32 HTTP calls per invocation — cap the batch at 30 so it fits the
 /// call budget with headroom instead of dying `budget-exceeded` with
@@ -60,9 +70,16 @@ fn bad_payload(m: &str) -> GuestError {
     failed("invalid-response", format!("payload: {m}"))
 }
 
-/// A sanitized warning — never carries bodies, URLs, or upstream text.
+/// A sanitized warning — never carries bodies, URLs, or upstream
+/// text. The diagnostic is advisory: weather on the log channel is
+/// swallowed while terminal kinds still propagate, mirroring
+/// `rate_warn` in http.rs.
 async fn warn(message: &str) -> Result<(), GuestError> {
-    log(LogLevel::Warn, message).await
+    match log(LogLevel::Warn, message).await {
+        Err(e) if terminal(&e) => Err(e),
+        Err(GuestError::Host { .. }) => Ok(()),
+        other => other,
+    }
 }
 
 /// The payload/ref object must contain exactly `keys` — missing
@@ -71,17 +88,34 @@ fn payload_obj<'a>(
     payload: &'a Value,
     keys: &[&str],
 ) -> Result<&'a Map<String, Value>, GuestError> {
+    payload_obj_opt(payload, keys, &[])
+}
+
+/// Like `payload_obj`, but `optional` keys may be absent; keys outside
+/// the union still reject. The host never emits an optional key as
+/// `null` — a present-but-null optional is `invalid-response` in the
+/// same spirit as an unanticipated key.
+fn payload_obj_opt<'a>(
+    payload: &'a Value,
+    keys: &[&str],
+    optional: &[&str],
+) -> Result<&'a Map<String, Value>, GuestError> {
     let obj = payload
         .as_object()
         .ok_or_else(|| bad_payload("must be an object"))?;
     for k in obj.keys() {
-        if !keys.contains(&k.as_str()) {
+        if !keys.contains(&k.as_str()) && !optional.contains(&k.as_str()) {
             return Err(bad_payload("unexpected key"));
         }
     }
     for k in keys {
         if !obj.contains_key(*k) {
             return Err(bad_payload("missing key"));
+        }
+    }
+    for k in optional {
+        if obj.get(*k) == Some(&Value::Null) {
+            return Err(bad_payload("optional key must be absent, not null"));
         }
     }
     Ok(obj)
@@ -133,7 +167,11 @@ fn storefront_of(obj: &Map<String, Value>) -> Result<Option<String>, GuestError>
 }
 
 async fn search(payload: &Value) -> Result<Value, GuestError> {
-    let obj = payload_obj(payload, &["query", "limit", "storefront"])?;
+    let obj = payload_obj_opt(
+        payload,
+        &["query", "limit", "storefront"],
+        &["kinds", "continuation"],
+    )?;
     let query = obj["query"]
         .as_str()
         .map(str::trim)
@@ -155,19 +193,154 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
     // shape and the result is honestly reported as global (`null`).
     let _storefront = storefront_of(obj)?;
 
-    let url = format!(
-        "{API}/search?q={}&limit={limit}",
-        encode::percent_encode(&query)
-    );
-    match http::get_json(&url).await? {
-        // A missing search endpoint is upstream breakage, not an
-        // empty catalog.
-        http::Outcome::NotFound => Err(failed("transient", "deezer search status 404".into())),
-        http::Outcome::Body(v) => Ok(json!({
-            "items": parse::search_items(&v)?,
-            "storefront": Value::Null,
-        })),
+    // `kinds` absent asks for everything; a present array is validated
+    // against the contract enum and deduped into fetch order.
+    let kinds: Vec<&str> = match obj.get("kinds") {
+        None => SEARCH_KINDS.to_vec(),
+        Some(Value::Array(list)) if !list.is_empty() => {
+            let mut wanted = Vec::with_capacity(list.len());
+            for k in list {
+                let k = k
+                    .as_str()
+                    .ok_or_else(|| bad_payload("kinds entries must be strings"))?;
+                if !SEARCH_KINDS.contains(&k) {
+                    return Err(bad_payload("kinds entry is not a search kind"));
+                }
+                if !wanted.contains(&k) {
+                    wanted.push(k);
+                }
+            }
+            SEARCH_KINDS
+                .iter()
+                .copied()
+                .filter(|k| wanted.contains(k))
+                .collect()
+        }
+        Some(_) => return Err(bad_payload("kinds must be a nonempty array")),
+    };
+    // In a mixed ask the entity rails cap at ENTITY_MIX_LIMIT; an
+    // explicit `kinds` ask hands every kind the request's own limit.
+    let scoped = obj.contains_key("kinds");
+
+    // The continuation token is this guest's own JSON map of
+    // kind → next `index` for offset paging; a missing entry restarts
+    // that kind at 0. Foreign or malformed tokens are payload errors.
+    let offsets: Map<String, Value> = match obj.get("continuation") {
+        None => Map::new(),
+        Some(Value::String(token)) => {
+            let parsed: Value = serde_json::from_str(token)
+                .map_err(|_| bad_payload("continuation is not a valid token"))?;
+            let m = parsed
+                .as_object()
+                .ok_or_else(|| bad_payload("continuation is not a valid token"))?;
+            if !m
+                .iter()
+                .all(|(k, v)| SEARCH_KINDS.contains(&k.as_str()) && v.is_u64())
+            {
+                return Err(bad_payload("continuation is not a valid token"));
+            }
+            m.clone()
+        }
+        Some(_) => return Err(bad_payload("continuation must be a string")),
+    };
+
+    let mut items: Vec<Value> = Vec::new();
+    let mut entities: Vec<Value> = Vec::new();
+    let mut more = Map::new();
+    let mut first_failure: Option<GuestError> = None;
+    let mut failures = 0usize;
+    let q = encode::percent_encode(&query);
+
+    for kind in &kinds {
+        let off = offsets.get(*kind).and_then(Value::as_u64).unwrap_or(0);
+        let page = if *kind == "track" || scoped {
+            limit
+        } else {
+            ENTITY_MIX_LIMIT
+        };
+        // `index` is Deezer's offset paging — absent on page one.
+        let index = if off == 0 {
+            String::new()
+        } else {
+            format!("&index={off}")
+        };
+        let url = match *kind {
+            "track" => format!("{API}/search?q={q}&limit={page}{index}"),
+            other => format!("{API}/search/{other}?q={q}&limit={page}{index}"),
+        };
+        let rows = match http::get_json(&url).await {
+            Ok(http::Outcome::Body(v)) => match *kind {
+                "track" => parse::search_items(&v).map(|mut r| items.append(&mut r)),
+                "artist" => {
+                    parse::entity_items(&v, parse::artist_hit).map(|mut r| entities.append(&mut r))
+                }
+                "album" => parse::entity_items(&v, |row| parse::album_hit(row, None))
+                    .map(|mut r| entities.append(&mut r)),
+                _ => parse::entity_items(&v, parse::playlist_hit)
+                    .map(|mut r| entities.append(&mut r)),
+            }
+            .map(|()| {
+                // A `next` link marks a deeper page for this kind —
+                // recorded only once the rows it carried parsed.
+                if parse::has_next(&v) {
+                    more.insert(kind.to_string(), json!(off + page));
+                }
+            }),
+            Ok(http::Outcome::NotFound) => Err(failed(
+                "transient",
+                format!("deezer {kind} search status 404"),
+            )),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = rows {
+            if terminal(&e) {
+                return Err(e);
+            }
+            // Section weather: the kind keeps its offset in the
+            // continuation — the next page retries it rather than
+            // silently losing the rail.
+            failures += 1;
+            if first_failure.is_none() {
+                first_failure = Some(e);
+            }
+            more.insert(kind.to_string(), json!(off));
+            warn("deezer search section unavailable").await?;
+        }
     }
+    // Every requested kind failing is a failure, not an empty page.
+    if failures == kinds.len() {
+        return Err(first_failure.unwrap_or_else(|| failed("transient", "deezer search".into())));
+    }
+
+    Ok(json!({
+        "items": items,
+        "entities": entities,
+        "top_hit": top_hit(&query, &entities, &items),
+        "continuation": match more.is_empty() {
+            true => Value::Null,
+            false => json!(serde_json::to_string(&more).unwrap_or_default()),
+        },
+        "storefront": Value::Null,
+    }))
+}
+
+/// The hero card: the first rail entity whose title is an exact
+/// case-folded match of the query — artists first by fetch order —
+/// else a track that matches, else `null`. Deezer orders each list by
+/// relevance, so the first exact match is the best hit.
+fn top_hit(query: &str, entities: &[Value], items: &[Value]) -> Value {
+    let q = query.trim().to_lowercase();
+    if let Some(e) = entities
+        .iter()
+        .find(|e| e["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
+    {
+        return json!({ "type": "entity", "item": e });
+    }
+    items
+        .iter()
+        .find(|t| t["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
+        .map(|t| json!({ "type": "track", "item": t }))
+        .unwrap_or(Value::Null)
 }
 
 async fn metadata(payload: &Value) -> Result<Value, GuestError> {
@@ -232,9 +405,10 @@ async fn metadata(payload: &Value) -> Result<Value, GuestError> {
 
 async fn entity(payload: &Value) -> Result<Value, GuestError> {
     let obj = payload_obj(payload, &["ref"])?;
-    let (kind, id) = deezer_ref(&obj["ref"], &["album", "artist"])?;
+    let (kind, id) = deezer_ref(&obj["ref"], &["album", "artist", "playlist"])?;
     match kind.as_str() {
         "album" => album_entity(&id).await,
+        "playlist" => playlist_entity(&id).await,
         _ => artist_entity(&id).await,
     }
 }
@@ -271,6 +445,7 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
     };
 
     let mut items: Vec<Value> = Vec::new();
+    let mut related: Vec<Value> = Vec::new();
     let mut complete = true;
 
     // Top-tracks section. A section that fails degrades the page to
@@ -296,16 +471,19 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
         }
     }
 
-    // Album-list section: `/artist/{id}/albums` rows carry no artist
-    // sub-object, so they inherit the page artist's name and id.
+    // Discography rail: `/artist/{id}/albums` rows carry no artist
+    // sub-object, so they inherit the page artist's name as their
+    // subtitle. Entity rows ride `related`, never `items`.
     let albums_url = format!("{API}/artist/{id}/albums?limit={ARTIST_ALBUMS_LIMIT}");
     match section(&albums_url).await? {
-        Section::Body(v) => match parse::album_items(&v, Some((name.as_str(), id))) {
+        Section::Body(v) => match parse::grouped_entity_items(&v, "discography", |row| {
+            parse::album_hit(row, Some(name.as_str()))
+        }) {
             Ok(mut list) => {
                 if parse::has_next(&v) {
                     complete = false;
                 }
-                items.append(&mut list);
+                related.append(&mut list);
             }
             Err(_) => {
                 complete = false;
@@ -318,11 +496,56 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
         }
     }
 
+    // Related-artists rail.
+    let related_url = format!("{API}/artist/{id}/related?limit={ARTIST_RELATED_LIMIT}");
+    match section(&related_url).await? {
+        Section::Body(v) => match parse::grouped_entity_items(&v, "related", parse::artist_hit) {
+            Ok(mut list) => {
+                if parse::has_next(&v) {
+                    complete = false;
+                }
+                related.append(&mut list);
+            }
+            Err(_) => {
+                complete = false;
+                warn("deezer artist related section unavailable").await?;
+            }
+        },
+        Section::Degraded => {
+            complete = false;
+            warn("deezer artist related section unavailable").await?;
+        }
+    }
+
     Ok(json!({
         "entity": entity,
         "items": items,
+        "related": related,
         "complete": complete,
     }))
+}
+
+async fn playlist_entity(id: &str) -> Result<Value, GuestError> {
+    let v = match http::get_json(&format!("{API}/playlist/{id}")).await? {
+        http::Outcome::NotFound => {
+            return Err(failed(
+                "no-result",
+                format!("deezer playlist {id} not found"),
+            ));
+        }
+        http::Outcome::Body(v) => v,
+    };
+    match parse::playlist_page(&v, id)? {
+        Some(page) => Ok(json!({
+            "entity": page.entity,
+            "items": page.items,
+            "complete": page.complete,
+        })),
+        None => Err(failed(
+            "no-result",
+            format!("deezer playlist {id} not found"),
+        )),
+    }
 }
 
 /// The result of a composite-page section fetch.
@@ -369,6 +592,9 @@ mod tests {
     use base64::Engine as _;
 
     const SEARCH: &str = include_str!("../fixtures/search.json");
+    const SEARCH_ARTIST: &str = include_str!("../fixtures/search-artist.json");
+    const SEARCH_ALBUM: &str = include_str!("../fixtures/search-album.json");
+    const SEARCH_PLAYLIST: &str = include_str!("../fixtures/search-playlist.json");
     const EMPTY: &str = include_str!("../fixtures/search-empty.json");
     const MALFORMED: &str = include_str!("../fixtures/search-malformed.json");
     const QUOTA: &str = include_str!("../fixtures/error-quota.json");
@@ -378,6 +604,8 @@ mod tests {
     const ARTIST: &str = include_str!("../fixtures/artist.json");
     const ARTIST_TOP: &str = include_str!("../fixtures/artist-top.json");
     const ARTIST_ALBUMS: &str = include_str!("../fixtures/artist-albums.json");
+    const ARTIST_RELATED: &str = include_str!("../fixtures/artist-related.json");
+    const PLAYLIST: &str = include_str!("../fixtures/playlist.json");
     const TOP_MALFORMED: &str = include_str!("../fixtures/artist-top-malformed.json");
 
     fn step(input: &Value) -> Value {
@@ -420,6 +648,18 @@ mod tests {
             .unwrap_or_else(|| panic!("result.items not an array: {out}"))
     }
 
+    fn entities_of(out: &Value) -> &Vec<Value> {
+        out["result"]["entities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.entities not an array: {out}"))
+    }
+
+    fn related_of(out: &Value) -> &Vec<Value> {
+        out["result"]["related"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.related not an array: {out}"))
+    }
+
     /// Invoke `catalog.search` and return the emitted `http_request`.
     fn search_request(payload: Value) -> Value {
         let out = invoke("catalog.search", payload);
@@ -443,6 +683,42 @@ mod tests {
             out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
         }
         out
+    }
+
+    /// Feed `respond(request)` to every emitted `http_request` until a
+    /// terminal output (`done`/`fail`), acking `log` calls and
+    /// collecting their messages. Bounded by the step budget so a
+    /// guest that never settles fails the test instead of hanging it.
+    fn drive(out: Value, respond: impl Fn(&Value) -> Value) -> (Value, Vec<String>) {
+        let mut logs = Vec::new();
+        let mut out = out;
+        for _ in 0..32 {
+            match (out["type"].as_str(), out["kind"].as_str()) {
+                (Some("host_request"), Some("http_request")) => {
+                    out = step(&respond(&out));
+                }
+                (Some("host_request"), Some("log")) => {
+                    if let Some(m) = out["payload"]["message"].as_str() {
+                        logs.push(m.to_string());
+                    }
+                    out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
+                }
+                _ => return (out, logs),
+            }
+        }
+        panic!("drive exceeded its step budget: {out}")
+    }
+
+    /// The search fixture a typed entity endpoint answers with.
+    fn search_section(req: &Value) -> &'static str {
+        let url = req["payload"]["url"].as_str().unwrap_or_default();
+        if url.contains("/search/artist") {
+            SEARCH_ARTIST
+        } else if url.contains("/search/album") {
+            SEARCH_ALBUM
+        } else {
+            SEARCH_PLAYLIST
+        }
     }
 
     #[test]
@@ -492,6 +768,8 @@ mod tests {
     fn search_fixture_maps_rows() {
         let req = search_request(json!({"query": "x", "limit": 10, "storefront": "US"}));
         let out = step(&http_ok(req_id(&req), SEARCH));
+        // A mixed ask fans out to the three typed entity endpoints.
+        let (out, _) = drive(out, |req| http_ok(req_id(req), search_section(req)));
         assert_eq!(out["type"], "done", "{out}");
         let items = items_of(&out);
         // Bad rows dropped: zero-id, non-track type, title-less, the
@@ -543,21 +821,213 @@ mod tests {
         // Preview URLs never cross into the result.
         let s = out["result"].to_string();
         assert!(!s.contains("preview") && !s.contains("cdnt-preview"), "{s}");
+
+        // Entity rails: two artists, one album, one playlist — in
+        // fetch order, each carrying its entityMetadata shape.
+        let entities = entities_of(&out);
+        assert_eq!(entities.len(), 4, "{entities:?}");
+        assert_eq!(entities[0]["kind"], "artist");
+        assert_eq!(entities[0]["title"], "Portishead");
+        assert_eq!(entities[0]["subtitle"], "15 albums");
+        assert_eq!(entities[0]["source_ref"]["id"], "1069");
+        assert_eq!(entities[1]["title"], "Portis");
+        assert_eq!(entities[2]["kind"], "album");
+        assert_eq!(entities[2]["title"], "Dummy");
+        assert_eq!(entities[2]["subtitle"], "Portishead");
+        assert_eq!(entities[3]["kind"], "playlist");
+        assert_eq!(entities[3]["title"], "Trip-Hop Classics");
+        assert_eq!(entities[3]["subtitle"], "Deezer");
+        // No exact title match → no hero.
+        assert_eq!(out["result"]["top_hit"], Value::Null);
+        // The artist fixture advertises `next` — its offset rides the
+        // continuation alone.
+        assert_eq!(
+            out["result"]["continuation"].as_str(),
+            Some(r#"{"artist":10}"#)
+        );
+    }
+
+    /// `kinds` scopes the ask: one endpoint, the request's own limit,
+    /// and entity rails only for the kinds asked for.
+    #[test]
+    fn search_kinds_scopes_to_one_call() {
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 7, "storefront": null, "kinds": ["album"]}),
+        );
+        assert_eq!(out["kind"], "http_request", "{out}");
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(
+            url, "https://api.deezer.com/search/album?q=x&limit=7",
+            "{url}"
+        );
+        let out = step(&http_ok(req_id(&out), SEARCH_ALBUM));
+        assert_eq!(out["type"], "done", "{out}");
+        assert!(items_of(&out).is_empty());
+        let entities = entities_of(&out);
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0]["kind"], "album");
+        assert_eq!(out["result"]["continuation"], Value::Null);
+    }
+
+    /// A `track`-only kinds ask keeps the legacy single-call shape —
+    /// no entity endpoints are touched.
+    #[test]
+    fn search_track_only_is_the_legacy_call() {
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 5, "storefront": null, "kinds": ["track"]}),
+        );
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(url, "https://api.deezer.com/search?q=x&limit=5", "{url}");
+        let out = step(&http_ok(req_id(&out), EMPTY));
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(entities_of(&out).len(), 0);
+    }
+
+    /// An exact title match on an entity rail wins the hero slot.
+    #[test]
+    fn search_exact_artist_is_top_hit() {
+        let req = search_request(json!({"query": "portishead", "limit": 5, "storefront": null}));
+        let (out, _) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
+            http_ok(req_id(req), search_section(req))
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        let hit = &out["result"]["top_hit"];
+        assert_eq!(hit["type"], "entity", "{out}");
+        assert_eq!(hit["item"]["kind"], "artist");
+        assert_eq!(hit["item"]["source_ref"]["id"], "1069");
+    }
+
+    /// No entity match but an exact track title takes the hero slot.
+    #[test]
+    fn search_exact_track_is_top_hit() {
+        let req = search_request(json!({"query": "roads", "limit": 5, "storefront": null}));
+        let (out, _) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
+            http_ok(req_id(req), search_section(req))
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        let hit = &out["result"]["top_hit"];
+        assert_eq!(hit["type"], "track", "{out}");
+        assert_eq!(hit["item"]["source_ref"]["kind"], "track");
+        assert_eq!(hit["item"]["title"], "Roads");
+    }
+
+    /// Section weather on one rail degrades it, keeping its offset —
+    /// the page still reports every kind that answered.
+    #[test]
+    fn search_section_failure_keeps_its_offset() {
+        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        let (out, logs) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
+            let url = req["payload"]["url"].as_str().unwrap_or_default();
+            if url.contains("/search/album") {
+                http_status(req_id(req), 500, &[])
+            } else {
+                http_ok(req_id(req), search_section(req))
+            }
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        let entities = entities_of(&out);
+        assert!(
+            entities.iter().all(|e| e["kind"] != "album"),
+            "{entities:?}"
+        );
+        assert!(entities.iter().any(|e| e["kind"] == "playlist"));
+        // The failed rail retries at the offset it never advanced.
+        let token: Value =
+            serde_json::from_str(out["result"]["continuation"].as_str().unwrap_or_default())
+                .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
+        assert_eq!(token["album"], 0, "{out}");
+        assert!(logs.iter().any(|m| m.contains("section unavailable")));
+    }
+
+    /// A continuation token pages its kinds forward on `index`.
+    #[test]
+    fn search_continuation_pages_forward() {
+        let token = r#"{"track":10,"album":5}"#;
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["track", "album"], "continuation": token}),
+        );
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert!(
+            url.contains("/search?") && url.contains("index=10"),
+            "{url}"
+        );
+        let out = step(&http_ok(req_id(&out), EMPTY));
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert!(
+            url.contains("/search/album?") && url.contains("index=5"),
+            "{url}"
+        );
+        let out = step(&http_ok(req_id(&out), EMPTY));
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["continuation"], Value::Null);
+    }
+
+    /// Foreign or malformed tokens are payload errors, never a
+    /// request.
+    #[test]
+    fn search_bad_continuation_is_invalid_response() {
+        for token in [
+            "not json",
+            r#"{"bogus":3}"#,
+            r#"{"track":"3"}"#,
+            r#"{"track":-1}"#,
+            "[]",
+        ] {
+            let out = invoke(
+                "catalog.search",
+                json!({"query": "x", "limit": 5, "storefront": null, "continuation": token}),
+            );
+            assert_eq!(out["type"], "fail", "{token}");
+            assert_eq!(out["error"]["kind"], "invalid-response", "{token}");
+        }
+    }
+
+    /// `kinds` is the contract enum — empty, wrong-typed, or
+    /// out-of-enum asks are payload errors before any request.
+    #[test]
+    fn search_bad_kinds_is_invalid_response() {
+        for kinds in [
+            json!([]),
+            json!("album"),
+            json!(["album", "bogus"]),
+            json!([1]),
+            Value::Null,
+        ] {
+            let out = invoke(
+                "catalog.search",
+                json!({"query": "x", "limit": 5, "storefront": null, "kinds": kinds}),
+            );
+            assert_eq!(out["type"], "fail", "{kinds}");
+            assert_eq!(out["error"]["kind"], "invalid-response", "{kinds}");
+        }
     }
 
     #[test]
     fn search_empty_is_done_with_no_items() {
         let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
-        let out = step(&http_ok(req_id(&req), EMPTY));
+        let (out, _) = drive(step(&http_ok(req_id(&req), EMPTY)), |req| {
+            http_ok(req_id(req), EMPTY)
+        });
         assert_eq!(out["type"], "done", "{out}");
         assert!(items_of(&out).is_empty());
+        assert!(entities_of(&out).is_empty());
+        assert_eq!(out["result"]["top_hit"], Value::Null);
+        assert_eq!(out["result"]["continuation"], Value::Null);
     }
 
     #[test]
     fn malformed_body_is_invalid_response() {
         for body in [MALFORMED, "not json {"] {
             let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
-            let out = step(&http_ok(req_id(&req), body));
+            // Every kind degrades on the malformed body — all-failed
+            // propagates the first failure.
+            let (out, _) = drive(step(&http_ok(req_id(&req), body)), |req| {
+                http_ok(req_id(req), body)
+            });
             assert_eq!(out["type"], "fail", "{body}");
             assert_eq!(out["error"]["kind"], "invalid-response", "{body}");
         }
@@ -566,13 +1036,18 @@ mod tests {
     #[test]
     fn rate_limit_status_logs_then_fails() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
+        // Every kind hits the same quota — all-failed propagates the
+        // typed verdict.
+        let (out, logs) = drive(
+            step(&http_status(req_id(&req), 429, &[("Retry-After", "30")])),
+            |req| http_status(req_id(req), 429, &[("Retry-After", "30")]),
+        );
         // The retry hint rides both the diagnostic log and the fail
         // message — the message is the only channel back to the app.
-        assert_eq!(out["kind"], "log", "{out}");
-        let msg = out["payload"]["message"].as_str().unwrap_or_default();
-        assert!(msg.contains("retry_after=30"), "{msg}");
-        let out = ack_log(&out);
+        assert!(
+            logs.iter().any(|m| m.contains("retry_after=30")),
+            "{logs:?}"
+        );
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "rate-limit");
         assert_eq!(
@@ -585,8 +1060,9 @@ mod tests {
     fn quota_envelope_is_rate_limit() {
         // Deezer answers quota exhaustion as 200 + an error envelope.
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_ok(req_id(&req), QUOTA));
-        let out = ack_log(&out);
+        let (out, _) = drive(step(&http_ok(req_id(&req), QUOTA)), |req| {
+            http_ok(req_id(req), QUOTA)
+        });
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "rate-limit");
     }
@@ -594,15 +1070,25 @@ mod tests {
     #[test]
     fn rate_limit_survives_a_failed_log_call() {
         // The log channel's own failure must never displace the typed
-        // verdict: the warn request answered `host_error` still leaves
+        // verdict: a warn request answered `host_error` still leaves
         // `rate-limit`, not the channel's `transient`.
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
-        assert_eq!(out["kind"], "log", "{out}");
-        let out = step(&json!({
-            "type": "host_error", "id": req_id(&out),
-            "error": {"kind": "transient", "message": "log channel down"},
-        }));
+        let mut out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
+        // Every log call answers `transient`; every request 429s.
+        for _ in 0..32 {
+            match (out["type"].as_str(), out["kind"].as_str()) {
+                (Some("host_request"), Some("log")) => {
+                    out = step(&json!({
+                        "type": "host_error", "id": req_id(&out),
+                        "error": {"kind": "transient", "message": "log channel down"},
+                    }));
+                }
+                (Some("host_request"), Some("http_request")) => {
+                    out = step(&http_status(req_id(&out), 429, &[]));
+                }
+                _ => break,
+            }
+        }
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "rate-limit", "{out}");
     }
@@ -626,7 +1112,9 @@ mod tests {
     fn server_and_other_errors_are_transient() {
         for status in [500_u16, 503, 418] {
             let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-            let out = step(&http_status(req_id(&req), status, &[]));
+            let (out, _) = drive(step(&http_status(req_id(&req), status, &[])), |req| {
+                http_status(req_id(req), status, &[])
+            });
             assert_eq!(out["type"], "fail", "{status}");
             assert_eq!(out["error"]["kind"], "transient", "{status}");
         }
@@ -635,10 +1123,18 @@ mod tests {
     #[test]
     fn unknown_error_envelope_is_transient() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_ok(
-            req_id(&req),
-            r#"{"error":{"type":"ParameterException","message":"bad parameter","code":501}}"#,
-        ));
+        let (out, _) = drive(
+            step(&http_ok(
+                req_id(&req),
+                r#"{"error":{"type":"ParameterException","message":"bad parameter","code":501}}"#,
+            )),
+            |req| {
+                http_ok(
+                    req_id(req),
+                    r#"{"error":{"type":"ParameterException","message":"bad parameter","code":501}}"#,
+                )
+            },
+        );
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "transient");
         assert!(
@@ -653,7 +1149,9 @@ mod tests {
     #[test]
     fn search_404_is_transient() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_status(req_id(&req), 404, &[]));
+        let (out, _) = drive(step(&http_status(req_id(&req), 404, &[])), |req| {
+            http_status(req_id(req), 404, &[])
+        });
         assert_eq!(out["error"]["kind"], "transient");
     }
 
@@ -896,6 +1394,14 @@ mod tests {
         );
 
         let out = step(&http_ok(req_id(&out), ARTIST_ALBUMS));
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(
+            url,
+            format!("https://api.deezer.com/artist/1069/related?limit={ARTIST_RELATED_LIMIT}"),
+            "{url}"
+        );
+
+        let out = step(&http_ok(req_id(&out), ARTIST_RELATED));
         assert_eq!(out["type"], "done", "{out}");
 
         let entity = &out["result"]["entity"];
@@ -905,17 +1411,26 @@ mod tests {
         assert_eq!(entity["artwork"][0]["width"], 1000);
 
         let items = items_of(&out);
-        // Top tracks first, then the album list — each under its own
-        // source_ref kind.
-        assert_eq!(items.len(), 4, "{items:?}");
+        // `items` carries the top tracks only — entity rows ride
+        // `related`, never the track listing.
+        assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[0]["source_ref"]["kind"], "track");
         assert_eq!(items[0]["title"], "Glory Box");
         assert_eq!(items[1]["source_ref"]["kind"], "track");
-        assert_eq!(items[2]["source_ref"]["kind"], "album");
-        assert_eq!(items[2]["title"], "Third");
-        assert_eq!(items[2]["artist"], "Portishead");
-        assert_eq!(items[2]["artist_ref"]["id"], "1069");
-        assert_eq!(items[3]["source_ref"]["kind"], "album");
+
+        let related = related_of(&out);
+        assert_eq!(related.len(), 4, "{related:?}");
+        assert_eq!(related[0]["kind"], "album");
+        assert_eq!(related[0]["group"], "discography");
+        assert_eq!(related[0]["title"], "Third");
+        assert_eq!(related[0]["subtitle"], "Portishead");
+        assert_eq!(related[0]["source_ref"]["id"], "455045");
+        assert_eq!(related[1]["kind"], "album");
+        assert_eq!(related[1]["group"], "discography");
+        assert_eq!(related[2]["kind"], "artist");
+        assert_eq!(related[2]["group"], "related");
+        assert_eq!(related[2]["title"], "Massive Attack");
+        assert_eq!(related[3]["title"], "Tricky");
         assert_eq!(out["result"]["complete"], true);
     }
 
@@ -943,10 +1458,13 @@ mod tests {
             "{out}"
         );
         let out = step(&http_ok(req_id(&out), ARTIST_ALBUMS));
+        let out = step(&http_ok(req_id(&out), ARTIST_RELATED));
         assert_eq!(out["type"], "done", "{out}");
-        let items = items_of(&out);
-        assert_eq!(items.len(), 2, "{items:?}");
-        assert!(items.iter().all(|i| i["source_ref"]["kind"] == "album"));
+        assert!(items_of(&out).is_empty());
+        let related = related_of(&out);
+        assert_eq!(related.len(), 4, "{related:?}");
+        assert_eq!(related[0]["group"], "discography");
+        assert_eq!(related[2]["group"], "related");
         assert_eq!(out["result"]["complete"], false);
     }
 
@@ -962,9 +1480,11 @@ mod tests {
         // Malformed top → warn logged, albums still fetched.
         assert_eq!(out["kind"], "http_request", "{out}");
         let out = feed(&out, ARTIST_ALBUMS);
+        let out = feed(&out, ARTIST_RELATED);
         assert_eq!(out["type"], "done", "{out}");
         assert_eq!(out["result"]["complete"], false);
-        assert_eq!(items_of(&out).len(), 2);
+        assert_eq!(related_of(&out).len(), 4);
+        assert!(items_of(&out).is_empty());
     }
 
     /// A `next` page marker truncates the composite — flagged, never
@@ -981,9 +1501,11 @@ mod tests {
             r#"{"data":[{"id":1,"type":"track","title":"T","artist":{"id":1069,"name":"Portishead"}}],"total":99,"next":"https://api.deezer.com/artist/1069/top?index=1"}"#,
         );
         let out = feed(&out, ARTIST_ALBUMS);
+        let out = feed(&out, ARTIST_RELATED);
         assert_eq!(out["type"], "done", "{out}");
         assert_eq!(out["result"]["complete"], false);
-        assert_eq!(items_of(&out).len(), 3);
+        assert_eq!(items_of(&out).len(), 1);
+        assert_eq!(related_of(&out).len(), 4);
     }
 
     /// Terminal host errors are not section weather — a
@@ -1018,6 +1540,7 @@ mod tests {
         let out = ack_log(&out);
         assert_eq!(out["kind"], "http_request", "{out}");
         let out = feed(&out, ARTIST_ALBUMS);
+        let out = feed(&out, ARTIST_RELATED);
         assert_eq!(out["type"], "done", "{out}");
         assert_eq!(out["result"]["complete"], false);
     }
@@ -1075,6 +1598,59 @@ mod tests {
 
     /// Track refs are valid `sourceRef`s but not `entityRef`s —
     /// `catalog.entity` cannot serve them.
+    #[test]
+    fn entity_playlist_carries_tracks() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "deezer", "kind": "playlist", "id": "908622995"}}),
+        );
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(url, "https://api.deezer.com/playlist/908622995", "{url}");
+        let out = step(&http_ok(req_id(&out), PLAYLIST));
+        assert_eq!(out["type"], "done", "{out}");
+
+        let entity = &out["result"]["entity"];
+        assert_eq!(entity["kind"], "playlist");
+        assert_eq!(entity["title"], "Trip-Hop Classics");
+        // The curator is the playlist's subtitle — the line that
+        // marks it from an album.
+        assert_eq!(entity["subtitle"], "Deezer");
+        assert_eq!(entity["source_ref"]["kind"], "playlist");
+
+        let items = items_of(&out);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["title"], "Roads");
+        assert_eq!(items[0]["source_ref"]["kind"], "track");
+        assert_eq!(out["result"]["complete"], true);
+    }
+
+    #[test]
+    fn entity_playlist_missing_is_no_result() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "deezer", "kind": "playlist", "id": "42"}}),
+        );
+        let out = step(&http_ok(req_id(&out), NO_DATA));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "no-result");
+    }
+
+    /// A playlist body whose `tracks` section is short flags
+    /// `complete:false`, same as the album page.
+    #[test]
+    fn entity_playlist_short_tracks_incomplete() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "deezer", "kind": "playlist", "id": "908622995"}}),
+        );
+        let body = r#"{"id":908622995,"type":"playlist","title":"T","nb_tracks":50,
+            "tracks":{"data":[{"id":1,"type":"track","title":"Only One"}]}}"#;
+        let out = step(&http_ok(req_id(&out), body));
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false);
+        assert_eq!(items_of(&out).len(), 1);
+    }
+
     #[test]
     fn entity_track_ref_is_not_applicable() {
         let out = invoke(
@@ -1140,7 +1716,9 @@ mod tests {
         // character query is legal.
         let req =
             search_request(json!({"query": "曲".repeat(512), "limit": 5, "storefront": null}));
-        let out = step(&http_ok(req_id(&req), EMPTY));
+        let (out, _) = drive(step(&http_ok(req_id(&req), EMPTY)), |req| {
+            http_ok(req_id(req), EMPTY)
+        });
         assert_eq!(out["type"], "done");
     }
 
@@ -1158,10 +1736,11 @@ mod tests {
             ("", "deezer rate-limited"),
         ] {
             let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-            let out = step(&http_status(req_id(&req), 429, &[("Retry-After", value)]));
-            assert_eq!(out["kind"], "log", "{value}");
-            assert_eq!(out["payload"]["message"].as_str(), Some(want), "{value}");
-            let out = ack_log(&out);
+            let (out, logs) = drive(
+                step(&http_status(req_id(&req), 429, &[("Retry-After", value)])),
+                |req| http_status(req_id(req), 429, &[("Retry-After", value)]),
+            );
+            assert!(logs.iter().any(|m| m == want), "{value}: {logs:?}");
             assert_eq!(out["error"]["kind"], "rate-limit", "{value}");
             let want_fail = if want.contains("retry_after") {
                 format!("rate-limit: deezer status 429 retry_after={value}")

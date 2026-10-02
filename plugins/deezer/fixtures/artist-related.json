@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": 98,
+      "name": "Massive Attack",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist/bb3cc9e4b4c76de6e7e0b1e2f3a4b5c6/1000x1000-000000-80-0-0.jpg",
+      "nb_album": 22,
+      "nb_fan": 1760240,
+      "radio": true,
+      "type": "artist"
+    },
+    {
+      "id": 1154,
+      "name": "Tricky",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist/cc4dd5f6a7b8c9d0e1f2a3b4c5d6e7f8/1000x1000-000000-80-0-0.jpg",
+      "nb_album": 18,
+      "nb_fan": 486213,
+      "radio": true,
+      "type": "artist"
+    }
+  ],
+  "total": 2
+}

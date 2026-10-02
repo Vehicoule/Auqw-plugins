@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use auqw_guest_sdk::GuestError;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 /// Edge length of the `cover_xl`/`picture_xl` artwork Deezer serves.
 pub const ARTWORK_XL: u64 = 1000;
@@ -250,17 +250,149 @@ pub fn track_items(v: &Value) -> Result<Vec<Value>, GuestError> {
         .collect())
 }
 
-/// A `{data:[..]}` page of albums → `album` entity rows; `ctx_artist`
-/// is the page artist's `(name, id)`.
+/// A `/search/artist` row → `entityMetadata`, or `None` when the row is
+/// not a usable artist hit.
+pub fn artist_hit(v: &Value) -> Option<Value> {
+    let o = v.as_object()?;
+    if o.get("type").and_then(Value::as_str) != Some("artist") {
+        return None;
+    }
+    let subtitle = u64_field(o, "nb_album").map(|n| {
+        if n == 1 {
+            "1 album".to_string()
+        } else {
+            format!("{n} albums")
+        }
+    });
+    Some(entity_metadata(
+        "artist",
+        &id_field(o, "id")?,
+        &str_field(o, "name")?,
+        subtitle.as_deref(),
+        https_field(o, "picture_xl"),
+        None,
+    ))
+}
+
+/// A `/search/album` or `/artist/{id}/albums` row → `entityMetadata`;
+/// `ctx_artist` supplies the artist name for rows that carry no artist
+/// sub-object of their own.
+pub fn album_hit(v: &Value, ctx_artist: Option<&str>) -> Option<Value> {
+    let o = v.as_object()?;
+    if o.get("type").and_then(Value::as_str) != Some("album") {
+        return None;
+    }
+    let artist = sub(o, "artist")
+        .and_then(|a| str_field(a, "name"))
+        .or_else(|| ctx_artist.map(str::to_string));
+    Some(entity_metadata(
+        "album",
+        &id_field(o, "id")?,
+        &str_field(o, "title")?,
+        artist.as_deref(),
+        https_field(o, "cover_xl"),
+        None,
+    ))
+}
+
+/// A `/search/playlist` row → `entityMetadata` — the subtitle is the
+/// curator's name, the line that marks a playlist from an album.
+pub fn playlist_hit(v: &Value) -> Option<Value> {
+    let o = v.as_object()?;
+    if o.get("type").and_then(Value::as_str) != Some("playlist") {
+        return None;
+    }
+    let curator = sub(o, "user").and_then(|u| str_field(u, "name"));
+    Some(entity_metadata(
+        "playlist",
+        &id_field(o, "id")?,
+        &str_field(o, "title")?,
+        curator.as_deref(),
+        https_field(o, "picture_xl"),
+        None,
+    ))
+}
+
+/// A `{data:[..]}` page of entity hits → `entityMetadata` items;
+/// malformed rows drop out like malformed tracks do.
 ///
 /// # Errors
 /// `invalid-response` when `data` is missing or not an array.
-pub fn album_items(v: &Value, ctx_artist: Option<(&str, &str)>) -> Result<Vec<Value>, GuestError> {
-    Ok(data_list(v)?
-        .iter()
-        .filter_map(|r| album_row(r, ctx_artist))
-        .map(|r| to_metadata(&r))
+pub fn entity_items(
+    v: &Value,
+    hit: impl Fn(&Value) -> Option<Value>,
+) -> Result<Vec<Value>, GuestError> {
+    Ok(data_list(v)?.iter().filter_map(hit).collect())
+}
+
+/// A `{data:[..]}` page of entity hits tagged with a `related[]`
+/// `group` — artist-page rails like `discography`/`related`.
+///
+/// # Errors
+/// `invalid-response` when `data` is missing or not an array.
+pub fn grouped_entity_items(
+    v: &Value,
+    group: &str,
+    hit: impl Fn(&Value) -> Option<Value>,
+) -> Result<Vec<Value>, GuestError> {
+    Ok(entity_items(v, hit)?
+        .into_iter()
+        .map(|mut e| {
+            e["group"] = json!(group);
+            e
+        })
         .collect())
+}
+
+/// The playlist entity page. Required fields gate the page itself — a
+/// wrong-id body is `Ok(None)` (`no-result` upstream), a malformed
+/// playlist object is `invalid-response`. A missing or short `tracks`
+/// section degrades to `complete:false` without failing the page.
+///
+/// # Errors
+/// `invalid-response` when the body is not a usable playlist object.
+pub fn playlist_page(v: &Value, want_id: &str) -> Result<Option<EntityPage>, GuestError> {
+    let o = v
+        .as_object()
+        .ok_or_else(|| bad("playlist body is not an object"))?;
+    if !id_matches(o, want_id)? {
+        return Ok(None);
+    }
+    let title = str_field(o, "title").ok_or_else(|| bad("playlist title missing"))?;
+    let curator = sub(o, "creator").and_then(|c| str_field(c, "name"));
+    let entity = entity_metadata(
+        "playlist",
+        want_id,
+        &title,
+        curator.as_deref(),
+        https_field(o, "picture_xl"),
+        None,
+    );
+    let mut complete = true;
+    let mut items = Vec::new();
+    match o
+        .get("tracks")
+        .and_then(Value::as_object)
+        .and_then(|t| t.get("data"))
+        .and_then(Value::as_array)
+    {
+        Some(rows) => {
+            items = rows
+                .iter()
+                .filter_map(|r| track_row(r, None, None))
+                .map(|r| to_metadata(&r))
+                .collect();
+            if u64_field(o, "nb_tracks").is_some_and(|nb| (rows.len() as u64) < nb) {
+                complete = false;
+            }
+        }
+        None => complete = false,
+    }
+    Ok(Some(EntityPage {
+        entity,
+        items,
+        complete,
+    }))
 }
 
 /// The album entity page. Required fields gate the page itself — a
@@ -288,6 +420,7 @@ pub fn album_page(v: &Value, want_id: &str) -> Result<Option<EntityPage>, GuestE
             .and_then(|a| str_field(a, "name"))
             .as_deref(),
         https_field(o, "cover_xl"),
+        None,
     );
 
     let mut complete = true;
@@ -344,6 +477,7 @@ pub fn artist_meta(v: &Value, want_id: &str) -> Result<Option<(Value, String)>, 
         &name,
         subtitle.as_deref(),
         https_field(o, "picture_xl"),
+        None,
     );
     Ok(Some((entity, name)))
 }
@@ -354,12 +488,13 @@ fn entity_metadata(
     title: &str,
     subtitle: Option<&str>,
     artwork_xl: Option<String>,
+    group: Option<&str>,
 ) -> Value {
     let artwork: Vec<Value> = artwork_xl
         .iter()
         .map(|u| serde_json::json!({"url": u, "width": ARTWORK_XL, "height": ARTWORK_XL}))
         .collect();
-    serde_json::json!({
+    let mut meta = serde_json::json!({
         "source_ref": {
             "provider": "deezer",
             "kind": kind,
@@ -369,7 +504,13 @@ fn entity_metadata(
         "title": title,
         "subtitle": subtitle,
         "artwork": artwork,
-    })
+    });
+    // `group` stays absent unless the row rides a `related` rail —
+    // exact-key decode accepts it only as one of the enum values.
+    if let Some(g) = group {
+        meta["group"] = json!(g);
+    }
+    meta
 }
 
 fn entity_ref(kind: &str, id: Option<&str>) -> Value {

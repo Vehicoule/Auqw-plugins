@@ -15,6 +15,11 @@
       "body_file": "../../plugins/deezer/fixtures/artist-albums.json"
     },
     {
+      "url_contains": "api.deezer.com/artist/1069/related",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/artist-related.json"
+    },
+    {
       "url_contains": "api.deezer.com/artist/1069",
       "status": 200,
       "body_file": "../../plugins/deezer/fixtures/artist.json"
@@ -22,6 +27,14 @@
   ],
   "expect": {
     "result": "ok",
-    "max_http_calls": 3
+    "result_subset": {
+      "items": [{ "title": "Glory Box" }],
+      "related": [
+        { "kind": "album", "group": "discography" },
+        { "kind": "album", "group": "discography" },
+        { "kind": "artist", "group": "related" }
+      ]
+    },
+    "max_http_calls": 4
   }
 }

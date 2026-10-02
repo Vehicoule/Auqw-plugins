@@ -1,9 +1,24 @@
 {
-  "name": "deezer catalog.search — track rows",
+  "name": "deezer catalog.search — track rows + entity rails",
   "plugin": "deezer",
   "capability": "catalog.search",
   "request": { "query": "roads portishead", "limit": 10, "storefront": null },
   "upstreams": [
+    {
+      "url_contains": "api.deezer.com/search/artist",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/search-artist.json"
+    },
+    {
+      "url_contains": "api.deezer.com/search/album",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/search-album.json"
+    },
+    {
+      "url_contains": "api.deezer.com/search/playlist",
+      "status": 200,
+      "body_file": "../../plugins/deezer/fixtures/search-playlist.json"
+    },
     {
       "url_contains": "api.deezer.com/search",
       "status": 200,
@@ -12,6 +27,10 @@
   ],
   "expect": {
     "result": "ok",
-    "max_http_calls": 1
+    "result_subset": {
+      "items": [{ "title": "Roads" }],
+      "entities": [{ "kind": "artist", "title": "Portishead" }]
+    },
+    "max_http_calls": 4
   }
 }

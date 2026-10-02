@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "id": 908622995,
+      "title": "Trip-Hop Classics",
+      "public": true,
+      "nb_tracks": 50,
+      "link": "https://www.deezer.com/playlist/908622995",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/playlist/3b2f7a1c9e4d5f6a7b8c9d0e1f2a3b4c/1000x1000-000000-80-0-0.jpg",
+      "checksum": "a1b2c3d4e5f6",
+      "creation_date": "2020-04-12 09:00:00",
+      "md5_image": "3b2f7a1c9e4d5f6a7b8c9d0e1f2a3b4c",
+      "user": {
+        "id": 41786751,
+        "name": "Deezer",
+        "tracklist": "https://api.deezer.com/user/41786751/flow",
+        "type": "user"
+      },
+      "type": "playlist"
+    }
+  ],
+  "total": 1
+}

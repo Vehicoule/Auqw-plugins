@@ -1,0 +1,24 @@
+{
+  "data": [
+    {
+      "id": 109301,
+      "title": "Dummy",
+      "link": "https://www.deezer.com/album/109301",
+      "cover_xl": "https://cdn-images.dzcdn.net/images/cover/5942b88996f33c82790023d5d99395d3/1000x1000-000000-80-0-0.jpg",
+      "md5_image": "5942b88996f33c82790023d5d99395d3",
+      "genre_id": 152,
+      "nb_tracks": 11,
+      "record_type": "album",
+      "tracklist": "https://api.deezer.com/album/109301/tracks",
+      "explicit_lyrics": false,
+      "artist": {
+        "id": 1069,
+        "name": "Portishead",
+        "picture_xl": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/1000x1000-000000-80-0-0.jpg",
+        "type": "artist"
+      },
+      "type": "album"
+    }
+  ],
+  "total": 1
+}
