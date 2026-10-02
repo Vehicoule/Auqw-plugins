@@ -562,7 +562,23 @@ fn probe_capability(
     cap: &str,
 ) -> Result<serde_json::Value, String> {
     const FUEL: u64 = 20_000_000;
-    let mut store = wasmi::Store::new(engine, ());
+    const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+    // Fuel caps instruction count only — a memory.grow can still reach
+    // the Wasm32 limit and OOM the validator before fuel runs out.
+    // The limiter enforces the host's 64 MiB memory budget too.
+    struct ProbeState {
+        limits: wasmi::StoreLimits,
+    }
+    let mut store = wasmi::Store::new(
+        engine,
+        ProbeState {
+            limits: wasmi::StoreLimitsBuilder::default()
+                .memory_size(MEMORY_LIMIT)
+                .trap_on_grow_failure(true)
+                .build(),
+        },
+    );
+    store.limiter(|s| &mut s.limits);
     store
         .set_fuel(FUEL)
         .map_err(|e| format!("cannot cap probe fuel: {e}"))?;
