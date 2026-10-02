@@ -1,0 +1,81 @@
+{
+ "id": 908622995,
+ "title": "Trip-Hop Classics",
+ "description": "Sombre beats and smoky vocals.",
+ "duration": 15600,
+ "fans": 41203,
+ "link": "https://www.deezer.com/playlist/908622995",
+ "picture_xl": "https://cdn-images.dzcdn.net/images/playlist/3b2f7a1c9e4d5f6a7b8c9d0e1f2a3b4c/1000x1000-000000-80-0-0.jpg",
+ "checksum": "a1b2c3d4e5f6",
+ "tracklist": "https://api.deezer.com/playlist/908622995/tracks",
+ "creation_date": "2020-04-12 09:00:00",
+ "creator": {
+  "id": 41786751,
+  "name": "Deezer",
+  "tracklist": "https://api.deezer.com/user/41786751/flow",
+  "type": "user"
+ },
+ "type": "playlist",
+ "nb_tracks": 2,
+ "tracks": {
+  "data": [
+   {
+    "id": 982668,
+    "readable": true,
+    "title": "Roads",
+    "title_short": "Roads",
+    "title_version": "",
+    "isrc": "GBAQT9400064",
+    "link": "https://www.deezer.com/track/982668",
+    "duration": 303,
+    "rank": 718292,
+    "explicit_lyrics": false,
+    "explicit_content_lyrics": 0,
+    "explicit_content_cover": 2,
+    "preview": "https://cdnt-preview.dzcdn.net/roads.mp3?hdnea=exp~hmac=iiii",
+    "md5_image": "5942b88996f33c82790023d5d99395d3",
+    "artist": {
+     "id": 1069,
+     "name": "Portishead",
+     "picture_xl": "https://cdn-images.dzcdn.net/images/artist/a78ec8e6fa844b473c4cea87b8ebfcf5/1000x1000-000000-80-0-0.jpg",
+     "tracklist": "https://api.deezer.com/artist/1069/top?limit=50",
+     "type": "artist"
+    },
+    "album": {
+     "id": 109301,
+     "title": "Dummy",
+     "cover_xl": "https://cdn-images.dzcdn.net/images/cover/5942b88996f33c82790023d5d99395d3/1000x1000-000000-80-0-0.jpg",
+     "md5_image": "5942b88996f33c82790023d5d99395d3",
+     "tracklist": "https://api.deezer.com/album/109301/tracks",
+     "type": "album"
+    },
+    "type": "track"
+   },
+   {
+    "id": 1125632,
+    "readable": true,
+    "title": "Roads (Live)",
+    "title_short": "Roads",
+    "title_version": "(Live)",
+    "isrc": "GBARA9800070",
+    "duration": 350,
+    "rank": 390309,
+    "explicit_lyrics": false,
+    "preview": "https://cdnt-preview.dzcdn.net/roadslive.mp3?hdnea=exp~hmac=jjjj",
+    "artist": {
+     "id": 1069,
+     "name": "Portishead",
+     "type": "artist"
+    },
+    "album": {
+     "id": 109302,
+     "title": "Roseland NYC Live",
+     "cover_xl": "https://cdn-images.dzcdn.net/images/cover/6e13dc3331a9a515f3e8571dd3e2f71b/1000x1000-000000-80-0-0.jpg",
+     "type": "album"
+    },
+    "type": "track"
+   }
+  ],
+  "checksum": "ff00ee11"
+ }
+}
