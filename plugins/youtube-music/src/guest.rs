@@ -59,14 +59,23 @@ const LAST_EDGE_KEY: &str = "ladder/last-edge";
 /// `plugin-host/src/budgets.rs`). A rung attempt's worst chain is
 /// four calls — player, probe, one redirect re-probe, one
 /// fallback-window re-probe after a missed hint-derived probe — so
-/// every pass starts a rung only while that chain still fits; past
-/// the bound the rung would die mid-draw `budget-exceeded` either
-/// way, and a bare-pass rung it skips books transport weather. In-
-/// flight re-asks (401 token-drop, walled-visitor drop) hold the
-/// same bound: they run only while the probe chain behind them
-/// still has room.
+/// a remedy pass starts a rung only while the whole chain still
+/// fits and the bare pass reserves the minimal player+probe pair
+/// (the optional members gate themselves); past the bound the rung
+/// would die mid-draw `budget-exceeded` either way, and a bare-pass
+/// rung it skips books transport weather. In-flight re-asks (401
+/// token-drop, walled-visitor drop) hold the full bound: they run
+/// only while the probe chain behind them still has room.
 const HTTP_CALL_BUDGET: u32 = 32;
 const RUNG_CHAIN_CALLS: u32 = 4;
+
+/// The smallest rung chain that can still resolve: a player request
+/// and one probe. The bare pass starts a rung while at least this
+/// fits — the optional chain members (redirect follow, hint-repair
+/// fallback) check the remaining calls themselves before emitting,
+/// so a tight pass still banks a playable rung instead of reserving
+/// weather it may never need.
+const MIN_RUNG_CALLS: u32 = 2;
 
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
@@ -917,18 +926,19 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             };
             let mut rung_visitor = fresh_visitor.clone().or(kv_visitor);
 
-            // Every pass holds the whole-chain reservation — starting
-            // a rung whose player + probe + redirect + fallback chain
-            // cannot fit inside the host budget would die mid-draw on
-            // `budget-exceeded` anyway. The remedy passes already hold
-            // this bound at the top of the loop; here it protects the
-            // bare pass's attempt, after the KV reads (backoff and
-            // visitor are free under the HTTP budget). A bare-pass
-            // rung that cannot start books the transport weather a
-            // host denial would have produced — it votes in the
-            // taxonomy and stays redraw-eligible — while a rung that
-            // already holds a verdict keeps it.
-            if http_calls + RUNG_CHAIN_CALLS > HTTP_CALL_BUDGET {
+            // The bare pass reserves the minimal successful chain —
+            // player + probe — because the optional members (redirect
+            // follow, hint-repair fallback) gate themselves inside
+            // `finish_pick`: a tight pass should still bank a rung
+            // that only needs two calls rather than dying to a
+            // `budget-exceeded` mid-draw. Remedy passes hold the full
+            // four-call reservation at the top of the loop. Backoff
+            // and visitor reads above are KV — free under the HTTP
+            // budget. A bare-pass rung that cannot start books the
+            // transport weather a host denial would have produced —
+            // it votes in the taxonomy and stays redraw-eligible —
+            // while a rung that already holds a verdict keeps it.
+            if http_calls + MIN_RUNG_CALLS > HTTP_CALL_BUDGET {
                 if outcomes[i].is_none() {
                     outcomes[i] = Some(RungOutcome::Transport);
                 }
@@ -1410,11 +1420,16 @@ async fn finish_pick(
     if resp.status / 100 == 3 {
         let target = header_value(&resp.headers, "location").map(str::to_owned);
         if let Some(target) = target.filter(|t| t.starts_with("https://") && is_googlevideo(t)) {
-            probe_url = target;
-            *http_calls += 1;
-            match http_request(probe_request(rung, &probe_url, picked.content_length)).await {
-                Ok(r) => resp = r,
-                Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
+            // The follow is optional chain spend: it emits only while
+            // a call remains, else the rung keeps the unresolved 3xx
+            // and books capped like a foreign target.
+            if *http_calls < HTTP_CALL_BUDGET {
+                probe_url = target;
+                *http_calls += 1;
+                match http_request(probe_request(rung, &probe_url, picked.content_length)).await {
+                    Ok(r) => resp = r,
+                    Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
+                }
             }
         }
     }
@@ -1430,12 +1445,15 @@ async fn finish_pick(
     let mut verdict = probe_verdict(&resp, picked.content_length);
     // A response still in 3xx is a redirect that never resolved: the
     // target rode outside the allowlist or the hop chain did not
-    // close. Re-probing that URL over the fallback window could only
-    // "hit" a URL playback cannot actually follow — the rung is a
-    // capped mint, full stop.
+    // close (or the follow did not fit the budget). Re-probing that
+    // URL over the fallback window could only "hit" a URL playback
+    // cannot actually follow — the rung is a capped mint, full stop.
+    // The re-probe is itself optional chain spend: with no call left
+    // the hinted miss's verdict stands.
     if verdict == Some(RungOutcome::Capped)
         && picked.content_length.is_some()
         && resp.status / 100 != 3
+        && *http_calls < HTTP_CALL_BUDGET
     {
         *http_calls += 1;
         resp = match http_request(probe_request(rung, &probe_url, None)).await {
@@ -2199,6 +2217,38 @@ mod tests {
                 .contains("transport"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn bare_pass_starts_a_rung_its_minimal_chain_can_finish() {
+        // Seven four-call rungs spend 28 calls and rung 7's player
+        // request dies transient on the 29th. Rung 8's minimal chain
+        // — player + probe — still fits in the three calls left, so
+        // the pass starts it instead of reserving weather it never
+        // needed: the stream resolves.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        for i in 0..7 {
+            assert_eq!(rung_of(&out), i);
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer_headers(
+                &out,
+                302,
+                &[("Location", "https://rr9.googlevideo.com/alt")],
+                0,
+            );
+            out = h.answer(&out, 416, "");
+            out = answer_fallback_416(&mut h, &out);
+        }
+        assert_eq!(rung_of(&out), 7);
+        out = h.answer_host_error(&out, "transient");
+        assert_eq!(rung_of(&out), 8);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.43.32");
     }
 
     /// Strip `contentLength` so the probe falls back to a fixed window.
