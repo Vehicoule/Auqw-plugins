@@ -1254,11 +1254,12 @@ async fn mint_once(
             // contract shape — it can't be video-specific.
             (pot.is_some(), PotMiss::Global)
         }
-        // Server-side weather can't bind to a video; a client refusal
-        // can — scope it so the next video's mint is unaffected.
+        // Server-side weather and the provider's own rate limit can't
+        // bind to a video; a client refusal can — scope it so the next
+        // video's mint is unaffected.
         Ok(r) => (
             false,
-            if r.status >= 500 {
+            if r.status >= 500 || r.status == 429 {
                 PotMiss::Global
             } else {
                 PotMiss::Video
@@ -4523,6 +4524,29 @@ mod tests {
             .unwrap_or_default(),
         );
         let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+    }
+
+    #[test]
+    fn provider_rate_limit_books_the_global_aside() {
+        // The provider's own throttle is not video evidence — it
+        // suppresses every mint in the window.
+        let mut h = Harness::new();
+        h.pot = Pot::Status(429);
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(h.pot_calls, 1);
+        assert!(h.committed.contains_key(POT_ASIDE_KEY));
+        assert!(!h.committed.contains_key(&format!("{POT_ASIDE_KEY}/{VID}")));
+        // A different video inside the window skips its mint too.
+        let out = h.invoke(json!({ "source_ref": "othervideo1" }));
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
         let out = answer_probe_206(&mut h, &out);
