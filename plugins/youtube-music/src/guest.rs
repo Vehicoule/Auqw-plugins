@@ -57,14 +57,15 @@ const LAST_EDGE_KEY: &str = "ladder/last-edge";
 
 /// The host's per-invocation HTTP budget (`max_http_calls` in
 /// `plugin-host/src/budgets.rs`). A rung attempt's worst chain is
-/// three calls — player, probe, one redirect re-probe — so a remedy
-/// pass emits a request only while that chain still fits; past the
-/// bound the rung would die mid-draw `budget-exceeded` either way.
-/// In-flight re-asks (401 token-drop, walled-visitor drop) hold the
-/// same bound: they run only while the probe chain behind them still
-/// has room.
+/// four calls — player, probe, one redirect re-probe, one
+/// fallback-window re-probe after a missed hint-derived probe — so a
+/// remedy pass emits a request only while that chain still fits; past
+/// the bound the rung would die mid-draw `budget-exceeded` either
+/// way. In-flight re-asks (401 token-drop, walled-visitor drop) hold
+/// the same bound: they run only while the probe chain behind them
+/// still has room.
 const HTTP_CALL_BUDGET: u32 = 32;
-const RUNG_CHAIN_CALLS: u32 = 3;
+const RUNG_CHAIN_CALLS: u32 = 4;
 
 /// What one rung attempt produced; recorded per rung for the final
 /// `fail` kind.
@@ -465,17 +466,22 @@ fn unescape_json_unicode(s: &str) -> String {
         if c == '\\' && chars.peek() == Some(&'u') {
             chars.next();
             let mut code = 0u32;
-            let mut ok = true;
+            let mut digits = String::new();
             for _ in 0..4 {
-                match chars.next().and_then(|h| h.to_digit(16)) {
-                    Some(d) => code = code * 16 + d,
-                    None => {
-                        ok = false;
-                        break;
+                // Peek before consuming: a non-hex char — or the end
+                // of input — terminates the escape without being
+                // eaten, so a malformed escape keeps the rest of the
+                // input scannable instead of deleting the terminator
+                // and the digits already read.
+                match chars.peek().copied().and_then(|h| h.to_digit(16)) {
+                    Some(d) => {
+                        code = code * 16 + d;
+                        digits.push(chars.next().unwrap_or_default());
                     }
+                    None => break,
                 }
             }
-            match ok.then(|| char::from_u32(code)).flatten() {
+            match (digits.len() == 4).then(|| char::from_u32(code)).flatten() {
                 // Structural JSON stays escaped: a `\u0022` inside a
                 // string VALUE must never forge a `"status":"ok"`
                 // the closed-span veto then reads as real structure.
@@ -491,9 +497,14 @@ fn unescape_json_unicode(s: &str) -> String {
                     out.push('u');
                     out.extend(format!("{:04x}", decoded as u32).chars());
                 }
+                // Fewer than four hex digits, or a scalar `char` can't
+                // hold — emit the literal `\u` plus the digits actually
+                // read and let the scan continue from the char that
+                // failed to parse.
                 None => {
                     out.push('\\');
                     out.push('u');
+                    out.push_str(&digits);
                 }
             }
         } else {
@@ -754,8 +765,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
     let _ = p.resume_offset;
     // The wall clock is the one call a resolve cannot degrade —
     // backoff arithmetic is meaningless without it, so its failure is
-    // the resolve's failure.
-    let now = now_ms().await?;
+    // the resolve's failure. It's re-read where it's used: a rung's
+    // backoff check and staged deadline belong to the moment they
+    // run, not the top of the walk — stamped from a clock read once
+    // up front, a backoff window shorter than the walk itself would
+    // land already expired on a late rung.
     // One slot per rung, indexed by static LADDER position: `order`
     // permutes request scheduling only — the failure summary still
     // reads the ladder in static order, so a last-good hint can never
@@ -872,7 +886,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // staged bot-backoff is the thing attestation exists to
             // break.
             if !attested {
-                match load_backoff(&backoff_key, now).await? {
+                match load_backoff(&backoff_key, now_ms().await?).await? {
                     StoredBackoff::Active(reason) => {
                         dirty_backoffs[i] = true;
                         let outcome = outcome_for_reason(&reason);
@@ -934,7 +948,8 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                         let outcome = terminal_or_transport(e)?;
                         if let Some((reason, ms)) = backoff_for(outcome) {
                             dirty_backoffs[i] = true;
-                            stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                            stage_backoff(&backoff_key, now_ms().await?.saturating_add(ms), reason)
+                                .await?;
                         }
                         outcomes[i] = Some(outcome);
                         continue 'rung;
@@ -1001,7 +1016,8 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 PlayerVerdict::Outcome(outcome) => {
                     if let Some((reason, ms)) = backoff_for(outcome) {
                         dirty_backoffs[i] = true;
-                        stage_backoff(&backoff_key, now.saturating_add(ms), reason).await?;
+                        stage_backoff(&backoff_key, now_ms().await?.saturating_add(ms), reason)
+                            .await?;
                     }
                     outcomes[i] = Some(outcome);
                     if pass == 0 && outcome == RungOutcome::Bot {
@@ -1047,7 +1063,7 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                     dirty_backoffs[i] = true;
                     stage_backoff(
                         &backoff_key,
-                        now.saturating_add(BOT_BACKOFF_MS),
+                        now_ms().await?.saturating_add(BOT_BACKOFF_MS),
                         "bot-check",
                     )
                     .await?;
@@ -1131,8 +1147,12 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                                 PickOutcome::Advance(outcome) => {
                                     if let Some((reason, ms)) = backoff_for(outcome) {
                                         dirty_backoffs[i] = true;
-                                        stage_backoff(&backoff_key, now.saturating_add(ms), reason)
-                                            .await?;
+                                        stage_backoff(
+                                            &backoff_key,
+                                            now_ms().await?.saturating_add(ms),
+                                            reason,
+                                        )
+                                        .await?;
                                     }
                                     outcomes[i] = Some(outcome);
                                 }
@@ -1352,7 +1372,8 @@ async fn finish_pick(
         return Ok(PickOutcome::Advance(RungOutcome::Capped));
     }
     *http_calls += 1;
-    let mut resp = match http_request(probe_request(rung, &picked.url, picked.content_length)).await
+    let mut probe_url = picked.url.clone();
+    let mut resp = match http_request(probe_request(rung, &probe_url, picked.content_length)).await
     {
         Ok(r) => r,
         // A host denial past the local allowlist check is no longer a
@@ -1370,20 +1391,43 @@ async fn finish_pick(
     if resp.status / 100 == 3 {
         let target = header_value(&resp.headers, "location").map(str::to_owned);
         if let Some(target) = target.filter(|t| t.starts_with("https://") && is_googlevideo(t)) {
+            probe_url = target;
             *http_calls += 1;
-            match http_request(probe_request(rung, &target, picked.content_length)).await {
+            match http_request(probe_request(rung, &probe_url, picked.content_length)).await {
                 Ok(r) => resp = r,
                 Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
             }
         }
     }
-    match probe_verdict(&resp, picked.content_length) {
+    // The manifest's `contentLength` is a hint, not authority: an
+    // over-reported one misses the tail probe on a perfectly healthy
+    // rung, and booked `Capped` it would wedge every rung the same
+    // way. A hint-derived probe that misses earns ONE re-probe over
+    // the fixed fallback window — a hit means the rung serves and
+    // only the hint lied. A miss on both still books `Capped`; the
+    // verdict taxonomy is unchanged (a 429 or 5xx never re-probes —
+    // they are the rung's own weather, not a range miss).
+    let mut content_length = picked.content_length;
+    let mut verdict = probe_verdict(&resp, picked.content_length);
+    if verdict == Some(RungOutcome::Capped) && picked.content_length.is_some() {
+        *http_calls += 1;
+        resp = match http_request(probe_request(rung, &probe_url, None)).await {
+            Ok(r) => r,
+            Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
+        };
+        verdict = probe_verdict(&resp, None);
+        // A fallback hit proves the window's span, not the hinted
+        // length — report the served `Content-Range` total (the edge's
+        // own size evidence) rather than the hint that just lied.
+        content_length = served_total(&resp);
+    }
+    match verdict {
         None => Ok(PickOutcome::Done(json!({
             "url": picked.url,
             "mime": picked.mime,
             "bitrate_kbps": picked.bitrate_kbps,
             "expires_at_ms": picked.expires_at_ms,
-            "content_length": picked.content_length,
+            "content_length": content_length,
             "client": rung.name,
             "itag": picked.itag,
             // The mint's fetch identity: the URL was minted (and just
@@ -1433,6 +1477,18 @@ fn parse_content_range(resp: &HttpResponse) -> Option<ContentRange> {
         end: end.trim().parse().ok()?,
         total: total.trim().parse().ok(),
     })
+}
+
+/// The file's total length as the serving edge itself reported it —
+/// the `/<total>` half of a 206's `Content-Range` or the `bytes */<N>`
+/// of a 416. `None` when the response carried no usable range header.
+fn served_total(resp: &HttpResponse) -> Option<u64> {
+    match parse_content_range(resp) {
+        Some(ContentRange::Range { total, .. }) | Some(ContentRange::Unsatisfiable { total }) => {
+            total
+        }
+        None => None,
+    }
 }
 
 /// The byte offset the probe asked for: the tail of a known-length
@@ -1854,6 +1910,20 @@ mod tests {
         )
     }
 
+    /// The fallback-window re-probe after a hinted-probe miss: a GET
+    /// asking the fixed `bytes=1048576-1114111` span. Assert the ask
+    /// and answer a bare 416 — no `Content-Range`, so the verdict
+    /// stays `Capped`.
+    fn answer_fallback_416(h: &mut Harness, out: &Value) -> Value {
+        assert_eq!(out["type"], "host_request");
+        assert_eq!(out["payload"]["method"], "GET");
+        assert_eq!(
+            header_of(out, "Range").as_deref(),
+            Some("bytes=1048576-1114111")
+        );
+        h.answer(out, 416, "")
+    }
+
     fn url_of(out: &Value) -> String {
         out["payload"]["url"].as_str().unwrap_or("").to_string()
     }
@@ -1927,12 +1997,32 @@ mod tests {
     }
 
     #[test]
+    fn malformed_unicode_escape_preserves_remaining_input() {
+        // A short or non-hex escape keeps its literal text — the
+        // terminating char is never eaten, and the digits already
+        // read ride back into the output.
+        assert_eq!(unescape_json_unicode("a\\u12xz"), "a\\u12xz");
+        assert_eq!(unescape_json_unicode("x\\u12"), "x\\u12");
+        assert_eq!(unescape_json_unicode("\\u"), "\\u");
+        assert_eq!(unescape_json_unicode("\\u0 z\\u0041"), "\\u0 zA");
+        // Valid escapes still decode; structural chars stay escaped.
+        assert_eq!(unescape_json_unicode("a\\u0041b"), "aAb");
+        assert_eq!(unescape_json_unicode("\\u0020"), " ");
+        assert_eq!(unescape_json_unicode("\\u0022"), "\\u0022");
+        // A lone surrogate forms no scalar — the literal survives.
+        assert_eq!(unescape_json_unicode("\\ud83d"), "\\ud83d");
+    }
+
+    #[test]
     fn probe_403_advances_to_next_rung() {
         let mut h = Harness::new();
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
+        // A hinted-range refusal is one lie, not a verdict — the
+        // fallback window re-probes before the mint books Capped.
         let out = h.answer(&out, 403, "");
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -1987,8 +2077,10 @@ mod tests {
             )],
             0,
         );
-        // One hop is the bound: the second 3xx caps the mint and the
+        // One hop is the bound: the second 3xx caps the hinted probe —
+        // the mint still re-proves on the fallback window before the
         // ladder moves on.
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -1998,8 +2090,32 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
+        // The hinted range misses — the same mint re-probes on the
+        // fixed fallback window before the verdict books.
         let out = h.answer(&out, 416, "");
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn probe_hint_miss_fallback_hit_is_done() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // The manifest's length lied — the edge serves a 1.1 MB object
+        // and the fallback window proves it: `end+1 == total` on the
+        // served range is a hit, and the resolve reports the edge's
+        // own size evidence, not the manifest's claim.
+        let out = h.answer(&out, 416, "");
+        let out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 1048576-1099999/1100000")],
+            51424,
+        );
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["content_length"], 1100000);
     }
 
     /// Strip `contentLength` so the probe falls back to a fixed window.
@@ -2122,8 +2238,10 @@ mod tests {
         probe_of(&out);
         // A 200 means the edge ignored the Range ask and streams from
         // byte 0 — it proves nothing about serving past the horizon,
-        // so the mint is judged capped, not transport weather.
+        // so the mint is judged capped, not transport weather. The
+        // fallback window misses the same way before that books.
         let out = h.answer(&out, 200, "x");
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2134,8 +2252,9 @@ mod tests {
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
         // A 206 with no echoed range — even with a full body — verifies
-        // nothing about the tail.
+        // nothing about the tail; the fallback window misses too.
         let out = h.answer_headers(&out, 206, &[], 65536);
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2151,6 +2270,7 @@ mod tests {
             &[("Content-Range", "bytes 0-65535/4557665")],
             65536,
         );
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2169,6 +2289,7 @@ mod tests {
             &[("Content-Range", "bytes 4557664-4557664/4557666")],
             1,
         );
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2186,6 +2307,7 @@ mod tests {
             &[("Content-Range", "bytes 4557664-4557664/4557665")],
             0,
         );
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2203,6 +2325,7 @@ mod tests {
             &[("Content-Range", "bytes 4557664-4557664/4557665")],
             2,
         );
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2358,17 +2481,19 @@ mod tests {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
         }
         // Capped mints are per-mint stochastic — each earns a redraw on
         // the second edge, mint and probe again. Pass 0 already spent
-        // 18 calls of the 32-call HTTP budget, so only the redraws
-        // whose full chain (player + probe + re-probe) still fits are
-        // emitted: six of nine.
-        for _ in 0..6 {
+        // 27 calls of the 32-call HTTP budget (player + hinted probe +
+        // fallback re-probe per rung), so only the redraws whose full
+        // four-call reservation still fits are emitted: one of nine.
+        for _ in 0..1 {
             assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
         }
         assert_eq!(
             fail_kind(&out),
@@ -2567,10 +2692,12 @@ mod tests {
     fn mint_fires_once_per_resolve() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        // rung 0 pick -> denied mint -> probe 403 -> rung 1.
+        // rung 0 pick -> denied mint -> probe 403 -> fallback miss ->
+        // rung 1.
         out = feed(&mut h, &out, OK);
         probe_of(&out);
         out = h.answer(&out, 403, "");
+        out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
         // rung 1 pick -> straight to probe; no second mint.
         out = feed(&mut h, &out, OK);
@@ -3183,6 +3310,35 @@ mod tests {
     }
 
     #[test]
+    fn backoff_deadline_stamps_the_clock_at_stage_time() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // The wall clock moves between the walk's first read and the
+        // rung's verdict — the deadline stamps the fresh read so the
+        // window actually exists. Read once at the top, a window
+        // shorter than the walk books already-expired on a late rung.
+        h.now = NOW + 40_000;
+        let out = h.answer(&out, 403, "");
+        let out = answer_fallback_416(&mut h, &out);
+        assert_eq!(rung_of(&out), 1);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        let stored: Value = serde_json::from_slice(
+            h.committed
+                .get(&format!("backoff/a/{VID}/VISIONOS"))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        )
+        .unwrap_or_default();
+        assert_eq!(stored["reason"], "capped");
+        assert_eq!(stored["until_ms"], NOW + 40_000 + 5_000);
+    }
+
+    #[test]
     fn host_rate_limit_on_every_rung_fails_rate_limit() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
@@ -3751,6 +3907,10 @@ mod tests {
             &[("Location", "https://cdn.example.com/elsewhere")],
             0,
         );
+        // The hinted probe capped on a redirect it cannot serve — the
+        // fallback window re-proves on the original edge before the
+        // rung books its verdict.
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -4176,18 +4336,20 @@ mod tests {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
             if rung < 8 {
                 assert_eq!(rung_of(&out), rung + 1);
             }
         }
         // The capped mints are weather: each redraws on the second
-        // edge — new mint, same refusal. Seventeen calls spent on
-        // pass 0 leaves room inside the 32-call budget for seven of
-        // the eight redraws (each needs its three-call chain).
-        for _ in 1..8usize {
+        // edge — new mint, same refusal. Twenty-five calls spent on
+        // pass 0 leaves room inside the 32-call budget for two of the
+        // eight redraws (each reserves its four-call chain).
+        for _ in 1..3usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
         }
         assert_eq!(
             fail_kind(&out),

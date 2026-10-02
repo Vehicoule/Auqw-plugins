@@ -124,23 +124,38 @@ pub async fn suggest(payload: &Value) -> Result<Value, GuestError> {
             warn("ignoring malformed visitor value").await?;
         }
     }
-    // The suggestion section must exist: an upstream error body or an
-    // unexpected shape is `invalid-response`, not an empty completion
-    // set — while a present-but-empty contents array is the honest
-    // "no completions" signal.
-    let contents = body
+    // A `searchSuggestionsSectionRenderer` carrying a `contents` array
+    // must exist: an upstream error body or an unexpected shape is
+    // `invalid-response`, not an empty completion set — while a
+    // present-but-empty contents array is the honest "no completions"
+    // signal. The section is not guaranteed to lead `contents` — a
+    // header or history block can precede it — so every top-level
+    // section is scanned and all suggestion sections' contents
+    // concatenate.
+    let mut found = false;
+    let mut contents: Vec<&Value> = Vec::new();
+    for section in body
         .get("contents")
         .and_then(Value::as_array)
-        .and_then(|c| c.first())
-        .and_then(|s| s.get("searchSuggestionsSectionRenderer"))
-        .and_then(|s| s.get("contents"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            failed(
-                "invalid-response",
-                "suggest body carries no suggestion section".into(),
-            )
-        })?;
+        .into_iter()
+        .flatten()
+    {
+        let Some(c) = section
+            .get("searchSuggestionsSectionRenderer")
+            .and_then(|s| s.get("contents"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        found = true;
+        contents.extend(c.iter());
+    }
+    if !found {
+        return Err(failed(
+            "invalid-response",
+            "suggest body carries no suggestion section".into(),
+        ));
+    }
     let mut out: Vec<String> = Vec::new();
     // Walk the whole section: skipped rows (history, dupes, blanks)
     // must not hide later completions — the response body is already
@@ -271,6 +286,49 @@ mod tests {
         );
         // The response's visitorData persisted for the next call.
         assert!(h.committed.contains_key(VISITOR_KEY));
+    }
+
+    #[test]
+    fn suggest_reads_past_a_leading_other_section() {
+        // The pane's first section isn't always the suggestions one —
+        // a leading unrelated section must not kill the whole pane.
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "input": "awa" }));
+        let mut body: Value = serde_json::from_str(SUGGESTIONS).unwrap_or_default();
+        let Some(contents) = body["contents"].as_array_mut() else {
+            panic!("contents array");
+        };
+        contents.insert(0, json!({"didYouMeanRenderer": {"correctedQuery": "awa"}}));
+        let out = h.answer(&out, 200, &body.to_string());
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            out["result"]["suggestions"],
+            json!(["awa lacrim", "awa 2 lacrim", "awa imani"])
+        );
+    }
+
+    #[test]
+    fn suggest_concatenates_multiple_suggestion_sections() {
+        // The API can emit more than one suggestions section — the
+        // later rows join the earlier ones, in order.
+        let mut h = Harness::new();
+        let out = h.invoke(json!({ "input": "awa" }));
+        let mut body: Value = serde_json::from_str(SUGGESTIONS).unwrap_or_default();
+        let Some(contents) = body["contents"].as_array_mut() else {
+            panic!("contents array");
+        };
+        contents.push(json!({"searchSuggestionsSectionRenderer": {"contents": [
+            {"searchSuggestionRenderer": {
+                "suggestion": {"runs": [{"text": "awa belmondo"}]},
+                "navigationEndpoint": {"searchEndpoint": {"query": "awa belmondo"}}
+            }}
+        ]}}));
+        let out = h.answer(&out, 200, &body.to_string());
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            out["result"]["suggestions"],
+            json!(["awa lacrim", "awa 2 lacrim", "awa imani", "awa belmondo"])
+        );
     }
 
     #[test]

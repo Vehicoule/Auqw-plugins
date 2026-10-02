@@ -23,7 +23,7 @@ mod encode;
 mod http;
 mod parse;
 
-use auqw_guest_sdk::{export_plugin, GuestError, GuestFuture, Invocation};
+use auqw_guest_sdk::{export_plugin, now_ms, GuestError, GuestFuture, Invocation};
 use serde_json::{json, Map, Value};
 
 use parse::Record;
@@ -35,6 +35,17 @@ const API: &str = "https://lrclib.net";
 /// duration hint rather than tripping a 400 that would abort the
 /// waterfall on tier 1.
 const DURATION_MAX_SECS: u64 = 3600;
+
+/// The host's per-invocation deadline in ms (`deadline` in
+/// `plugin-host/src/budgets.rs`). The waterfall has no cheaper source
+/// of truth, so it mirrors the value: a tier that cannot finish inside
+/// it is skipped rather than started.
+const INVOCATION_DEADLINE_MS: u64 = 30_000;
+/// Worst case one tier spends upstream: the host's per-request HTTP
+/// timeout (`http_timeout` in the same budgets).
+const TIER_WORST_MS: u64 = 10_000;
+/// Parse/rank/defer bookkeeping after the call lands, plus slack.
+const TIER_MARGIN_MS: u64 = 2_000;
 
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
@@ -419,7 +430,17 @@ async fn lyrics(payload: &Value, flavor: Flavor) -> Result<Value, GuestError> {
     // after every tier's candidates have been tried.
     let mut deferred_matched: Option<Value> = None;
     let mut deferred: Option<Value> = None;
+    // The waterfall runs inside one invocation: starting a tier the
+    // remaining window can't cover dies mid-call on the host deadline
+    // and the honest "no lyrics" never lands. Clock failure is like
+    // the resolve path's — the waterfall's own arithmetic is
+    // meaningless without it, so it propagates.
+    let started = now_ms().await?;
     for tier in tiers(&q) {
+        let elapsed = now_ms().await?.saturating_sub(started);
+        if elapsed + TIER_WORST_MS + TIER_MARGIN_MS > INVOCATION_DEADLINE_MS {
+            break;
+        }
         let body = match http::get_json(&tier.url).await? {
             http::Outcome::NotFound => continue,
             http::Outcome::Body(body) => body,
@@ -515,6 +536,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine as _;
+    use std::cell::Cell;
 
     const GET_SYNCED: &str = include_str!("../fixtures/get-synced.json");
     const GET_PLAIN: &str = include_str!("../fixtures/get-plain.json");
@@ -526,16 +548,61 @@ mod tests {
     const MISS_404: &str = include_str!("../fixtures/miss-404.json");
     const MALFORMED: &str = include_str!("../fixtures/malformed.json");
 
+    // `now_ms` reads inside the waterfall: `lyrics()` reads the clock
+    // at start and before each tier. Each read answers `tick * n`
+    // where `n` is the read index — the default tick of 0 keeps all
+    // reads at t=0 so the deadline check never engages unless a test
+    // arms it. `invoke` resets all three knobs; a test arms them
+    // after it returns.
+    thread_local! {
+        static NOW_TICK_MS: Cell<u64> = const { Cell::new(0) };
+        static NOW_CALLS: Cell<u64> = const { Cell::new(0) };
+        // When armed, `log` requests answer `host_error` — the typed
+        // verdict must survive a failed log call.
+        static LOG_ERROR: Cell<bool> = const { Cell::new(false) };
+    }
+
     fn step(input: &Value) -> Value {
         let out =
             auqw_guest_sdk::dispatch_step(&serde_json::to_vec(input).unwrap_or_default(), dispatch);
         serde_json::from_slice(&out).unwrap_or_else(|e| panic!("guest output is not JSON: {e}"))
     }
 
+    /// Take a guest output and auto-answer the cheap host calls
+    /// (`now_ms`, `log`) until the guest emits an `http_request` or a
+    /// terminal message.
+    fn drive(mut out: Value) -> Value {
+        loop {
+            if out["type"] != "host_request" {
+                return out;
+            }
+            let id = req_id(&out);
+            out = match out["kind"].as_str().unwrap_or("") {
+                "http_request" => return out,
+                "now_ms" => {
+                    let n = NOW_CALLS.with(|c| c.replace(c.get() + 1));
+                    let now = NOW_TICK_MS.with(|t| t.get()).saturating_mul(n);
+                    step(&json!({
+                        "type": "now_response", "id": id, "now_ms": now,
+                    }))
+                }
+                "log" if LOG_ERROR.with(|f| f.get()) => step(&json!({
+                    "type": "host_error", "id": id,
+                    "error": {"kind": "transient", "message": "log channel down"},
+                })),
+                "log" => step(&json!({"type": "host_ok", "id": id})),
+                other => panic!("unexpected host_request kind {other}: {out}"),
+            };
+        }
+    }
+
     fn invoke(cap: &str, payload: Value) -> Value {
         // Tests share worker threads; clear any state a previous test
         // left parked before starting a fresh invocation.
         auqw_guest_sdk::reset_for_testing();
+        NOW_CALLS.with(|c| c.set(0));
+        NOW_TICK_MS.with(|t| t.set(0));
+        LOG_ERROR.with(|f| f.set(false));
         step(&json!({
             "type": "invoke", "request_id": "t", "capability": cap, "payload": payload,
         }))
@@ -579,7 +646,7 @@ mod tests {
     }
 
     fn invoke_request(cap: &str, q: &Value) -> Value {
-        let out = invoke(cap, json!({ "query": q }));
+        let out = drive(invoke(cap, json!({ "query": q })));
         assert_eq!(out["type"], "host_request", "{out}");
         out
     }
@@ -588,9 +655,9 @@ mod tests {
     /// guest's next output.
     fn answer(out: &Value, status: u16, body: &str) -> Value {
         if body.is_empty() {
-            step(&http_status(req_id(out), status))
+            drive(step(&http_status(req_id(out), status)))
         } else {
-            step(&http_status_body(req_id(out), status, body))
+            drive(step(&http_status_body(req_id(out), status, body)))
         }
     }
 
@@ -985,6 +1052,36 @@ mod tests {
             out["error"]["message"].as_str(),
             Some("rate-limit: lrclib status 429 retry_after=30")
         );
+    }
+
+    #[test]
+    fn rate_limit_survives_a_failed_log_call() {
+        let req = invoke_request("lyrics.plain", &query());
+        // The log channel's own failure must never displace the typed
+        // verdict: armed here, the warn request answers `host_error`
+        // and the fail still lands `rate-limit`, not the channel's
+        // `transient`.
+        LOG_ERROR.with(|f| f.set(true));
+        let out = drive(step(&json!({
+            "type": "http_response", "id": req_id(&req), "status": 429,
+            "headers": [], "body": "",
+        })));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "rate-limit", "{out}");
+    }
+
+    #[test]
+    fn waterfall_stops_starting_tiers_at_the_deadline() {
+        let req = invoke_request("lyrics.plain", &query());
+        // Arm the clock after the `started` read (answered 0 inside
+        // invoke_request): the per-tier check reads tick*n, so tier 1
+        // runs (15+10+2 fits 30) and tier 2's check lands at 30 s —
+        // 30+10+2 > 30 — and the waterfall breaks to the honest absent
+        // result instead of dying mid-tier on the host deadline.
+        NOW_TICK_MS.with(|t| t.set(15_000));
+        let out = answer(&req, 404, MISS_404);
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["state"], "absent");
     }
 
     #[test]

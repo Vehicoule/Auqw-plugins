@@ -108,7 +108,9 @@ fn envelope_kind(body: &Value) -> Envelope {
 /// Emit the sanitized rate-limit diagnostic, then produce the typed
 /// error. The message never carries upstream text, bodies, or URLs.
 async fn rate_limited() -> Result<GuestError, GuestError> {
-    log(LogLevel::Warn, "deezer rate-limited").await?;
+    // A log call's failure must never displace the typed verdict —
+    // the diagnostic is advisory, `rate-limit` is the contract.
+    log(LogLevel::Warn, "deezer rate-limited").await.ok();
     Ok(failed("rate-limit", "deezer api quota exceeded".into()))
 }
 
@@ -118,15 +120,14 @@ async fn rate_limited() -> Result<GuestError, GuestError> {
 async fn rate_limited_with_hint(resp: &HttpResponse) -> Result<GuestError, GuestError> {
     let hint = retry_after_secs(resp);
     match hint {
-        Some(r) => {
-            log(
-                LogLevel::Warn,
-                &format!("deezer rate-limited retry_after={r}"),
-            )
-            .await?;
-        }
-        None => log(LogLevel::Warn, "deezer rate-limited").await?,
-    }
+        Some(r) => log(
+            LogLevel::Warn,
+            &format!("deezer rate-limited retry_after={r}"),
+        )
+        .await
+        .ok(),
+        None => log(LogLevel::Warn, "deezer rate-limited").await.ok(),
+    };
     Ok(failed(
         "rate-limit",
         match hint {

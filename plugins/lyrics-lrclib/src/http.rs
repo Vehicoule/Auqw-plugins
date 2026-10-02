@@ -42,16 +42,18 @@ pub async fn get_json(url: &str) -> Result<Outcome, GuestError> {
         404 => Ok(Outcome::NotFound),
         403 | 429 => {
             let hint = retry_after_secs(&resp);
+            // A log call's failure must never displace the typed
+            // verdict — the diagnostic is advisory, `rate-limit` is
+            // the contract.
             match hint {
-                Some(r) => {
-                    log(
-                        LogLevel::Warn,
-                        &format!("lrclib rate-limited retry_after={r}"),
-                    )
-                    .await?;
-                }
-                None => log(LogLevel::Warn, "lrclib rate-limited").await?,
-            }
+                Some(r) => log(
+                    LogLevel::Warn,
+                    &format!("lrclib rate-limited retry_after={r}"),
+                )
+                .await
+                .ok(),
+                None => log(LogLevel::Warn, "lrclib rate-limited").await.ok(),
+            };
             Err(failed(
                 "rate-limit",
                 match hint {

@@ -1,0 +1,39 @@
+{
+  "name": "youtube-music playback.resolve — over-reported contentLength still resolves on the fallback probe",
+  "plugin": "youtube-music",
+  "capability": "playback.resolve",
+  "request": {
+    "source_ref": {
+      "provider": "youtube-music",
+      "kind": "track",
+      "id": "dQw4w9WgXcQ"
+    },
+    "target_bitrate_kbps": 128
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/player",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/player-ok-overlength.json"
+    },
+    {
+      "url_contains": "googlevideo.com",
+      "status": 416,
+      "headers": {
+        "content-range": "bytes */900000"
+      },
+      "body_file": "../../plugins/youtube-music/fixtures/probe-tail.bin"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "client": "VISIONOS",
+      "itag": 140,
+      "mime": "audio/mp4",
+      "bitrate_kbps": 130,
+      "content_length": 900000
+    },
+    "max_http_calls": 3
+  }
+}
