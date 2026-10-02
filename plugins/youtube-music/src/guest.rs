@@ -1440,21 +1440,21 @@ async fn finish_pick(
     // The manifest's `contentLength` is a hint, not authority: an
     // over-reported one misses the tail probe on a perfectly healthy
     // rung, and booked `Capped` it would wedge every rung the same
-    // way. A hint-derived probe that misses earns ONE re-probe over
-    // the fixed fallback window — a hit means the rung serves and
-    // only the hint lied. A miss on both still books `Capped`; the
-    // verdict taxonomy is unchanged (a 429 or 5xx never re-probes —
-    // they are the rung's own weather, not a range miss).
+    // way. A range-shaped miss — a 416, or a 206 that failed the
+    // span checks — earns ONE re-probe over the fixed fallback
+    // window: a hit means the rung serves and only the hint lied. A
+    // miss on both still books `Capped`; the verdict taxonomy is
+    // unchanged (a 429 or 5xx never re-probes — they are the rung's
+    // own weather, not a range miss).
     let mut content_length = picked.content_length;
     let mut verdict = probe_verdict(&resp, picked.content_length);
-    // A response still in 3xx is a redirect that never resolved: the
-    // target rode outside the allowlist or the hop chain did not
-    // close. Re-probing that URL over the fallback window could only
-    // "hit" a URL playback cannot actually follow — the rung is a
-    // capped mint, full stop.
+    // Everything else that books `Capped` is definitive — a refusal
+    // like 403 or 404, a 2xx that ignored the range, or a redirect
+    // that never resolved is the mint's own verdict, not the hint's
+    // lie, and the repair could only repeat it. The cap stands.
     if verdict == Some(RungOutcome::Capped)
         && picked.content_length.is_some()
-        && resp.status / 100 != 3
+        && fallback_worthy(&resp)
     {
         // The re-probe is itself optional chain spend — when it does
         // not fit, the hinted miss stands unverified: an inconclusive,
@@ -1576,6 +1576,16 @@ fn probe_start(content_length: Option<u64>) -> u64 {
 /// `Transport`, not `Capped` — server weather teaches nothing about
 /// serving. Anything else marks the mint capped and advances the
 /// ladder.
+/// Whether a hinted-probe answer is a *range* miss — the only kind
+/// the fallback window can disambiguate: a 416, or a 206 whose span
+/// failed `probe_verdict`'s checks. A refusal (403, 404, a bare 4xx)
+/// or a 2xx that ignored the range is definitive — no second window
+/// could change it — so it earns no re-probe and keeps its verdict
+/// at any budget.
+fn fallback_worthy(resp: &HttpResponse) -> bool {
+    matches!(resp.status, 206 | 416)
+}
+
 fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<RungOutcome> {
     let start_asked = probe_start(content_length);
     match resp.status {
@@ -2079,10 +2089,10 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
-        // A hinted-range refusal is one lie, not a verdict — the
-        // fallback window re-probes before the mint books Capped.
+        // A refusal is the mint's own verdict, not a range miss — no
+        // fallback window could change it, so nothing emits a
+        // re-probe and the rung books Capped outright.
         let out = h.answer(&out, 403, "");
-        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2336,6 +2346,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn definitive_refusal_keeps_its_cap_at_the_budget_edge() {
+        // Same two-call window, but the hinted probe's 403 is a
+        // definitive refusal — the mint's verdict, not a range miss —
+        // so no repair is owed and the cap survives intact. The ladder
+        // reports streams-capped, not transport.
+        let mut h = Harness::new();
+        let mut out = drive_to_last_rung(&mut h);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        out = h.answer(&out, 403, "");
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "transient", "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streams-capped"),
+            "{out}"
+        );
+    }
+
     /// Strip `contentLength` so the probe falls back to a fixed window.
     fn ok_without_length() -> String {
         let mut body: Value = serde_json::from_str(OK).unwrap_or_default();
@@ -2455,11 +2487,9 @@ mod tests {
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
         // A 200 means the edge ignored the Range ask and streams from
-        // byte 0 — it proves nothing about serving past the horizon,
-        // so the mint is judged capped, not transport weather. The
-        // fallback window misses the same way before that books.
+        // byte 0 — a mint that cannot serve ranges books capped
+        // outright: re-probing another window can only repeat it.
         let out = h.answer(&out, 200, "x");
-        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2699,19 +2729,18 @@ mod tests {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            out = answer_fallback_416(&mut h, &out);
         }
         // Capped mints are per-mint stochastic — each earns a redraw on
         // the second edge, mint and probe again. Pass 0 already spent
-        // 27 calls of the 32-call HTTP budget (player + hinted probe +
-        // fallback re-probe per rung), so only the redraws whose full
-        // four-call reservation still fits are emitted: one of nine.
-        for _ in 0..1 {
+        // 18 calls of the 32-call HTTP budget (player + hinted probe
+        // per rung — a refusal earns no re-probe), so only the redraws
+        // whose full four-call reservation still fits are emitted:
+        // six of nine.
+        for _ in 0..6 {
             assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            out = answer_fallback_416(&mut h, &out);
         }
         assert_eq!(
             fail_kind(&out),
@@ -2910,12 +2939,10 @@ mod tests {
     fn mint_fires_once_per_resolve() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        // rung 0 pick -> denied mint -> probe 403 -> fallback miss ->
-        // rung 1.
+        // rung 0 pick -> denied mint -> probe 403 -> rung 1.
         out = feed(&mut h, &out, OK);
         probe_of(&out);
         out = h.answer(&out, 403, "");
-        out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
         // rung 1 pick -> straight to probe; no second mint.
         out = feed(&mut h, &out, OK);
@@ -3539,7 +3566,6 @@ mod tests {
         // shorter than the walk books already-expired on a late rung.
         h.now = NOW + 40_000;
         let out = h.answer(&out, 403, "");
-        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
@@ -4553,20 +4579,18 @@ mod tests {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            out = answer_fallback_416(&mut h, &out);
             if rung < 8 {
                 assert_eq!(rung_of(&out), rung + 1);
             }
         }
         // The capped mints are weather: each redraws on the second
-        // edge — new mint, same refusal. Twenty-five calls spent on
-        // pass 0 leaves room inside the 32-call budget for two of the
+        // edge — new mint, same refusal. Seventeen calls spent on
+        // pass 0 leaves room inside the 32-call budget for six of the
         // eight redraws (each reserves its four-call chain).
-        for _ in 1..3usize {
+        for _ in 1..7usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
-            out = answer_fallback_416(&mut h, &out);
         }
         assert_eq!(
             fail_kind(&out),
