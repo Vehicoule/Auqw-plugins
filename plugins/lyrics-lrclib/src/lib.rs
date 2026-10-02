@@ -560,6 +560,7 @@ mod tests {
         // When armed, `log` requests answer `host_error` — the typed
         // verdict must survive a failed log call.
         static LOG_ERROR: Cell<bool> = const { Cell::new(false) };
+        static LOG_ERROR_KIND: Cell<&'static str> = const { Cell::new("transient") };
     }
 
     fn step(input: &Value) -> Value {
@@ -588,7 +589,10 @@ mod tests {
                 }
                 "log" if LOG_ERROR.with(|f| f.get()) => step(&json!({
                     "type": "host_error", "id": id,
-                    "error": {"kind": "transient", "message": "log channel down"},
+                    "error": {
+                        "kind": LOG_ERROR_KIND.with(|k| k.get()),
+                        "message": "log channel down"
+                    },
                 })),
                 "log" => step(&json!({"type": "host_ok", "id": id})),
                 other => panic!("unexpected host_request kind {other}: {out}"),
@@ -603,6 +607,7 @@ mod tests {
         NOW_CALLS.with(|c| c.set(0));
         NOW_TICK_MS.with(|t| t.set(0));
         LOG_ERROR.with(|f| f.set(false));
+        LOG_ERROR_KIND.with(|k| k.set("transient"));
         step(&json!({
             "type": "invoke", "request_id": "t", "capability": cap, "payload": payload,
         }))
@@ -1068,6 +1073,21 @@ mod tests {
         })));
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "rate-limit", "{out}");
+    }
+
+    #[test]
+    fn cancelled_log_call_propagates_over_rate_limit() {
+        let req = invoke_request("lyrics.plain", &query());
+        // Terminal kinds outrank the typed verdict: `cancelled` is the
+        // abort signal, never a rate-limit.
+        LOG_ERROR.with(|f| f.set(true));
+        LOG_ERROR_KIND.with(|k| k.set("cancelled"));
+        let out = drive(step(&json!({
+            "type": "http_response", "id": req_id(&req), "status": 429,
+            "headers": [], "body": "",
+        })));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "cancelled", "{out}");
     }
 
     #[test]

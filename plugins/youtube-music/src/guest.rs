@@ -58,11 +58,12 @@ const LAST_EDGE_KEY: &str = "ladder/last-edge";
 /// The host's per-invocation HTTP budget (`max_http_calls` in
 /// `plugin-host/src/budgets.rs`). A rung attempt's worst chain is
 /// four calls — player, probe, one redirect re-probe, one
-/// fallback-window re-probe after a missed hint-derived probe — so a
-/// remedy pass emits a request only while that chain still fits; past
+/// fallback-window re-probe after a missed hint-derived probe — so
+/// every pass starts a rung only while that chain still fits; past
 /// the bound the rung would die mid-draw `budget-exceeded` either
-/// way. In-flight re-asks (401 token-drop, walled-visitor drop) hold
-/// the same bound: they run only while the probe chain behind them
+/// way, and a bare-pass rung it skips books transport weather. In-
+/// flight re-asks (401 token-drop, walled-visitor drop) hold the
+/// same bound: they run only while the probe chain behind them
 /// still has room.
 const HTTP_CALL_BUDGET: u32 = 32;
 const RUNG_CHAIN_CALLS: u32 = 4;
@@ -916,6 +917,24 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             };
             let mut rung_visitor = fresh_visitor.clone().or(kv_visitor);
 
+            // Every pass holds the whole-chain reservation — starting
+            // a rung whose player + probe + redirect + fallback chain
+            // cannot fit inside the host budget would die mid-draw on
+            // `budget-exceeded` anyway. The remedy passes already hold
+            // this bound at the top of the loop; here it protects the
+            // bare pass's attempt, after the KV reads (backoff and
+            // visitor are free under the HTTP budget). A bare-pass
+            // rung that cannot start books the transport weather a
+            // host denial would have produced — it votes in the
+            // taxonomy and stays redraw-eligible — while a rung that
+            // already holds a verdict keeps it.
+            if http_calls + RUNG_CHAIN_CALLS > HTTP_CALL_BUDGET {
+                if outcomes[i].is_none() {
+                    outcomes[i] = Some(RungOutcome::Transport);
+                }
+                continue;
+            }
+
             // The rung's sends live in one loop because two one-shot
             // re-asks can stack: a 401 against a carried trust token
             // drops it and re-asks bare (`take` makes it single-shot —
@@ -1409,17 +1428,32 @@ async fn finish_pick(
     // they are the rung's own weather, not a range miss).
     let mut content_length = picked.content_length;
     let mut verdict = probe_verdict(&resp, picked.content_length);
-    if verdict == Some(RungOutcome::Capped) && picked.content_length.is_some() {
+    // A response still in 3xx is a redirect that never resolved: the
+    // target rode outside the allowlist or the hop chain did not
+    // close. Re-probing that URL over the fallback window could only
+    // "hit" a URL playback cannot actually follow — the rung is a
+    // capped mint, full stop.
+    if verdict == Some(RungOutcome::Capped)
+        && picked.content_length.is_some()
+        && resp.status / 100 != 3
+    {
         *http_calls += 1;
         resp = match http_request(probe_request(rung, &probe_url, None)).await {
             Ok(r) => r,
             Err(e) => return Ok(PickOutcome::Advance(terminal_or_transport(e)?)),
         };
         verdict = probe_verdict(&resp, None);
-        // A fallback hit proves the window's span, not the hinted
-        // length — report the served `Content-Range` total (the edge's
-        // own size evidence) rather than the hint that just lied.
-        content_length = served_total(&resp);
+        // A `bytes */0` refusal technically hits the EOF arm while
+        // describing an empty object nothing can play — a capped
+        // rung, not a zero-length result. Any other hit proves the
+        // window's span, not the hinted length, so the result reports
+        // the served `Content-Range` total — the edge's own size
+        // evidence — rather than the hint that just lied.
+        if verdict.is_none() && served_total(&resp) == Some(0) {
+            verdict = Some(RungOutcome::Capped);
+        } else {
+            content_length = served_total(&resp);
+        }
     }
     match verdict {
         None => Ok(PickOutcome::Done(json!({
@@ -2077,10 +2111,9 @@ mod tests {
             )],
             0,
         );
-        // One hop is the bound: the second 3xx caps the hinted probe —
-        // the mint still re-proves on the fallback window before the
-        // ladder moves on.
-        let out = answer_fallback_416(&mut h, &out);
+        // One hop is the bound: the chain still sits on an unresolved
+        // 3xx, and an unfollowed redirect earns no fallback re-probe —
+        // the rung books capped and the ladder moves on.
         assert_eq!(rung_of(&out), 1);
     }
 
@@ -2116,6 +2149,56 @@ mod tests {
         );
         assert_eq!(out["type"], "done");
         assert_eq!(out["result"]["content_length"], 1100000);
+    }
+
+    #[test]
+    fn zero_total_fallback_is_capped_not_done() {
+        let mut h = Harness::new();
+        let out = begin(&mut h);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // A `bytes */0` refusal hits the EOF arm while describing an
+        // empty object — the rung books capped and the ladder walks
+        // on; a zero-length result never ships.
+        let out = h.answer(&out, 416, "");
+        let out = h.answer_headers(&out, 416, &[("Content-Range", "bytes */0")], 0);
+        assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn bare_pass_holds_the_chain_reservation() {
+        // Nine rungs each drawing the four-call worst chain — player,
+        // hinted probe, redirect re-probe, fallback — would spend 36
+        // calls against the 32-call budget. The pass stops starting
+        // rungs the chain can't finish inside: rung 8 never emits,
+        // books transport weather instead of dying `budget-exceeded`
+        // mid-draw, and the mixed ladder fails retryable.
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        for i in 0..8 {
+            assert_eq!(rung_of(&out), i, "rung {i} should still emit");
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer_headers(
+                &out,
+                302,
+                &[("Location", "https://rr9.googlevideo.com/alt")],
+                0,
+            );
+            out = h.answer(&out, 416, ""); // the landed edge refuses the hint
+            out = answer_fallback_416(&mut h, &out); // the window refuses too
+        }
+        // 8 rungs × 4 calls = 32: the ninth rung's chain cannot fit,
+        // so nothing further emits — the walk is already terminal.
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "transient", "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("transport"),
+            "{out}"
+        );
     }
 
     /// Strip `contentLength` so the probe falls back to a fixed window.
@@ -3907,10 +3990,9 @@ mod tests {
             &[("Location", "https://cdn.example.com/elsewhere")],
             0,
         );
-        // The hinted probe capped on a redirect it cannot serve — the
-        // fallback window re-proves on the original edge before the
-        // rung books its verdict.
-        let out = answer_fallback_416(&mut h, &out);
+        // The hinted probe capped on a redirect it cannot serve — no
+        // fallback re-probe fires on a URL playback could never
+        // follow, so the rung books capped outright.
         assert_eq!(rung_of(&out), 1);
     }
 

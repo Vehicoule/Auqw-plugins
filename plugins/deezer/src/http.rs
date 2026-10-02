@@ -105,12 +105,31 @@ fn envelope_kind(body: &Value) -> Envelope {
     }
 }
 
+/// A sanitized rate-limit warning. The diagnostic is advisory —
+/// `rate-limit` is the contract — so weather on the log channel is
+/// swallowed, while the terminal kinds still propagate (`cancelled`
+/// is the abort signal; `permission-denied` and `invalid-response`
+/// are contract failures a log call can equally surface), and a
+/// step-protocol violation always does.
+async fn rate_warn(message: &str) -> Result<(), GuestError> {
+    match log(LogLevel::Warn, message).await {
+        Err(GuestError::Host { kind, message })
+            if matches!(
+                kind.as_str(),
+                "cancelled" | "permission-denied" | "invalid-response"
+            ) =>
+        {
+            Err(GuestError::Host { kind, message })
+        }
+        Err(GuestError::Host { .. }) => Ok(()),
+        other => other,
+    }
+}
+
 /// Emit the sanitized rate-limit diagnostic, then produce the typed
 /// error. The message never carries upstream text, bodies, or URLs.
 async fn rate_limited() -> Result<GuestError, GuestError> {
-    // A log call's failure must never displace the typed verdict —
-    // the diagnostic is advisory, `rate-limit` is the contract.
-    log(LogLevel::Warn, "deezer rate-limited").await.ok();
+    rate_warn("deezer rate-limited").await?;
     Ok(failed("rate-limit", "deezer api quota exceeded".into()))
 }
 
@@ -120,13 +139,8 @@ async fn rate_limited() -> Result<GuestError, GuestError> {
 async fn rate_limited_with_hint(resp: &HttpResponse) -> Result<GuestError, GuestError> {
     let hint = retry_after_secs(resp);
     match hint {
-        Some(r) => log(
-            LogLevel::Warn,
-            &format!("deezer rate-limited retry_after={r}"),
-        )
-        .await
-        .ok(),
-        None => log(LogLevel::Warn, "deezer rate-limited").await.ok(),
+        Some(r) => rate_warn(&format!("deezer rate-limited retry_after={r}")).await?,
+        None => rate_warn("deezer rate-limited").await?,
     };
     Ok(failed(
         "rate-limit",
