@@ -25,7 +25,7 @@ use crate::guest::{
     bad_payload, failed, is_video_id, kv_set_soft, load_visitor, looks_json, payload_keys,
     truncated_bot_check, warn,
 };
-use crate::parse::{classify_playability, has_whole_word_age, visitor_token, Playability};
+use crate::parse::{has_whole_word_age, visitor_token, Playability};
 
 const NEXT_URL: &str = "https://music.youtube.com/youtubei/v1/next?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 
@@ -1048,6 +1048,19 @@ lenient_obj!(NextPlayability {
     messages: "messages" => OptVecOpt<String>,
 });
 
+/// A refusal body's only signal: the `playabilityStatus` subtree
+/// decoded through the same lenient machinery — a 403 can carry a
+/// body the size of a normal `next` response, and a full `Value` DOM
+/// parse would re-pay the ~340 M fuel this file's typed views exist
+/// to eliminate on the error path.
+struct RefusalBody {
+    playability: OptObj<NextPlayability>,
+}
+
+lenient_obj!(RefusalBody {
+    playability: "playabilityStatus" => OptObj<NextPlayability>,
+});
+
 struct NextContext {
     visitor_data: OptStr,
 }
@@ -1924,8 +1937,8 @@ fn next_refusal(resp: &HttpResponse) -> GuestError {
         .body
         .strip_prefix(b"\xEF\xBB\xBF")
         .unwrap_or(&resp.body);
-    if let Ok(b) = serde_json::from_slice::<Value>(body) {
-        return match classify_playability(&b).0 {
+    if let Ok(b) = serde_json::from_slice::<RefusalBody>(body) {
+        return match next_playability(b.playability.as_ref()) {
             Playability::BotCheck => failed("provider-wall", "bot-check".into()),
             Playability::SignInRequired | Playability::AgeRestricted => {
                 failed("auth-required", "sign-in-required".into())
@@ -1943,41 +1956,78 @@ fn next_refusal(resp: &HttpResponse) -> GuestError {
     }
 }
 
+/// A `next` response classified once — the visitor-drop wall check
+/// and the booked outcome both read this verdict, so a response pays
+/// one typed parse, never two inside the per-entry fuel budget.
+enum NextVerdict {
+    /// A 2xx carrying a readable `next` envelope.
+    Envelope(Box<NextBody>),
+    /// The failure the response books — a 429 rate-limit, a non-2xx
+    /// refusal (`next_refusal`), or a 2xx that is not a readable
+    /// envelope.
+    Failure(GuestError),
+}
+
+/// Classify a `next` response once for the wall check and the
+/// post-loop read: a 2xx parses into the typed view and a non-2xx
+/// books its refusal outcome.
+fn classify_next(resp: &HttpResponse) -> NextVerdict {
+    match resp.status {
+        s if (200..300).contains(&s) => match serde_json::from_slice::<NextBody>(&resp.body) {
+            Ok(b) => NextVerdict::Envelope(Box::new(b)),
+            // A 2xx `next` response must be a JSON envelope — anything
+            // less is upstream breakage.
+            Err(_) => NextVerdict::Failure(failed(
+                "invalid-response",
+                "next body is not a JSON object".into(),
+            )),
+        },
+        429 => NextVerdict::Failure(failed("rate-limit", "rate-limit".into())),
+        _ => NextVerdict::Failure(next_refusal(resp)),
+    }
+}
+
+/// Is this `next` verdict the bot wall — either of its shapes: a 2xx
+/// envelope whose `playabilityStatus` is a bot-check, or a refusal
+/// booked `provider-wall` (the wall in transport form)? Replayed
+/// state is suspect under every wall shape.
+fn next_walled(verdict: &NextVerdict) -> bool {
+    match verdict {
+        NextVerdict::Envelope(b) => {
+            next_playability(b.playability.as_ref()) == Playability::BotCheck
+        }
+        NextVerdict::Failure(GuestError::Failed { kind, .. }) => kind == "provider-wall",
+        NextVerdict::Failure(_) => false,
+    }
+}
+
 /// One InnerTube `next` page. The seed asks for the video's automix
 /// queue; a panel `playlistId` naming a different queue is not this
 /// seed's radio — like the player path answering a foreign video id,
 /// it counts as unavailable rather than a substituted mix.
 pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
-    let (p, access_token) = parse_radio_payload(payload)?;
-    let visitor = load_visitor(VISITOR_KEY).await?;
-    let mut resp = match http_request(web_remix_request(
-        NEXT_URL,
-        next_body(&p),
-        visitor.as_deref(),
-        access_token.as_deref(),
-    ))
-    .await
-    {
-        Ok(r) => r,
-        Err(GuestError::Host { kind, message }) => match kind.as_str() {
-            "cancelled" | "permission-denied" | "invalid-response" => {
-                return Err(GuestError::Host { kind, message });
-            }
-            _ => return Err(failed("transient", "next transport".into())),
-        },
-        Err(e) => return Err(e),
-    };
-    // A 401 proves the token dead — retry once bare so a stale token
-    // can't wall the seed, matching the ladder's drop rule.
-    if resp.status == 401 && access_token.is_some() {
-        resp = match http_request(web_remix_request(
+    let (p, mut access_token) = parse_radio_payload(payload)?;
+    let mut visitor = load_visitor(VISITOR_KEY).await?;
+    // The sends live in one loop because two one-shot re-asks can
+    // stack: a 401 against a carried trust token drops it and re-asks
+    // bare (`take` makes it single-shot — a bare 401 falls through as
+    // the request's own refusal), and a wall verdict on a request
+    // that replayed the persisted visitor drops it and re-asks once
+    // bare — replayed state is itself suspect on a wall, and nothing
+    // else can heal a poisoned persisted visitor: a failed invocation
+    // rolls its staged writes back and the wall response carries no
+    // fresh visitorData to overwrite the key, so the burned value
+    // would re-poison every later seed and continuation the same way.
+    let mut dropped_visitor = false;
+    let verdict = 'request: loop {
+        let sent = http_request(web_remix_request(
             NEXT_URL,
             next_body(&p),
             visitor.as_deref(),
-            None,
+            access_token.as_deref(),
         ))
-        .await
-        {
+        .await;
+        let r = match sent {
             Ok(r) => r,
             Err(GuestError::Host { kind, message }) => match kind.as_str() {
                 "cancelled" | "permission-denied" | "invalid-response" => {
@@ -1987,18 +2037,30 @@ pub async fn radio_seed(payload: &Value) -> Result<Value, GuestError> {
             },
             Err(e) => return Err(e),
         };
-    }
-    match resp.status {
-        s if (200..300).contains(&s) => {}
-        429 => return Err(failed("rate-limit", "rate-limit".into())),
-        _ => return Err(next_refusal(&resp)),
-    }
-    // A 2xx `next` response must be a JSON envelope; the seed's
-    // `playabilityStatus` (when upstream sends one) is classified by
-    // the same taxonomy as the player path — a walled or unavailable
-    // seed fails honestly, never with a substituted queue.
-    let body: NextBody = serde_json::from_slice(&resp.body)
-        .map_err(|_| failed("invalid-response", "next body is not a JSON object".into()))?;
+        if r.status == 401 && access_token.take().is_some() {
+            continue 'request;
+        }
+        let verdict = classify_next(&r);
+        if visitor.is_some() && !dropped_visitor && next_walled(&verdict) {
+            dropped_visitor = true;
+            // Drop the suspect value where it can persist — the
+            // deletion is staged and commits on `done`, so a
+            // successful re-ask's fresh visitorData overwrites it
+            // and a failure leaves the key poisoned no longer.
+            kv_set_soft(VISITOR_KEY, None).await?;
+            visitor = None;
+            continue 'request;
+        }
+        break 'request verdict;
+    };
+    let body: NextBody = match verdict {
+        NextVerdict::Envelope(b) => *b,
+        NextVerdict::Failure(e) => return Err(e),
+    };
+    // The seed's `playabilityStatus` (when upstream sends one) is
+    // classified by the same taxonomy as the player path — a walled
+    // or unavailable seed fails honestly, never with a substituted
+    // queue.
     match next_playability(body.playability.as_ref()) {
         Playability::Ok => {}
         Playability::BotCheck => {
@@ -2098,11 +2160,17 @@ mod tests {
                     }
                     "kv_set" => {
                         let key = out["payload"]["key"].as_str().unwrap_or("").to_string();
-                        if let Some(v) = out["payload"]["value"]
+                        match out["payload"]["value"]
                             .as_str()
                             .and_then(|s| B64.decode(s).ok())
                         {
-                            self.committed.insert(key, v);
+                            Some(v) => {
+                                self.committed.insert(key, v);
+                            }
+                            // A staged delete clears the committed row.
+                            None => {
+                                self.committed.remove(&key);
+                            }
                         }
                         step(&json!({"type":"host_ok","id":id}))
                     }
@@ -2433,6 +2501,101 @@ mod tests {
             let out = h.answer(&out, status, body);
             assert_eq!(fail_kind(&out).0, "transient", "status {status}");
         }
+    }
+
+    /// Replayed state is suspect under every wall shape: a `next`
+    /// that walls under the persisted visitor drops it from KV and
+    /// re-asks once bare — a wall response carries no fresh
+    /// visitorData to heal the key, and a failed invocation would
+    /// roll the healing write back, so the burned value would
+    /// re-poison every later seed and suggest call the same way.
+    #[test]
+    fn wall_under_persisted_visitor_drops_and_reasks_bare() {
+        for (status, body) in [
+            // The wall in transport form.
+            (403u16, "<html><body>unusual traffic</body></html>"),
+            // The envelope wall — a 2xx bot-check or a JSON 403
+            // refusal classify the same verdict.
+            (
+                200,
+                "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}",
+            ),
+            (
+                403,
+                "{\"playabilityStatus\":{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}}",
+            ),
+        ] {
+            let mut h = Harness::new();
+            h.committed
+                .insert("visitor/web-remix".into(), b"burned-wr".to_vec());
+            let out = h.invoke(seed_payload());
+            assert_eq!(
+                header_of(&out, "X-Goog-Visitor-Id").as_deref(),
+                Some("burned-wr")
+            );
+            let out = h.answer(&out, status, body);
+            // Same `next` re-asked once bare — not booked yet — and
+            // the suspect value's deletion is staged.
+            assert_eq!(out["kind"], "http_request", "status {status}");
+            assert_eq!(header_of(&out, "X-Goog-Visitor-Id"), None);
+            assert!(!h.committed.contains_key("visitor/web-remix"));
+            let out = h.answer(&out, 200, SEED);
+            assert_eq!(out["type"], "done");
+            // A successful response's visitorData heals the key.
+            assert_eq!(
+                h.committed.get("visitor/web-remix").map(Vec::as_slice),
+                Some(b"visitor-wr-002".as_slice())
+            );
+        }
+    }
+
+    /// The bare re-ask is single-shot like the ladder's drop rule: a
+    /// wall under no replayed visitor books on first sight, and a
+    /// second wall after the drop books the same verdict instead of
+    /// looping upstream.
+    #[test]
+    fn wall_reask_is_single_shot() {
+        // No persisted visitor — the wall books immediately.
+        let mut h = Harness::new();
+        let out = h.invoke(seed_payload());
+        let out = h.answer(&out, 403, "<html>wall</html>");
+        assert_eq!(fail_kind(&out).0, "provider-wall");
+        // A wall on the bare re-ask books too — the drop is spent.
+        let mut h = Harness::new();
+        h.committed
+            .insert("visitor/web-remix".into(), b"burned-wr".to_vec());
+        let out = h.invoke(seed_payload());
+        let out = h.answer(&out, 403, "<html>wall</html>");
+        assert_eq!(out["kind"], "http_request");
+        let out = h.answer(&out, 403, "<html>wall</html>");
+        assert_eq!(fail_kind(&out).0, "provider-wall");
+        // The guest issued the delete before booking — under the real
+        // host the staged write still rolls back with the failure.
+        assert!(!h.committed.contains_key("visitor/web-remix"));
+    }
+
+    /// The refusal view classifies the same verdicts without a DOM —
+    /// a non-JSON-shaped body on a 403 (scalar JSON included) is the
+    /// wall in transport form, matching `refusal_outcome`'s
+    /// non-envelope arm on the player path.
+    #[test]
+    fn refusal_classifies_without_a_dom() {
+        for body in ["null", "123", "\"oops\""] {
+            let mut h = Harness::new();
+            let out = h.invoke(seed_payload());
+            let out = h.answer(&out, 403, body);
+            assert_eq!(fail_kind(&out).0, "provider-wall", "{body}");
+        }
+        // A refusal carrying unrelated bulk still reads its verdict
+        // — the typed view skips the bulk at tokenize time.
+        let mut h = Harness::new();
+        let out = h.invoke(seed_payload());
+        let bulk = "x".repeat(200_000);
+        let body = format!(
+            "{{\"playabilityStatus\":{{\"status\":\"LOGIN_REQUIRED\",\"reason\":\"Sign in to confirm you're not a bot\"}},\"bulk\":\"{bulk}\"}}"
+        );
+        let out = h.answer(&out, 403, &body);
+        assert_eq!(fail_kind(&out).0, "provider-wall");
     }
 
     #[test]
