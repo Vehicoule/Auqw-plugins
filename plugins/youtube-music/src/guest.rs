@@ -1440,18 +1440,14 @@ async fn finish_pick(
     // The manifest's `contentLength` is a hint, not authority: an
     // over-reported one misses the tail probe on a perfectly healthy
     // rung, and booked `Capped` it would wedge every rung the same
-    // way. A range-shaped miss — a 416, or a 206 that failed the
-    // span checks — earns ONE re-probe over the fixed fallback
-    // window: a hit means the rung serves and only the hint lied. A
-    // miss on both still books `Capped`; the verdict taxonomy is
-    // unchanged (a 429 or 5xx never re-probes — they are the rung's
-    // own weather, not a range miss).
+    // way. A hint-dependent miss — a 416, a 206 that failed the span
+    // checks, or a range-policy refusal — earns ONE re-probe over the
+    // fixed fallback window: a hit means the rung serves and only the
+    // hint lied. A miss on both still books `Capped`; the verdict
+    // taxonomy is unchanged (a 429 or 5xx never re-probes — they are
+    // the rung's own weather, not a range miss).
     let mut content_length = picked.content_length;
     let mut verdict = probe_verdict(&resp, picked.content_length);
-    // Everything else that books `Capped` is definitive — a refusal
-    // like 403 or 404, a 2xx that ignored the range, or a redirect
-    // that never resolved is the mint's own verdict, not the hint's
-    // lie, and the repair could only repeat it. The cap stands.
     if verdict == Some(RungOutcome::Capped)
         && picked.content_length.is_some()
         && fallback_worthy(&resp)
@@ -1576,14 +1572,17 @@ fn probe_start(content_length: Option<u64>) -> u64 {
 /// `Transport`, not `Capped` — server weather teaches nothing about
 /// serving. Anything else marks the mint capped and advances the
 /// ladder.
-/// Whether a hinted-probe answer is a *range* miss — the only kind
-/// the fallback window can disambiguate: a 416, or a 206 whose span
-/// failed `probe_verdict`'s checks. A refusal (403, 404, a bare 4xx)
-/// or a 2xx that ignored the range is definitive — no second window
-/// could change it — so it earns no re-probe and keeps its verdict
-/// at any budget.
+/// Whether a hinted-probe answer could be the hint's lie — the only
+/// kind the fallback window can disambiguate: a 416, a 206 whose
+/// span failed `probe_verdict`'s checks, or a 403. On googlevideo a
+/// signed URL's range policy (`range`/`rn` params) can deny an
+/// out-of-bounds hinted ask with 403 rather than 416 — the window
+/// inside the policy may still serve, so the refusal is ambiguous.
+/// A 404, a bare 2xx that ignored the range, or a redirect that
+/// never resolved is definitive — the mint's own verdict, not the
+/// hint's — and no re-probe could change it at any budget.
 fn fallback_worthy(resp: &HttpResponse) -> bool {
-    matches!(resp.status, 206 | 416)
+    matches!(resp.status, 206 | 403 | 416)
 }
 
 fn probe_verdict(resp: &HttpResponse, content_length: Option<u64>) -> Option<RungOutcome> {
@@ -2089,11 +2088,35 @@ mod tests {
         let out = begin(&mut h);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
-        // A refusal is the mint's own verdict, not a range miss — no
-        // fallback window could change it, so nothing emits a
-        // re-probe and the rung books Capped outright.
+        // A hinted-range refusal is one lie, not a verdict — an
+        // out-of-policy hinted ask can draw a 403 the in-window
+        // fallback would not, so the mint re-probes before the
+        // verdict books.
         let out = h.answer(&out, 403, "");
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
+    }
+
+    #[test]
+    fn hinted_range_refusal_fallback_hit_is_done() {
+        let mut h = Harness::new();
+        let mut out = begin(&mut h);
+        assert_eq!(rung_of(&out), 0);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        // Range-policy weather: the hinted ask rides outside the
+        // signed URL's policy and eats a 403, but the fallback window
+        // sits inside it — the rung serves, and the result reports
+        // the edge's own size evidence.
+        out = h.answer(&out, 403, "");
+        out = h.answer_headers(
+            &out,
+            206,
+            &[("Content-Range", "bytes 1048576-1099999/1100000")],
+            51424,
+        );
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["content_length"], 1100000);
     }
 
     #[test]
@@ -2348,10 +2371,32 @@ mod tests {
 
     #[test]
     fn definitive_refusal_keeps_its_cap_at_the_budget_edge() {
-        // Same two-call window, but the hinted probe's 403 is a
-        // definitive refusal — the mint's verdict, not a range miss —
-        // so no repair is owed and the cap survives intact. The ladder
-        // reports streams-capped, not transport.
+        // Same two-call window, but the hinted probe's 404 is a
+        // definitive refusal — the object is gone for every range —
+        // so no repair is owed and the cap survives intact. The
+        // ladder reports streams-capped, not transport.
+        let mut h = Harness::new();
+        let mut out = drive_to_last_rung(&mut h);
+        out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        out = h.answer(&out, 404, "");
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "transient", "{out}");
+        assert!(
+            out["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("streams-capped"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn unaffordable_refusal_repair_books_transport() {
+        // A 403 refusal is ambiguous — mint weather or range policy —
+        // so it earns the repair like any hint-dependent miss; with
+        // no call left it stands unverified: inconclusive, budget-
+        // limited weather, not a provider cap.
         let mut h = Harness::new();
         let mut out = drive_to_last_rung(&mut h);
         out = feed(&mut h, &out, OK);
@@ -2363,7 +2408,7 @@ mod tests {
             out["error"]["message"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("streams-capped"),
+                .contains("transport"),
             "{out}"
         );
     }
@@ -2729,18 +2774,19 @@ mod tests {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
         }
         // Capped mints are per-mint stochastic — each earns a redraw on
         // the second edge, mint and probe again. Pass 0 already spent
-        // 18 calls of the 32-call HTTP budget (player + hinted probe
-        // per rung — a refusal earns no re-probe), so only the redraws
-        // whose full four-call reservation still fits are emitted:
-        // six of nine.
-        for _ in 0..6 {
+        // 27 calls of the 32-call HTTP budget (player + hinted probe +
+        // fallback re-probe per rung), so only the redraws whose full
+        // four-call reservation still fits are emitted: one of nine.
+        for _ in 0..1 {
             assert!(url_of(&out).starts_with("https://youtubei.googleapis.com/"));
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
         }
         assert_eq!(
             fail_kind(&out),
@@ -2939,10 +2985,12 @@ mod tests {
     fn mint_fires_once_per_resolve() {
         let mut h = Harness::new();
         let mut out = begin(&mut h);
-        // rung 0 pick -> denied mint -> probe 403 -> rung 1.
+        // rung 0 pick -> denied mint -> probe 403 -> fallback miss ->
+        // rung 1.
         out = feed(&mut h, &out, OK);
         probe_of(&out);
         out = h.answer(&out, 403, "");
+        out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
         // rung 1 pick -> straight to probe; no second mint.
         out = feed(&mut h, &out, OK);
@@ -3566,6 +3614,7 @@ mod tests {
         // shorter than the walk books already-expired on a late rung.
         h.now = NOW + 40_000;
         let out = h.answer(&out, 403, "");
+        let out = answer_fallback_416(&mut h, &out);
         assert_eq!(rung_of(&out), 1);
         let out = feed(&mut h, &out, OK);
         probe_of(&out);
@@ -4579,18 +4628,20 @@ mod tests {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
             if rung < 8 {
                 assert_eq!(rung_of(&out), rung + 1);
             }
         }
         // The capped mints are weather: each redraws on the second
-        // edge — new mint, same refusal. Seventeen calls spent on
-        // pass 0 leaves room inside the 32-call budget for six of the
+        // edge — new mint, same refusal. Twenty-five calls spent on
+        // pass 0 leaves room inside the 32-call budget for two of the
         // eight redraws (each reserves its four-call chain).
-        for _ in 1..7usize {
+        for _ in 1..3usize {
             out = feed(&mut h, &out, OK);
             probe_of(&out);
             out = h.answer(&out, 403, "");
+            out = answer_fallback_416(&mut h, &out);
         }
         assert_eq!(
             fail_kind(&out),
