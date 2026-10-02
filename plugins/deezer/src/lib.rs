@@ -1021,13 +1021,37 @@ mod tests {
             json!({"query": "x", "limit": 10, "storefront": null,
                    "kinds": ["track", "artist"], "continuation": token}),
         );
-        let out = step(&http_ok(req_id(&out), SEARCH_ARTIST));
+        // An advancing next keeps the rail pending; track's marker
+        // rides alongside unchanged.
+        let mut page: Value = serde_json::from_str(SEARCH_ARTIST)
+            .unwrap_or_else(|_| panic!("SEARCH_ARTIST fixture is not JSON"));
+        page["next"] = json!("https://api.deezer.com/search/artist?q=x&index=4");
+        let body = serde_json::to_string(&page).unwrap_or_default();
+        let out = step(&http_ok(req_id(&out), &body));
         assert_eq!(out["type"], "done", "{out}");
         let next: Value =
             serde_json::from_str(out["result"]["continuation"].as_str().unwrap_or_default())
                 .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
-        assert_eq!(next["artist"], 2, "{next}");
+        assert_eq!(next["artist"], 4, "{next}");
         assert_eq!(next["track"], Value::Null, "{next}");
+    }
+
+    /// A `next` that can't move the offset forward ends the rail
+    /// rather than emitting a self-referential token that refetches
+    /// the same page forever.
+    #[test]
+    fn search_stuck_next_ends_the_rail() {
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["artist"], "continuation": "{\"artist\":10}"}),
+        );
+        // Empty data and a next link with no index — the fallback
+        // offset equals the current one, so the rail is done.
+        let body = r#"{"data":[],"next":"https://api.deezer.com/search/artist?q=x"}"#;
+        let out = step(&http_ok(req_id(&out), body));
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["continuation"], Value::Null);
     }
 
     /// Foreign or malformed tokens are payload errors, never a
