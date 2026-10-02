@@ -39,7 +39,7 @@ jobs:
       PLUGIN: ${{ inputs.plugin }}
       VERSION: ${{ inputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: set up scratch paths
         # runner.temp is not an allowed context in job-level env — the
@@ -60,11 +60,11 @@ jobs:
 
       # Reproduce the artifact exactly like ci.yml does — same pinned
       # toolchain, same cache, same per-crate build.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.98.0
           targets: wasm32-unknown-unknown
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: reproduce the reviewed artifact
         run: |
@@ -78,7 +78,7 @@ jobs:
           # The crate + artifact names derive from the plugin id the
           # same way tooling/build.sh derives them.
           export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot"
-          cargo build --target wasm32-unknown-unknown --release -p "auqw-$PLUGIN"
+          cargo build --locked --target wasm32-unknown-unknown --release -p "auqw-$PLUGIN"
           BUILT="target/wasm32-unknown-unknown/release/auqw_$(printf '%s' "$PLUGIN" | tr '-' '_').wasm"
           RELEASED="releases/$PLUGIN/$VERSION/$PLUGIN-$VERSION.wasm"
           test -f "$RELEASED" || { echo "release artifact $RELEASED missing" >&2; exit 1; }
@@ -86,6 +86,10 @@ jobs:
           echo "release: $(sha256sum "$RELEASED" | cut -d' ' -f1)"
           [ "$(sha256sum "$BUILT" | cut -d' ' -f1)" = "$(sha256sum "$RELEASED" | cut -d' ' -f1)" ] \
             || { echo "release wasm differs from the reviewed build — refusing to sign" >&2; exit 1; }
+          # Hand the reviewed digest to the sign step: sign.mjs's
+          # --expect-digest fails if the staged artifact is not these
+          # exact bytes.
+          echo "REVIEWED_WASM_SHA=$(sha256sum "$BUILT" | cut -d' ' -f1)" >> "$GITHUB_ENV"
 
       - name: require the shipped manifest to be the reviewed one
         run: |
@@ -97,6 +101,13 @@ jobs:
           # exact bytes; when it has moved on, the wasm check above is
           # the binding one (and already fails for a source tree that
           # no longer builds this release).
+          # A second pin lives in the Auqw repo: providers.lock.json's
+          # manifest_digest records each release manifest's sha256, and
+          # sign.mjs reports the digest it writes into provenance.json
+          # (the `sign: manifest` line / --print-manifest-digest) so the
+          # lock entry can be updated by script. This job checks out no
+          # Auqw tree, so the lock-leg comparison happens on the Auqw
+          # side, not here.
           SOURCE="plugins/$PLUGIN/manifest.json"
           RELEASED="releases/$PLUGIN/$VERSION/plugin.manifest.json"
           test -f "$SOURCE" || { echo "source manifest $SOURCE missing" >&2; exit 1; }
@@ -155,9 +166,12 @@ jobs:
               process.exit(1);
             }
           ' "$STAGE_DIR/plugin.manifest.json" "$PLUGIN" "$VERSION"
-          # --force: the release dir already exists — only provenance.json
-          # and signature are rewritten; the wasm bytes are unchanged.
-          node tooling/sign.mjs --key-file "$KEY_FILE" sign "$STAGE_DIR" --force
+          # --force: the release dir already exists — sign.mjs refuses
+          # to rewrite anything but provenance.json and signature, and
+          # --expect-digest pins the staged artifact to the reviewed
+          # build's bytes.
+          node tooling/sign.mjs --key-file "$KEY_FILE" sign "$STAGE_DIR" --force \
+            --expect-digest "sha256:$REVIEWED_WASM_SHA"
           node tooling/sign.mjs --key-file "$KEY_FILE" verify "releases/$PLUGIN/$VERSION"
 
       - name: commit the re-signed release

@@ -28,11 +28,14 @@ mint). To prove a mint is uncapped the guest must observe bytes served
   the ladder. A bare-URL fallback probe that 416s passes only when
   `Content-Range: bytes */N` shows the file ends before the ask.
 
-Probe failure advances the **ladder** (same-rung retry, then next
-rung), not the resolve — `PickOutcome::Advance(RungOutcome::Capped)`.
-The classification is the ladder's input, so it is load-bearing: a
-probe that merely checked "URL alive" would pass capped mints and the
-caller would mint sessions against URLs that die ~1 MiB in.
+Probe failure advances the **ladder** straight to the next rung, not
+the resolve — `PickOutcome::Advance(RungOutcome::Capped)`. The probe
+has no same-rung retry (its only re-ask is the single 3xx hop); the
+same-rung re-asks live on the player request — the 401 token-drop and
+the walled-visitor bare re-ask. The classification is the ladder's
+input, so it is load-bearing: a probe that merely checked "URL alive"
+would pass capped mints and the caller would mint sessions against
+URLs that die ~1 MiB in.
 
 ## Option taken
 

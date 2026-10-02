@@ -6,6 +6,12 @@
 //   tooling/sign.mjs verify <release-dir>  re-verify a signed release
 //   tooling/sign.mjs pubkey                print key_id + public PEM
 //
+// sign flags: --force re-signs an existing release (provenance.json +
+// signature only — artifact and manifest bytes can never be swapped);
+// --expect-digest <sha> pins the staged wasm to an expected digest;
+// --print-manifest-digest appends the bare manifest sha256 to stdout
+// for lock-pin scripts (the `sign: manifest` line carries it too).
+//
 // The keypair lives outside every repository (default
 // ~/.auqw/keys/auqw-ed25519.json; override with
 // --key-file <path> or AUQW_KEY_FILE). The private key is never printed.
@@ -67,6 +73,9 @@ const parseArgs = (argv) => {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--force') opts.force = true;
+    else if (a === '--print-manifest-digest') opts.printManifestDigest = true;
+    else if (a === '--expect-digest') opts.expectDigest = argv[++i] ?? fail('--expect-digest needs a digest');
+    else if (a.startsWith('--expect-digest=')) opts.expectDigest = a.slice('--expect-digest='.length);
     else if (a === '--key-file') opts.keyFile = argv[++i] ?? fail('--key-file needs a path');
     else if (a.startsWith('--key-file=')) opts.keyFile = a.slice('--key-file='.length);
     else if (a === '-h' || a === '--help') opts.help = true;
@@ -143,6 +152,22 @@ const readManifest = (pluginDir) => {
   fail(`no manifest.json or plugin.manifest.json in ${pluginDir}`);
 };
 
+// The provenance a previous sign recorded — --force needs it to prove
+// the bytes being re-signed are the ones the release already attests.
+const readReleaseProvenance = (releaseDir) => {
+  const p = join(releaseDir, 'provenance.json');
+  let prev;
+  try {
+    prev = JSON.parse(readFileSync(p, 'utf8'));
+  } catch {
+    fail(`--force needs ${p} to re-sign — it is missing or unreadable`);
+  }
+  if (typeof prev?.wasm_sha256 !== 'string' || typeof prev?.manifest_sha256 !== 'string') {
+    fail(`--force needs ${p} to record wasm_sha256 and manifest_sha256`);
+  }
+  return prev;
+};
+
 const cmdSign = (opts) => {
   const pluginDir = resolve(opts.pos[1] ?? fail('usage: tooling/sign.mjs sign <plugin-dir>'));
   const { path: manifestPath, buf: manifestBuf } = readManifest(pluginDir);
@@ -175,9 +200,38 @@ const cmdSign = (opts) => {
     fail(`manifest artifact.digest ${pinned ?? '(missing)'} != ${wasmSha} — rebuild via tooling/build.sh ${id}`);
   }
 
+  if (opts.expectDigest !== undefined) {
+    const expected = opts.expectDigest.startsWith('sha256:') ? opts.expectDigest : `sha256:${opts.expectDigest}`;
+    if (expected !== wasmSha) {
+      fail(`--expect-digest ${expected} does not match the staged artifact ${wasmSha}`);
+    }
+  }
+
   const releaseDir = join(RELEASES_DIR, id, version);
-  if (existsSync(releaseDir) && !opts.force) {
-    fail(`release ${releaseDir} already exists — releases are immutable; bump the version or pass --force`);
+  const releaseExists = existsSync(releaseDir);
+  if (releaseExists) {
+    if (!opts.force) {
+      fail(`release ${releaseDir} already exists — releases are immutable; bump the version or pass --force`);
+    }
+    // --force re-mints provenance.json + signature over the bytes the
+    // release already attests; it can never swap artifact or manifest
+    // bytes. The staged pair must hash to the recorded digests, and
+    // the files on disk must still be what was recorded.
+    const prev = readReleaseProvenance(releaseDir);
+    if (prev.wasm_sha256 !== wasmSha) {
+      fail(`--force cannot swap artifact bytes: staged wasm ${wasmSha} != recorded ${prev.wasm_sha256}`);
+    }
+    if (prev.manifest_sha256 !== manifestSha) {
+      fail(`--force cannot swap manifest bytes: staged manifest ${manifestSha} != recorded ${prev.manifest_sha256}`);
+    }
+    const releasedWasm = join(releaseDir, `${id}-${version}.wasm`);
+    if (!existsSync(releasedWasm) || sha256(readFileSync(releasedWasm)) !== prev.wasm_sha256) {
+      fail(`release wasm no longer matches recorded ${prev.wasm_sha256} — refusing to re-sign`);
+    }
+    const releasedManifest = join(releaseDir, 'plugin.manifest.json');
+    if (!existsSync(releasedManifest) || sha256(readFileSync(releasedManifest)) !== prev.manifest_sha256) {
+      fail(`release manifest no longer matches recorded ${prev.manifest_sha256} — refusing to re-sign`);
+    }
   }
 
   const { keyId, privatePem } = loadKeyFile(opts.keyFile);
@@ -198,12 +252,16 @@ const cmdSign = (opts) => {
   };
 
   mkdirSync(releaseDir, { recursive: true });
-  copyFileSync(wasmPath, join(releaseDir, `${id}-${version}.wasm`));
-  copyFileSync(manifestPath, join(releaseDir, 'plugin.manifest.json'));
+  if (!releaseExists) {
+    copyFileSync(wasmPath, join(releaseDir, `${id}-${version}.wasm`));
+    copyFileSync(manifestPath, join(releaseDir, 'plugin.manifest.json'));
+  }
   writeFileSync(join(releaseDir, 'provenance.json'), `${JSON.stringify(provenance, null, 2)}\n`);
   writeFileSync(join(releaseDir, 'signature'), `${signature.toString('base64')}\n`);
   console.log(`sign: ok — ${id} ${version} -> ${releaseDir}`);
   console.log(`sign: wasm ${wasmSha} key_id ${keyId}`);
+  console.log(`sign: manifest ${manifestSha}`);
+  if (opts.printManifestDigest) console.log(manifestSha);
 };
 
 const cmdVerify = (opts) => {
@@ -280,6 +338,10 @@ const cmdPubkey = (opts) => {
 const usage = `usage: tooling/sign.mjs <keygen|sign|verify|pubkey> [args] [--force] [--key-file <path>]
   keygen                 create the ed25519 keypair (refuses to overwrite; --force replaces)
   sign <plugin-dir>      stage + sign releases/<id>/<version>/ from dist/ + manifest.json
+                         --force re-mints provenance.json + signature over the recorded
+                           bytes only (artifact/manifest bytes are never swapped)
+                         --expect-digest <sha> requires the staged wasm to match <sha>
+                         --print-manifest-digest ends stdout with the bare manifest sha256
   verify <release-dir>   re-check digests + ed25519 signature
   pubkey                 print key_id + PEM public key
 key file: --key-file <path> or AUQW_KEY_FILE (default ${DEFAULT_KEY_FILE})`;

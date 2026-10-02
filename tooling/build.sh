@@ -16,12 +16,12 @@ wasm_name="auqw_$(printf '%s' "$plugin" | tr '-' '_').wasm"
 # onto the same prefix keeps local release builds byte-identical to CI's.
 export RUSTFLAGS="--remap-path-prefix=$(rustc --print sysroot)/lib/rustlib/src/rust=/rustc/$(rustc -vV | awk '/commit-hash/{print $2}') --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$(rustc --print sysroot)=/sysroot ${RUSTFLAGS:-}"
 
-cargo build --release --target wasm32-unknown-unknown -p "$crate"
+cargo build --locked --release --target wasm32-unknown-unknown -p "$crate"
 
 mkdir -p "plugins/${plugin}/dist"
 cp "target/wasm32-unknown-unknown/release/${wasm_name}" \
    "plugins/${plugin}/dist/${plugin}.wasm"
 
-cargo run -q -p auqw-validate -- \
+cargo run -q --locked -p auqw-validate -- \
     "plugins/${plugin}/dist/${plugin}.wasm" \
     "plugins/${plugin}/manifest.json" --update-digest
