@@ -1,0 +1,117 @@
+{
+  "responseContext": {},
+  "header": {
+    "musicDetailHeaderRenderer": {
+      "title": { "runs": [{ "text": "Dummy" }] },
+      "subtitle": {
+        "runs": [
+          { "text": "Album" },
+          { "text": " • " },
+          {
+            "text": "Portishead",
+            "navigationEndpoint": {
+              "browseEndpoint": {
+                "browseId": "UCportishead9",
+                "browseEndpointContextSupportedConfigs": {
+                  "browseEndpointContextMusicConfig": {
+                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                  }
+                }
+              }
+            }
+          },
+          { "text": " • " },
+          { "text": "1994" }
+        ]
+      },
+      "thumbnail": {
+        "croppedSquareThumbnailRenderer": {
+          "thumbnail": {
+            "thumbnails": [
+              { "url": "https://lh3.googleusercontent.com/dummy=w544-h544", "width": 544, "height": 544 }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Songs" }] },
+                      "contents": [
+                        {
+                          "playlistPanelVideoRenderer": {
+                            "videoId": "mysteron000",
+                            "title": { "runs": [{ "text": "Mysterons" }] },
+                            "shortBylineText": {
+                              "runs": [
+                                {
+                                  "text": "Portishead",
+                                  "navigationEndpoint": {
+                                    "browseEndpoint": {
+                                      "browseId": "UCportishead9",
+                                      "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                          "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            },
+                            "longBylineText": {
+                              "runs": [
+                                {
+                                  "text": "Dummy",
+                                  "navigationEndpoint": {
+                                    "browseEndpoint": {
+                                      "browseId": "MPREb_dummy",
+                                      "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                          "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            },
+                            "lengthText": { "runs": [{ "text": "5:02" }] },
+                            "thumbnail": {
+                              "thumbnails": [
+                                { "url": "https://lh3.googleusercontent.com/myst=w120-h120", "width": 120, "height": 120 }
+                              ]
+                            }
+                          }
+                        },
+                        {
+                          "playlistPanelVideoRenderer": {
+                            "videoId": "sosvideo000",
+                            "title": { "runs": [{ "text": "SOS" }] },
+                            "shortBylineText": {
+                              "runs": [{ "text": "Portishead" }]
+                            },
+                            "lengthText": { "runs": [{ "text": "5:31" }] }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

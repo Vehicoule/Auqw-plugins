@@ -1,0 +1,308 @@
+{
+  "responseContext": { "visitorData": "CgtWSVNJVE9SMQ==" },
+  "contents": {
+    "tabbedSearchResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "selected": true,
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "musicCardShelfRenderer": {
+                      "title": { "runs": [{ "text": "Top result" }] },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "UCportishead9",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                  }
+                                }
+                              }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Portishead" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      { "text": "Artist" },
+                                      { "text": " • " },
+                                      { "text": "1.2M subscribers" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ],
+                            "thumbnail": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                  "thumbnails": [
+                                    { "url": "https://lh3.googleusercontent.com/artist=w544-h544", "width": 544, "height": 544 }
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Songs" }] },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "watchEndpoint": { "videoId": "roadsvideo0" }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Roads" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      {
+                                        "text": "Portishead",
+                                        "navigationEndpoint": {
+                                          "browseEndpoint": {
+                                            "browseId": "UCportishead9",
+                                            "browseEndpointContextSupportedConfigs": {
+                                              "browseEndpointContextMusicConfig": {
+                                                "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      },
+                                      { "text": " • " },
+                                      {
+                                        "text": "Dummy",
+                                        "navigationEndpoint": {
+                                          "browseEndpoint": {
+                                            "browseId": "MPREb_dummy",
+                                            "browseEndpointContextSupportedConfigs": {
+                                              "browseEndpointContextMusicConfig": {
+                                                "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    ]
+                                  }
+                                }
+                              }
+                            ],
+                            "fixedColumns": [
+                              {
+                                "musicResponsiveListItemFixedColumnRenderer": {
+                                  "text": { "runs": [{ "text": "5:02" }] }
+                                }
+                              }
+                            ],
+                            "thumbnail": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                  "thumbnails": [
+                                    { "url": "https://lh3.googleusercontent.com/road=w120-h120", "width": 120, "height": 120 }
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "watchEndpoint": { "videoId": "sosvideo000" }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "SOS" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      { "text": "Portishead" },
+                                      { "text": " • " },
+                                      { "text": "5:31" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Albums" }] },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "MPREb_dummy",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                  }
+                                }
+                              }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Dummy" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      { "text": "Album" },
+                                      { "text": " • " },
+                                      { "text": "Portishead" },
+                                      { "text": " • " },
+                                      { "text": "1994" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ],
+                            "thumbnail": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                  "thumbnails": [
+                                    { "url": "https://lh3.googleusercontent.com/dummy=w226-h226", "width": 226, "height": 226 }
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Artists" }] },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "UCportishead9",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                  }
+                                }
+                              }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Portishead" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Artist" }] }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Community playlists" }] },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "VLPLportisheadmix",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                                  }
+                                }
+                              }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Portishead Radio" }] }
+                                }
+                              },
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": {
+                                    "runs": [
+                                      { "text": "Playlist" },
+                                      { "text": " • " },
+                                      { "text": "YouTube Music" }
+                                    ]
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Videos" }] },
+                      "contents": [
+                        {
+                          "musicResponsiveListItemRenderer": {
+                            "navigationEndpoint": {
+                              "watchEndpoint": { "videoId": "teardropvid" }
+                            },
+                            "flexColumns": [
+                              {
+                                "musicResponsiveListItemFlexColumnRenderer": {
+                                  "text": { "runs": [{ "text": "Wandering Star" }] }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

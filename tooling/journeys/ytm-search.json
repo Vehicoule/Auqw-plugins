@@ -1,0 +1,31 @@
+{
+  "name": "youtube-music catalog.search — unfiltered page yields card, rails, and tracks",
+  "plugin": "youtube-music",
+  "capability": "catalog.search",
+  "request": { "query": "portishead", "limit": 20, "storefront": null },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/search",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/catalog-search-mixed.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "top_hit": { "type": "entity", "item": { "kind": "artist", "title": "Portishead" } },
+      "entities": [
+        { "kind": "album", "title": "Dummy" },
+        { "kind": "artist", "title": "Portishead" },
+        { "kind": "playlist", "title": "Portishead Radio" }
+      ],
+      "items": [
+        { "title": "Roads", "artist_ref": { "id": "UCportishead9" } },
+        { "title": "SOS" },
+        { "title": "Wandering Star" }
+      ],
+      "continuation": null
+    },
+    "max_http_calls": 1
+  }
+}

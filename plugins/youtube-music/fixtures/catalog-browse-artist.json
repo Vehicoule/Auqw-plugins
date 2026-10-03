@@ -1,0 +1,175 @@
+{
+  "responseContext": {},
+  "header": {
+    "musicImmersiveHeaderRenderer": {
+      "title": { "runs": [{ "text": "Portishead" }] },
+      "subscriptionButton": {
+        "subscribeButtonRenderer": {
+          "subscriberCountText": { "runs": [{ "text": "1.2M subscribers" }] }
+        }
+      },
+      "thumbnail": {
+        "musicThumbnailRenderer": {
+          "thumbnail": {
+            "thumbnails": [
+              { "url": "https://lh3.googleusercontent.com/phead=w1440-h600", "width": 1440, "height": 600 }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "musicShelfRenderer": {
+                      "title": { "runs": [{ "text": "Top songs" }] },
+                      "contents": [
+                        {
+                          "playlistPanelVideoRenderer": {
+                            "videoId": "roadsvideo0",
+                            "title": { "runs": [{ "text": "Roads" }] },
+                            "shortBylineText": {
+                              "runs": [
+                                {
+                                  "text": "Portishead",
+                                  "navigationEndpoint": {
+                                    "browseEndpoint": {
+                                      "browseId": "UCportishead9",
+                                      "browseEndpointContextSupportedConfigs": {
+                                        "browseEndpointContextMusicConfig": {
+                                          "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              ]
+                            },
+                            "lengthText": { "runs": [{ "text": "5:02" }] }
+                          }
+                        },
+                        {
+                          "playlistPanelVideoRenderer": {
+                            "videoId": "gloryboxvid",
+                            "title": { "runs": [{ "text": "Glory Box" }] },
+                            "shortBylineText": {
+                              "runs": [{ "text": "Portishead" }]
+                            },
+                            "lengthText": { "runs": [{ "text": "5:06" }] }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicCarouselShelfRenderer": {
+                      "header": {
+                        "musicCarouselShelfBasicHeaderRenderer": {
+                          "title": { "runs": [{ "text": "Albums" }] }
+                        }
+                      },
+                      "contents": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "title": { "runs": [{ "text": "Dummy" }] },
+                            "subtitle": {
+                              "runs": [
+                                { "text": "Album" },
+                                { "text": " • " },
+                                { "text": "1994" }
+                              ]
+                            },
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "MPREb_dummy",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                  }
+                                }
+                              }
+                            },
+                            "thumbnailRenderer": {
+                              "musicThumbnailRenderer": {
+                                "thumbnail": {
+                                  "thumbnails": [
+                                    { "url": "https://lh3.googleusercontent.com/dummy=w226-h226", "width": 226, "height": 226 }
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicCarouselShelfRenderer": {
+                      "header": {
+                        "musicCarouselShelfBasicHeaderRenderer": {
+                          "title": { "runs": [{ "text": "Featured on" }] }
+                        }
+                      },
+                      "contents": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "title": { "runs": [{ "text": "Trip Hop Essentials" }] },
+                            "subtitle": { "runs": [{ "text": "Playlist" }] },
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "VLPLtriphop",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_PLAYLIST"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "musicCarouselShelfRenderer": {
+                      "header": {
+                        "musicCarouselShelfBasicHeaderRenderer": {
+                          "title": { "runs": [{ "text": "Fans might also like" }] }
+                        }
+                      },
+                      "contents": [
+                        {
+                          "musicTwoRowItemRenderer": {
+                            "title": { "runs": [{ "text": "Massive Attack" }] },
+                            "subtitle": { "runs": [{ "text": "Artist" }] },
+                            "navigationEndpoint": {
+                              "browseEndpoint": {
+                                "browseId": "UCmassive001",
+                                "browseEndpointContextSupportedConfigs": {
+                                  "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ARTIST"
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
