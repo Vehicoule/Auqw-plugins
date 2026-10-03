@@ -20,6 +20,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: node --test tooling/sign.test.mjs
+      - run: node tooling/feed.mjs --check
       # Remap local cargo and toolchain/sysroot paths so artifact digests
       # match manifest pins on any machine — the same export lives in
       # tooling/build.sh. Build each plugin in its own cargo invocation:

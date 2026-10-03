@@ -1,0 +1,13 @@
+{
+  "plugin": "lyrics-lrclib",
+  "version": "0.2.0",
+  "abi_version": "0.1.0",
+  "wasm_sha256": "sha256:ccbcc743769840fd8bf9f2d5a7213ba39cb30e34ad9291aef37fabc032e5bd61",
+  "manifest_sha256": "sha256:b0ba6cadbd17d59bda1ac660b7c37c8dc4596d445c217a690cde0fdf77aca586",
+  "signed_at": "2026-10-03T09:51:37.131Z",
+  "key_id": "42d8cac606f16c04",
+  "toolchain": {
+    "node": "v24.19.0",
+    "platform": "linux/x64"
+  }
+}
