@@ -303,20 +303,13 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     if !version_ok {
         return Err("manifest.version must be semver x.y.z".into());
     }
-    // abi: "0.1.0", "0.2.0", or "0.3.0"; the capability set is
-    // version-specific and revisions are immutable — a newer ABI's
-    // capabilities never become valid on an older ABI.
+    // abi: single "0.1.0" — the tier matrix existed for an installed
+    // base the prerelease never had; the one ABI serves every
+    // capability. Revisions stay immutable: a future ABI's
+    // capabilities never become valid on 0.1.0.
     let abi = field_str("abi")?;
     let allowed_caps: &[&str] = match abi {
-        "0.1.0" => &["playback.resolve"],
-        "0.2.0" => &[
-            "catalog.search",
-            "catalog.metadata",
-            "catalog.artwork",
-            "playback.resolve",
-            "playback.candidates",
-        ],
-        "0.3.0" => &[
+        "0.1.0" => &[
             "catalog.artwork",
             "catalog.entity",
             "catalog.metadata",
@@ -330,7 +323,7 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             "radio.seed",
         ],
         _ => {
-            return Err("manifest.abi must be \"0.1.0\", \"0.2.0\", or \"0.3.0\"".into());
+            return Err("manifest.abi must be \"0.1.0\"".into());
         }
     };
     // capabilities: non-empty subset of the ABI's set
@@ -346,8 +339,7 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     {
         return Err("manifest.capabilities outside the set this ABI serves".into());
     }
-    // permissions: ^(network:(\*\.)?[a-z0-9.-]+|pot-provider|kv)$ —
-    // `kv` is a 0.2 permission and forbidden on a 0.1 manifest.
+    // permissions: ^(network:(\*\.)?[a-z0-9.-]+|pot-provider|kv)$
     let perms = manifest["permissions"]
         .as_array()
         .ok_or_else(|| "manifest.permissions must be an array".to_string())?;
@@ -359,9 +351,6 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             continue;
         }
         if p == "kv" {
-            if abi == "0.1.0" {
-                return Err("manifest.permissions entry \"kv\" requires abi \"0.2.0\"".into());
-            }
             continue;
         }
         let rest = p
@@ -752,67 +741,44 @@ mod tests {
     }
 
     #[test]
-    fn abi_versions_and_capability_sets() {
+    fn abi_0_1_serves_the_full_capability_set() {
+        // The one ABI serves every capability — the tier matrix went
+        // with the installed base that never shipped.
         assert_eq!(
             check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", "[]")),
             Ok(())
         );
-        assert!(check_manifest(&manifest("0.1.0", "[\"catalog.search\"]", "[]")).is_err());
         assert_eq!(
             check_manifest(&manifest(
-                "0.2.0",
-                "[\"catalog.search\",\"playback.candidates\"]",
-                "[]"
-            )),
-            Ok(())
-        );
-        assert!(check_manifest(&manifest("0.2.0", "[\"bogus.cap\"]", "[]")).is_err());
-        // 0.3.0 adds catalog.entity, lyrics.*, radio.seed on top of 0.2.0.
-        assert_eq!(
-            check_manifest(&manifest(
-                "0.3.0",
+                "0.1.0",
                 "[\"catalog.entity\",\"catalog.search.kinds\",\"lyrics.plain\",\"lyrics.synced\",\"radio.seed\"]",
                 "[]"
             )),
             Ok(())
         );
-        assert_eq!(
-            check_manifest(&manifest("0.3.0", "[\"playback.resolve\"]", "[]")),
-            Ok(())
-        );
-        // Immutable revisions: 0.3.0 capabilities are invalid on 0.1.0/0.2.0.
-        for cap in [
-            "catalog.entity",
-            "catalog.search.kinds",
-            "lyrics.plain",
-            "lyrics.synced",
-            "radio.seed",
-        ] {
-            let caps = format!("[\"{cap}\"]");
-            assert!(check_manifest(&manifest("0.1.0", &caps, "[]")).is_err());
-            assert!(check_manifest(&manifest("0.2.0", &caps, "[]")).is_err());
-        }
-        assert!(check_manifest(&manifest("0.3.0", "[\"bogus.cap\"]", "[]")).is_err());
+        assert!(check_manifest(&manifest("0.1.0", "[\"bogus.cap\"]", "[]")).is_err());
+        // Any other abi string is refused outright.
+        assert!(check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", "[]")).is_err());
         assert!(check_manifest(&manifest("0.4.0", "[\"playback.resolve\"]", "[]")).is_err());
     }
 
     #[test]
     fn kv_and_network_permissions() {
         assert_eq!(
-            check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", "[\"kv\"]")),
+            check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", "[\"kv\"]")),
             Ok(())
         );
         assert_eq!(
             check_manifest(&manifest(
-                "0.2.0",
+                "0.1.0",
                 "[\"playback.resolve\"]",
                 "[\"pot-provider\",\"network:*.googlevideo.com\",\"kv\"]"
             )),
             Ok(())
         );
-        assert!(check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", "[\"fs\"]")).is_err());
+        assert!(check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", "[\"fs\"]")).is_err());
         assert_eq!(
-            check_manifest(&manifest("0.3.0", "[\"lyrics.plain\"]", "[\"kv\"]")),
+            check_manifest(&manifest("0.1.0", "[\"lyrics.plain\"]", "[\"kv\"]")),
             Ok(())
         );
         // Loopback literals grant only as bare literals — a wildcarded
@@ -824,19 +790,18 @@ mod tests {
             ("network:*.127.0.0.1", false),
         ] {
             let perms = format!("[\"{perm}\"]");
-            let result = check_manifest(&manifest("0.2.0", "[\"playback.resolve\"]", &perms));
+            let result = check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", &perms));
             assert_eq!(result.is_ok(), ok, "{perm}: {result:?}");
         }
     }
 
     #[test]
-    fn abi_0_1_forbids_kv_permission() {
-        assert!(check_manifest(&manifest("0.1.0", "[\"playback.resolve\"]", "[\"kv\"]")).is_err());
+    fn abi_0_1_allows_kv_and_pot_permissions() {
         assert_eq!(
             check_manifest(&manifest(
                 "0.1.0",
                 "[\"playback.resolve\"]",
-                "[\"pot-provider\",\"network:x.test\"]"
+                "[\"pot-provider\",\"network:x.test\",\"kv\"]"
             )),
             Ok(())
         );

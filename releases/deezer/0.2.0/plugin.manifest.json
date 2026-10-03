@@ -1,12 +1,11 @@
 {
   "abi": "0.1.0",
   "artifact": {
-    "digest": "sha256:a37b6276ba510f850ee688d6c269d77e58a8084b939641e3e72f6a0aa4f38611",
+    "digest": "sha256:bf50cac1d28cc8d1d3bf7a6fe7ae64445743e8a1c35575376faf523ea324b722",
     "path": "dist/deezer.wasm"
   },
   "capabilities": [
     "catalog.search",
-    "catalog.search.kinds",
     "catalog.metadata",
     "catalog.entity"
   ],
