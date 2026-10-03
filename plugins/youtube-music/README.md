@@ -2,7 +2,7 @@
 
 `playback.resolve` + `playback.candidates` + `radio.seed` +
 `catalog.suggest` + `catalog.search` + `catalog.entity` provider
-for Auqw (ABI 0.3.0), built on the vendored `auqw-guest-sdk` async
+for Auqw (ABI 0.1.0), built on the vendored `auqw-guest-sdk` async
 dispatch.
 
 ## playback.resolve
@@ -186,7 +186,7 @@ completions").
 
 Track-seeded automix over the WEB_REMIX `next` endpoint (same client
 identity, headers, and `visitor/web-remix` KV as search). The payload
-is the ABI 0.3.0 dual envelope: `{source_ref}` seeds a new mix,
+is the ABI dual envelope: `{source_ref}` seeds a new mix,
 `{continuation}` fetches the next page — exactly one of the two keys.
 
 A seed must be a `youtube-music`/`track` ref with a video id (foreign
