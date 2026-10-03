@@ -6,6 +6,19 @@ on:
   pull_request:
 
 jobs:
+  vendor-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: Vehicoule/Auqw
+          path: auqw
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      # The sibling checkout lands inside the workspace at auqw/, so the
+      # SDK source is auqw/sdk/rust (not ../auqw as in local dev).
+      - run: node tooling/vendor-check.mjs --sdk auqw/sdk/rust --check
+
   rust:
     runs-on: ubuntu-latest
     steps:

@@ -3,35 +3,35 @@
   "plugins": [
     {
       "id": "deezer",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:bf50cac1d28cc8d1d3bf7a6fe7ae64445743e8a1c35575376faf523ea324b722",
-      "manifest_sha256": "sha256:b091901b521084f4760e5a370bb5dce430ce69e753c8196cd98915c21f53a898",
-      "signature": "W9287d5Xy/jrPlViXWK+McNgoVLlqXpQWyOu/DED8SCHeMAUE1bWuERgzoEgy05e0iwSfpftv7yDUef7KLoHBg=="
+      "wasm_sha256": "sha256:b5fedd6ad67a26292cd7c275b26f039a6b069ab53b31ca2a39fd838c549c6509",
+      "manifest_sha256": "sha256:8aafa7934ebf5fbbeb0c29b37e31837dc0010f38c00686027fcf860b32a1efa2",
+      "signature": "+HV/lNbiX7e/Gt33T+eps8ZDVwH8DWxqXBRdOH6ZBjcj/gdUMwHumMlx7/G1LuYR0b+h7/MS8+NUen2+fi1EBg=="
     },
     {
       "id": "itunes",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:4461a7e3bd4dcb45d66f38c1c380947aa4aaf047e68f654fcf9fe36f19e8384c",
-      "manifest_sha256": "sha256:8a872cbbb308920c0a05762be1591829795def1a388e0817a35cecf9839d207c",
-      "signature": "EvQlvltEtWfBvERKlyGCpdQpHK2Ct24oiJrr9qsUqRIjwOG6Ogc0AxTyY3Ztt7m7Nh0Ymxs49rwJsD3l0OZ/Dg=="
+      "wasm_sha256": "sha256:29e00e11992059d8cdfa1af7d11f9fcc214dd966490d0efd64ce849f1845eba8",
+      "manifest_sha256": "sha256:da9557d7552ea5fa353d1d50c477596912d1fdc6e3beea48478d7788098a508a",
+      "signature": "d/Jko+qhdxEyuOwKw4da1BqM4xFxkpYutK25XLKEAUjj7XZAkoEapbyuNvdgrp6FpwipOGbQA8CYQQBXi8v6DA=="
     },
     {
       "id": "lyrics-lrclib",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:ccbcc743769840fd8bf9f2d5a7213ba39cb30e34ad9291aef37fabc032e5bd61",
-      "manifest_sha256": "sha256:b0ba6cadbd17d59bda1ac660b7c37c8dc4596d445c217a690cde0fdf77aca586",
-      "signature": "beHNzKMQ5Mp1K5zynC8THltUWpmSzffKgi2sSZF0ntD2W5KkU4hjpQUUdW4YqPbU7+KDs9Oa74CFoByUbpTfBw=="
+      "wasm_sha256": "sha256:8deda366dd33f1b6376a0838591e2acdbb4ef0aa040eb7a47b7b7c35cfe4800a",
+      "manifest_sha256": "sha256:891771ac041a3424dd0cae9c99d9b1c5bdea8ae23b7c049c3c7570d40d5fb3c2",
+      "signature": "CyEuoCKaSptAwzITHxOW5Y3MX3HcQs3mA3TAvU1gB8RJjndI6TePS6dORoAy09kynR+ihd69DACugMgQ2BmcBg=="
     },
     {
       "id": "youtube-music",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:1a8772ea54c31c723dab025e1f7df3f866ff5b06eb494c94b2b10ed841b87fce",
-      "manifest_sha256": "sha256:705c929c86db673610aac384c0a30fb1d6e17baed1c75e27eb3ece42c67d784e",
-      "signature": "4mEZcL8pnyIKb6BID38eTVnf3Xl7MwntAR8GoFJacZXgvHSihXevpzSf39rTyPkKFtzO8oDDB/Mqyjvcbo5CAw=="
+      "wasm_sha256": "sha256:55d72c5468ae742eda0f3bd36625df35947a862793e3122b865dc7eaa8673198",
+      "manifest_sha256": "sha256:40ac4c43133c0c27b04b539e8429574ad9787b51db6c5d740304ff6457f24c24",
+      "signature": "P4e4gRhMmG46kaZpyfOKIePMJrdy18HCD+Ux93fPWAs7wzGxKVCoHjmrbR6bFNcDQy4zkjeOoXpeUL8QjXGHBw=="
     }
   ]
 }

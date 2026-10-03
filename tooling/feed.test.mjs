@@ -7,7 +7,7 @@
 // Run: node --test tooling/feed.test.mjs   (from the repo root)
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -32,6 +32,22 @@ const run = (cwd) =>
     encoding: 'utf8',
   });
 
+// The feed inspects each plugin's highest-semver release dir, so drift
+// cases mutate that dir — a hardcoded version stops being covered the
+// moment a newer release lands.
+const latestRelease = (id) => {
+  const versions = readdirSync(join(ROOT, 'releases', id)).filter((v) =>
+    /^\d+\.\d+\.\d+$/.test(v),
+  );
+  const key = (v) => v.split('.').map(Number);
+  versions.sort((a, b) => {
+    const [ka, kb] = [key(a), key(b)];
+    for (let i = 0; i < 3; i += 1) if (ka[i] !== kb[i]) return ka[i] - kb[i];
+    return 0;
+  });
+  return versions.at(-1);
+};
+
 test('feed check passes on the intact tree', () => {
   const r = run(ROOT);
   assert.equal(r.status, 0, r.stderr);
@@ -40,7 +56,8 @@ test('feed check passes on the intact tree', () => {
 test('feed check refuses wasm digest drift', () => {
   const repo = repoCopy();
   try {
-    const wasmPath = join(repo, 'releases', 'deezer', '0.2.0', 'deezer-0.2.0.wasm');
+    const v = latestRelease('deezer');
+    const wasmPath = join(repo, 'releases', 'deezer', v, `deezer-${v}.wasm`);
     const bytes = readFileSync(wasmPath);
     bytes[bytes.length - 1] ^= 0xff;
     writeFileSync(wasmPath, bytes);
@@ -55,7 +72,7 @@ test('feed check refuses wasm digest drift', () => {
 test('feed check refuses manifest digest drift', () => {
   const repo = repoCopy();
   try {
-    const manifestPath = join(repo, 'releases', 'deezer', '0.2.0', 'plugin.manifest.json');
+    const manifestPath = join(repo, 'releases', 'deezer', latestRelease('deezer'), 'plugin.manifest.json');
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     manifest.description = 'tampered after signing';
     writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
