@@ -373,13 +373,14 @@ fn kind_of_shelf_title(t: &str) -> Option<&'static str> {
 
 /// The `sectionListRenderer.contents` array wherever the response
 /// nests it (tab wrapper shapes differ between search and browse).
-fn section_list(body: &Value) -> Vec<&Value> {
+/// `None` means the body carried no recognizable results container
+/// at all — a present-but-empty array is a legitimate empty page.
+fn section_list(body: &Value) -> Option<Vec<&Value>> {
     let mut nodes = 0usize;
     find_key(body, "sectionListRenderer", 0, &mut nodes)
         .and_then(|s| s.get("contents"))
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
-        .unwrap_or_default()
 }
 
 /// Every `musicShelfRenderer` / `musicCarouselShelfRenderer` in the
@@ -627,19 +628,9 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
         )
         .await?
         {
-            Section::Body(body) => {
-                if section_list(&body).is_empty() {
-                    // A 200 body that isn't a results page — `{}` or
-                    // an error envelope is invalid-response, never
-                    // a clean zero-result search.
-                    failures = 1;
-                    first_failure = Some(failed(
-                        "invalid-response",
-                        "search body carried no results sections".into(),
-                    ));
-                    warn("ytm search body carried no results sections").await?;
-                } else {
-                    for s in section_list(&body) {
+            Section::Body(body) => match section_list(&body) {
+                Some(sections) => {
+                    for s in sections {
                         if let Some(card) =
                             s.get("musicCardShelfRenderer").and_then(Value::as_object)
                         {
@@ -653,7 +644,18 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
                         }
                     }
                 }
-            }
+                // A 200 body that isn't a results page — `{}` or an
+                // error envelope is invalid-response, never a clean
+                // zero-result search.
+                None => {
+                    failures = 1;
+                    first_failure = Some(failed(
+                        "invalid-response",
+                        "search body carried no results section".into(),
+                    ));
+                    warn("ytm search body carried no results section").await?;
+                }
+            },
             Section::Degraded(e) => {
                 failures = 1;
                 first_failure = Some(e);
@@ -672,23 +674,14 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
             )
             .await?
             {
-                Section::Body(body) => {
-                    if section_list(&body).is_empty() {
-                        failures += 1;
-                        if first_failure.is_none() {
-                            first_failure = Some(failed(
-                                "invalid-response",
-                                "search body carried no results sections".into(),
-                            ));
-                        }
-                        warn("ytm search body carried no results sections").await?;
-                    } else {
+                Section::Body(body) => match section_list(&body) {
+                    Some(sections) => {
                         // Each scoped ask caps at the request's own
                         // limit — a shared cap would let an earlier
                         // kind starve the later ones.
                         let mut kind_items = Vec::new();
                         let mut kind_entities = Vec::new();
-                        for s in section_list(&body) {
+                        for s in sections {
                             for (_title, contents) in shelves_of(&[s]) {
                                 fold_rows(
                                     &contents,
@@ -703,7 +696,17 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
                         items.extend(kind_items);
                         entities.extend(kind_entities);
                     }
-                }
+                    None => {
+                        failures += 1;
+                        if first_failure.is_none() {
+                            first_failure = Some(failed(
+                                "invalid-response",
+                                "search body carried no results section".into(),
+                            ));
+                        }
+                        warn("ytm search body carried no results section").await?;
+                    }
+                },
                 Section::Degraded(e) => {
                     failures += 1;
                     if first_failure.is_none() {
@@ -855,7 +858,7 @@ pub async fn entity(payload: &Value) -> Result<Value, GuestError> {
 
     let mut items: Vec<Value> = Vec::new();
     let mut related: Vec<Value> = Vec::new();
-    for (title, contents) in shelves_of(&section_list(&body)) {
+    for (title, contents) in shelves_of(&section_list(&body).unwrap_or_default()) {
         match r.0.as_str() {
             "artist" => {
                 // Top-songs shelf → items; carousels → related rails.
@@ -946,6 +949,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     const SEARCH_MIXED: &str = include_str!("../fixtures/catalog-search-mixed.json");
+    const SEARCH_EMPTY: &str = include_str!("../fixtures/search-empty.json");
     const SEARCH_ALBUMS: &str = include_str!("../fixtures/catalog-search-albums.json");
     const BROWSE_ALBUM: &str = include_str!("../fixtures/catalog-browse-album.json");
     const BROWSE_ARTIST: &str = include_str!("../fixtures/catalog-browse-artist.json");
@@ -1351,6 +1355,31 @@ mod tests {
         let out = h.answer(&out, 200, "{}");
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "invalid-response");
+    }
+
+    #[test]
+    fn honest_empty_search_page_is_done_not_failure() {
+        // A present-but-empty results container is a legitimate "no
+        // matches" page — the same shape candidates' search-empty
+        // fixture uses — not a malformed body.
+        let mut h = Harness::new();
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "x", "limit": 10, "storefront": null }),
+        );
+        let out = h.answer(&out, 200, SEARCH_EMPTY);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["items"], json!([]));
+        assert_eq!(out["result"]["entities"], json!([]));
+        // Scoped asks hold the same verdict — every kind's page was
+        // valid, just empty, so nothing failed.
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "x", "limit": 10, "storefront": null,
+                    "kinds": ["track"] }),
+        );
+        let out = h.answer(&out, 200, SEARCH_EMPTY);
+        assert_eq!(out["type"], "done");
     }
 
     #[test]
