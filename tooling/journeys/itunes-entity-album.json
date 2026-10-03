@@ -1,0 +1,44 @@
+{
+  "name": "itunes catalog.entity — album page is a song lookup",
+  "plugin": "itunes",
+  "capability": "catalog.entity",
+  "request": {
+    "ref": { "provider": "itunes", "kind": "album", "id": "1440760837" }
+  },
+  "upstreams": [
+    {
+      "url_contains": "entity=song",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/lookup-album.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "entity": {
+        "kind": "album",
+        "title": "Dummy",
+        "subtitle": "Portishead"
+      },
+      "items": [
+        {
+          "title": "Mysterons",
+          "artist": "Portishead",
+          "album": "Dummy",
+          "album_ref": {
+            "provider": "itunes",
+            "kind": "album",
+            "id": "1440760837"
+          },
+          "artist_ref": {
+            "provider": "itunes",
+            "kind": "artist",
+            "id": "2893557"
+          }
+        }
+      ],
+      "complete": true
+    },
+    "max_http_calls": 1
+  }
+}

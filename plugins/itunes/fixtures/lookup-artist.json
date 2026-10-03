@@ -1,0 +1,14 @@
+{
+  "resultCount": 1,
+  "results": [
+    {
+      "wrapperType": "artist",
+      "artistType": "Artist",
+      "artistName": "Portishead",
+      "artistLinkUrl": "https://music.apple.com/us/artist/portishead/2893557",
+      "artistId": 2893557,
+      "primaryGenreName": "Electronic",
+      "primaryGenreId": 7
+    }
+  ]
+}

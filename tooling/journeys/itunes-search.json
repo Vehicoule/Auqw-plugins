@@ -1,17 +1,40 @@
 {
-  "name": "itunes catalog.search — mixed results",
+  "name": "itunes catalog.search — mixed results with entity rails",
   "plugin": "itunes",
   "capability": "catalog.search",
   "request": { "query": "portishead", "limit": 10, "storefront": null },
   "upstreams": [
     {
-      "url_contains": "itunes.apple.com/search",
+      "url_contains": "entity=musicArtist",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/search-artist.json"
+    },
+    {
+      "url_contains": "entity=album",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/search-album.json"
+    },
+    {
+      "url_contains": "entity=song",
       "status": 200,
       "body_file": "../../plugins/itunes/fixtures/search-mixed.json"
     }
   ],
   "expect": {
     "result": "ok",
-    "max_http_calls": 1
+    "result_subset": {
+      "entities": [
+        {
+          "source_ref": { "provider": "itunes", "kind": "artist", "id": "2893557" },
+          "kind": "artist",
+          "title": "Portishead"
+        }
+      ],
+      "top_hit": {
+        "type": "entity",
+        "item": { "kind": "artist", "title": "Portishead" }
+      }
+    },
+    "max_http_calls": 3
   }
 }
