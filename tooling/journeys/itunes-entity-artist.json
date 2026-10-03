@@ -1,0 +1,60 @@
+{
+  "name": "itunes catalog.entity — artist page with discography rail",
+  "plugin": "itunes",
+  "capability": "catalog.entity",
+  "request": {
+    "ref": { "provider": "itunes", "kind": "artist", "id": "2893557" }
+  },
+  "upstreams": [
+    {
+      "url_contains": "entity=song",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/lookup-artist-songs.json"
+    },
+    {
+      "url_contains": "entity=album",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/lookup-artist-albums.json"
+    },
+    {
+      "url_contains": "lookup?id=2893557",
+      "status": 200,
+      "body_file": "../../plugins/itunes/fixtures/lookup-artist.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "entity": {
+        "kind": "artist",
+        "title": "Portishead",
+        "subtitle": "Electronic"
+      },
+      "items": [
+        {
+          "title": "Roads",
+          "artist": "Portishead",
+          "artist_ref": {
+            "provider": "itunes",
+            "kind": "artist",
+            "id": "2893557"
+          }
+        }
+      ],
+      "related": [
+        {
+          "kind": "album",
+          "title": "Dummy",
+          "group": "discography",
+          "source_ref": {
+            "provider": "itunes",
+            "kind": "album",
+            "id": "1440760837"
+          }
+        }
+      ],
+      "complete": true
+    },
+    "max_http_calls": 3
+  }
+}

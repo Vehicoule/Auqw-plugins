@@ -1,12 +1,13 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:8af785b5686b7d90c181169fec67cce138d5572193a0d024a2f80c269a177422",
+    "digest": "sha256:49247f9dc785f36ef09d3d456c5ef1f79c788556c29c783661975be57bddcd3b",
     "path": "dist/itunes.wasm"
   },
   "capabilities": [
     "catalog.search",
     "catalog.metadata",
+    "catalog.entity",
     "catalog.artwork"
   ],
   "id": "itunes",

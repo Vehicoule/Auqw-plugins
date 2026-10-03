@@ -1,0 +1,30 @@
+{
+  "resultCount": 3,
+  "results": [
+    {
+      "wrapperType": "artist",
+      "artistType": "Artist",
+      "artistName": "Portishead",
+      "artistLinkUrl": "https://music.apple.com/us/artist/portishead/2893557",
+      "artistId": 2893557,
+      "primaryGenreName": "Electronic",
+      "primaryGenreId": 7
+    },
+    {
+      "wrapperType": "artist",
+      "artistType": "Artist",
+      "artistName": "The Portis Heads",
+      "artistLinkUrl": "https://music.apple.com/us/artist/x/900001",
+      "artistId": 900001,
+      "primaryGenreName": "Tribute",
+      "primaryGenreId": 99
+    },
+    {
+      "wrapperType": "artist",
+      "artistType": "Artist",
+      "artistName": "Portis",
+      "artistLinkUrl": "https://music.apple.com/us/artist/y/900002",
+      "artistId": 900002
+    }
+  ]
+}
