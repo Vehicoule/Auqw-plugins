@@ -973,14 +973,18 @@ mod tests {
         );
         // Entities across the rails; the Videos shelf's row is a
         // playable track like the Songs shelf's.
-        let entities = result["entities"].as_array().unwrap();
+        let Some(entities) = result["entities"].as_array() else {
+            panic!("entities array");
+        };
         assert_eq!(entities.len(), 3);
         assert_eq!(entities[0]["kind"], "album");
         assert_eq!(entities[0]["title"], "Dummy");
         assert_eq!(entities[0]["subtitle"], "Album • Portishead • 1994");
         assert_eq!(entities[1]["kind"], "artist");
         assert_eq!(entities[2]["kind"], "playlist");
-        let items = result["items"].as_array().unwrap();
+        let Some(items) = result["items"].as_array() else {
+            panic!("items array");
+        };
         assert_eq!(items.len(), 3);
         assert_eq!(items[0]["title"], "Roads");
         assert_eq!(
@@ -1003,16 +1007,18 @@ mod tests {
         );
         assert_eq!(out["kind"], "http_request");
         let body = B64
-            .decode(out["payload"]["body"].as_str().unwrap())
-            .unwrap();
+            .decode(out["payload"]["body"].as_str().unwrap_or(""))
+            .unwrap_or_default();
         assert!(String::from_utf8_lossy(&body).contains(ALBUMS_PARAMS));
         let out = h.answer(&out, 200, SEARCH_ALBUMS);
         let result = &out["result"];
-        let entities = result["entities"].as_array().unwrap();
+        let Some(entities) = result["entities"].as_array() else {
+            panic!("entities array");
+        };
         assert_eq!(entities.len(), 2);
         assert_eq!(entities[0]["source_ref"]["id"], "MPREb_dummy");
         assert_eq!(entities[1]["source_ref"]["id"], "MPREb_third");
-        assert_eq!(result["items"].as_array().unwrap().len(), 0);
+        assert_eq!(result["items"].as_array().map(Vec::len), Some(0));
         // Case-folded title match is the scoped hero.
         assert_eq!(result["top_hit"]["type"], "entity");
         assert_eq!(result["top_hit"]["item"]["title"], "Dummy");
@@ -1028,13 +1034,13 @@ mod tests {
         );
         assert_eq!(out["kind"], "http_request");
         let body = B64
-            .decode(out["payload"]["body"].as_str().unwrap())
-            .unwrap();
+            .decode(out["payload"]["body"].as_str().unwrap_or(""))
+            .unwrap_or_default();
         assert!(String::from_utf8_lossy(&body).contains(SONGS_PARAMS));
         let out = h.answer(&out, 200, SEARCH_ALBUMS);
         let result = &out["result"];
-        assert_eq!(result["items"].as_array().unwrap().len(), 0);
-        assert_eq!(result["entities"].as_array().unwrap().len(), 0);
+        assert_eq!(result["items"].as_array().map(Vec::len), Some(0));
+        assert_eq!(result["entities"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]
@@ -1080,10 +1086,13 @@ mod tests {
                              "id": "MPREb_dummy" } }),
         );
         assert_eq!(out["kind"], "http_request");
-        assert!(out["payload"]["url"].as_str().unwrap().contains("/browse?"));
+        assert!(out["payload"]["url"]
+            .as_str()
+            .unwrap_or("")
+            .contains("/browse?"));
         let body = B64
-            .decode(out["payload"]["body"].as_str().unwrap())
-            .unwrap();
+            .decode(out["payload"]["body"].as_str().unwrap_or(""))
+            .unwrap_or_default();
         assert!(String::from_utf8_lossy(&body).contains("\"MPREb_dummy\""));
         let out = h.answer(&out, 200, BROWSE_ALBUM);
         assert_eq!(out["type"], "done");
@@ -1091,7 +1100,9 @@ mod tests {
         assert_eq!(result["entity"]["kind"], "album");
         assert_eq!(result["entity"]["title"], "Dummy");
         assert_eq!(result["entity"]["subtitle"], "Portishead • 1994");
-        let items = result["items"].as_array().unwrap();
+        let Some(items) = result["items"].as_array() else {
+            panic!("items array");
+        };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["title"], "Mysterons");
         assert_eq!(items[0]["artist_ref"]["id"], "UCportishead9");
@@ -1113,10 +1124,14 @@ mod tests {
         let result = &out["result"];
         assert_eq!(result["entity"]["kind"], "artist");
         assert_eq!(result["entity"]["title"], "Portishead");
-        let items = result["items"].as_array().unwrap();
+        let Some(items) = result["items"].as_array() else {
+            panic!("items array");
+        };
         assert_eq!(items.len(), 2);
         assert_eq!(items[0]["title"], "Roads");
-        let related = result["related"].as_array().unwrap();
+        let Some(related) = result["related"].as_array() else {
+            panic!("related array");
+        };
         assert_eq!(related.len(), 3);
         assert_eq!(related[0]["kind"], "album");
         assert_eq!(related[0]["title"], "Dummy");
@@ -1141,7 +1156,7 @@ mod tests {
         let result = &out["result"];
         assert_eq!(result["entity"]["kind"], "playlist");
         assert_eq!(result["entity"]["title"], "This Is Portishead");
-        assert_eq!(result["items"].as_array().unwrap().len(), 2);
+        assert_eq!(result["items"].as_array().map(Vec::len), Some(2));
     }
 
     #[test]
