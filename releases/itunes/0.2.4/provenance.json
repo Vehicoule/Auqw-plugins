@@ -1,0 +1,13 @@
+{
+  "plugin": "itunes",
+  "version": "0.2.4",
+  "abi_version": "0.3.0",
+  "wasm_sha256": "sha256:192ed4fdf1c9fa3a5b821ac21733f33bf26ebe13b2416ef3bcfe90d4406af2e2",
+  "manifest_sha256": "sha256:3c8d1d7277578d52f69e5bbe667bd5b5108e58520a94273be6810089233156a4",
+  "signed_at": "2026-10-03T00:57:40.807Z",
+  "key_id": "42d8cac606f16c04",
+  "toolchain": {
+    "node": "v24.19.0",
+    "platform": "linux/x64"
+  }
+}
