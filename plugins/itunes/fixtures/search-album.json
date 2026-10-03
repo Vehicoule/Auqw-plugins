@@ -1,0 +1,52 @@
+{
+  "resultCount": 3,
+  "results": [
+    {
+      "wrapperType": "collection",
+      "collectionType": "Album",
+      "artistId": 2893557,
+      "collectionId": 1440760837,
+      "artistName": "Portishead",
+      "collectionName": "Dummy",
+      "collectionCensoredName": "Dummy",
+      "artistViewUrl": "https://music.apple.com/us/artist/portishead/2893557",
+      "collectionViewUrl": "https://music.apple.com/us/album/dummy/1440760837",
+      "artworkUrl60": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/60x60bb.jpg",
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/100x100bb.jpg",
+      "collectionExplicitness": "notExplicit",
+      "trackCount": 11,
+      "country": "USA",
+      "currency": "USD",
+      "releaseDate": "1994-08-22T07:00:00Z",
+      "primaryGenreName": "Electronic"
+    },
+    {
+      "wrapperType": "collection",
+      "collectionType": "Album",
+      "artistId": 2893557,
+      "collectionId": 1440760901,
+      "artistName": "Portishead",
+      "collectionName": "Portishead",
+      "collectionCensoredName": "Portishead",
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/aa/bb/cc/source/100x100bb.jpg",
+      "collectionExplicitness": "explicit",
+      "trackCount": 10,
+      "country": "USA",
+      "releaseDate": "1997-09-30T07:00:00Z",
+      "primaryGenreName": "Electronic"
+    },
+    {
+      "wrapperType": "collection",
+      "collectionType": "Album",
+      "artistId": 2893557,
+      "collectionId": 1440760999,
+      "artistName": "Portishead",
+      "collectionName": "Third",
+      "collectionExplicitness": "notExplicit",
+      "trackCount": 11,
+      "country": "USA",
+      "releaseDate": "2008-04-28T07:00:00Z",
+      "primaryGenreName": "Electronic"
+    }
+  ]
+}

@@ -17,6 +17,10 @@ pub struct Track {
     pub artwork100: Option<String>,
     pub explicit: Option<bool>,
     pub genre: Option<String>,
+    /// Upstream `artistId`/`collectionId` — mint the entity refs the
+    /// track rows carry for artist/album pages.
+    pub artist_id: Option<String>,
+    pub collection_id: Option<String>,
 }
 
 fn bad(m: &str) -> GuestError {
@@ -39,23 +43,45 @@ const URL_MAX_CHARS: usize = 2048;
 /// `Number.MAX_SAFE_INTEGER`.
 const MAX_SAFE_MS: u64 = 9_007_199_254_740_991;
 
-/// Parse the `results` array of an iTunes body. Non-song rows and
-/// rows with a zero/missing id or empty name drop out; a non-JSON,
-/// non-object, or `results`-less body is `invalid-response`.
+/// Parse the `results` array of an iTunes body into its raw rows —
+/// search and lookup pages mix `wrapperType`s (the looked-up entity
+/// heads a lookup page), so callers pick a mapper per row kind. A
+/// non-JSON, non-object, or `results`-less body is `invalid-response`.
 ///
 /// # Errors
 /// [`GuestError::Failed`] kind `invalid-response` on malformed input.
-pub fn parse_tracks(body: &[u8]) -> Result<Vec<Track>, GuestError> {
+pub fn parse_rows(body: &[u8]) -> Result<Vec<Value>, GuestError> {
     let v: Value = serde_json::from_slice(body).map_err(|_| bad("body is not JSON"))?;
     let results = v
         .as_object()
         .and_then(|o| o.get("results"))
         .and_then(Value::as_array)
         .ok_or_else(|| bad("results missing or not an array"))?;
-    Ok(results.iter().filter_map(track_of).collect())
+    Ok(results.clone())
 }
 
-fn track_of(row: &Value) -> Option<Track> {
+/// Parse the `results` array keeping only song rows — rows with a
+/// zero/missing id or empty name drop out.
+///
+/// # Errors
+/// [`GuestError::Failed`] kind `invalid-response` on malformed input.
+pub fn parse_tracks(body: &[u8]) -> Result<Vec<Track>, GuestError> {
+    Ok(parse_rows(body)?.iter().filter_map(track_of).collect())
+}
+
+/// The body's declared `resultCount` — a declaration that can exceed
+/// the rows actually delivered, which is what makes it a second
+/// honest-completeness signal next to the request limit.
+pub fn result_count(body: &[u8]) -> Option<u64> {
+    let v: Value = serde_json::from_slice(body).ok()?;
+    v.as_object()
+        .and_then(|o| o.get("resultCount"))
+        .and_then(Value::as_u64)
+}
+
+/// A song row (`wrapperType`=`track`/`kind`=`song`), or `None` for
+/// entity rows and under-formed tracks.
+pub fn track_of(row: &Value) -> Option<Track> {
     let o = row.as_object()?;
     if let Some(w) = o.get("wrapperType").and_then(Value::as_str) {
         if w != "track" {
@@ -100,6 +126,8 @@ fn track_of(row: &Value) -> Option<Track> {
         artwork100,
         explicit,
         genre: str_field(o, "primaryGenreName"),
+        artist_id: id_field(o, "artistId"),
+        collection_id: id_field(o, "collectionId"),
     })
 }
 
@@ -112,7 +140,13 @@ fn str_field(o: &Map<String, Value>, key: &str) -> Option<String> {
 }
 
 fn track_id(o: &Map<String, Value>) -> Option<String> {
-    let v = o.get("trackId")?;
+    id_field(o, "trackId")
+}
+
+/// A nonzero upstream id field as a string, accepting the JSON
+/// number or the equivalent digit string.
+fn id_field(o: &Map<String, Value>, key: &str) -> Option<String> {
+    let v = o.get(key)?;
     let id = v
         .as_u64()
         .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))?;
@@ -147,7 +181,8 @@ pub fn artwork_ref(track: &Track, size: u64) -> Option<Value> {
     }))
 }
 
-/// The `trackMetadata` wire value for one track.
+/// The `trackMetadata` wire value for one track. `artist_ref`/
+/// `album_ref` ride the upstream ids — `null` when the row omits them.
 pub fn to_metadata(track: &Track, storefront: Option<&str>, artwork_size: u64) -> Value {
     let artwork: Vec<Value> = artwork_ref(track, artwork_size).into_iter().collect();
     serde_json::json!({
@@ -165,7 +200,96 @@ pub fn to_metadata(track: &Track, storefront: Option<&str>, artwork_size: u64) -
         "explicit": track.explicit,
         "genre": track.genre,
         "storefront": storefront,
+        "artist_ref": entity_ref("artist", &track.artist_id),
+        "album_ref": entity_ref("album", &track.collection_id),
     })
+}
+
+fn entity_ref(kind: &str, id: &Option<String>) -> Value {
+    match id {
+        Some(id) => serde_json::json!({
+            "provider": "itunes",
+            "kind": kind,
+            "id": id,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// `entityMetadata` for a `collection` row (`entity=album` searches
+/// and the leading row of an album lookup) — `group` only when the
+/// row lands on an entity page's `related` shelf.
+pub fn collection_of(row: &Value, group: Option<&str>) -> Option<Value> {
+    let o = row.as_object()?;
+    if o.get("wrapperType").and_then(Value::as_str) != Some("collection") {
+        return None;
+    }
+    let id = id_field(o, "collectionId")?;
+    let title = str_field(o, "collectionName")?;
+    let artwork = o
+        .get("artworkUrl100")
+        .and_then(Value::as_str)
+        .filter(|u| u.starts_with("https://"))
+        .and_then(|u| artwork_url(u, SEARCH_ENTITY_ARTWORK))
+        .into_iter()
+        .map(|(url, dim)| serde_json::json!({ "url": url, "width": dim, "height": dim }))
+        .collect::<Vec<Value>>();
+    let mut v = serde_json::json!({
+        "source_ref": { "provider": "itunes", "kind": "album", "id": id },
+        "kind": "album",
+        "title": title,
+        "subtitle": str_field(o, "artistName"),
+        "artwork": artwork,
+    });
+    if let Some(g) = group {
+        v["group"] = Value::from(g);
+    }
+    Some(v)
+}
+
+/// `entityMetadata` for an `artist` row — the public API serves no
+/// artist artwork, so the card carries an honest empty list.
+pub fn artist_of(row: &Value, group: Option<&str>) -> Option<Value> {
+    let o = row.as_object()?;
+    if o.get("wrapperType").and_then(Value::as_str) != Some("artist") {
+        return None;
+    }
+    let id = id_field(o, "artistId")?;
+    let title = str_field(o, "artistName")?;
+    let mut v = serde_json::json!({
+        "source_ref": { "provider": "itunes", "kind": "artist", "id": id },
+        "kind": "artist",
+        "title": title,
+        "subtitle": str_field(o, "primaryGenreName"),
+        "artwork": [],
+    });
+    if let Some(g) = group {
+        v["group"] = Value::from(g);
+    }
+    Some(v)
+}
+
+/// Entity rail artwork size — same substitution rule as track art.
+const SEARCH_ENTITY_ARTWORK: u64 = 600;
+
+/// Rewrite the `100x100bb` size segment to `size` — mirrors
+/// `artwork_ref`'s rule and cap for entity rows.
+fn artwork_url(url: &str, size: u64) -> Option<(String, Value)> {
+    let (url, dim) = match url.rfind("100x100bb") {
+        Some(i) => (
+            format!(
+                "{}{size}x{size}bb{}",
+                &url[..i],
+                &url[i + "100x100bb".len()..]
+            ),
+            Value::from(size),
+        ),
+        None => (url.to_string(), Value::Null),
+    };
+    if url.chars().count() > URL_MAX_CHARS {
+        return None;
+    }
+    Some((url, dim))
 }
 
 /// First-seen-wins dedup. A later row is a duplicate iff it repeats an
@@ -222,6 +346,8 @@ mod tests {
             artwork100: None,
             explicit,
             genre: None,
+            artist_id: None,
+            collection_id: None,
         }
     }
 

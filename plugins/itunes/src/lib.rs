@@ -1,10 +1,16 @@
-//! iTunes catalog guest: `catalog.search`, `catalog.metadata`, and
-//! `catalog.artwork` over the public keyless JSON API (ABI 0.2.0).
+//! iTunes catalog guest: `catalog.search`, `catalog.metadata`,
+//! `catalog.entity`, and `catalog.artwork` over the public keyless
+//! JSON API (ABI 0.2.0).
 //!
 //! The guest returns raw provider metadata as `trackMetadata` —
 //! version labels and candidate scoring are the application's job.
 //! `previewUrl` is never emitted: a 30-second preview is not the
-//! recording.
+//! recording. Search emits `entities` rails (artist/album rows) and a
+//! tagged `top_hit`; entity pages come from `lookup` — an album page
+//! is its tracklist, an artist page carries top songs plus a
+//! discography rail under `related`. The public API serves no
+//! playlists and no paging — `continuation` is always null and a
+//! playlist ref is `not-applicable`.
 
 mod encode;
 mod http;
@@ -12,11 +18,23 @@ mod parse;
 
 use std::collections::BTreeMap;
 
-use auqw_guest_sdk::{export_plugin, GuestError, GuestFuture, Invocation};
+use auqw_guest_sdk::{export_plugin, log, GuestError, GuestFuture, Invocation, LogLevel};
 use serde_json::{json, Map, Value};
 
 const API: &str = "https://itunes.apple.com";
 const SEARCH_ARTWORK_SIZE: u64 = 1200;
+/// Result kinds the guest serves, in fetch order — the track backbone
+/// leads, then the entity rails. `playlist` is contract-valid but the
+/// public API serves none, so it filters to an honest zero rows.
+const SEARCH_KINDS: &[&str] = &["track", "artist", "album"];
+/// Entity rails cap in a mixed query; explicit `kinds` asks get the
+/// request's own `limit`.
+const ENTITY_MIX_LIMIT: u64 = 10;
+/// Section sizes for the artist composite page.
+const ARTIST_SONGS_LIMIT: u64 = 50;
+const ARTIST_ALBUMS_LIMIT: u64 = 200;
+/// Album pages ask for the whole tracklist in one lookup.
+const ALBUM_TRACKS_LIMIT: u64 = 200;
 
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
@@ -24,6 +42,7 @@ fn dispatch(inv: Invocation) -> GuestFuture {
             "catalog.search" => search(&inv.payload).await,
             "catalog.metadata" => metadata(&inv.payload).await,
             "catalog.artwork" => artwork(&inv.payload).await,
+            "catalog.entity" => entity(&inv.payload).await,
             other => Err(failed(
                 "not-applicable",
                 format!("capability {other} not supported"),
@@ -45,17 +64,39 @@ fn bad_payload(m: &str) -> GuestError {
     failed("invalid-response", format!("payload: {m}"))
 }
 
+/// Log channel failure is weather — `warn` swallows Host kinds and
+/// still propagates terminal errors, mirroring `rate_warn` in http.rs.
+async fn warn(message: &str) -> Result<(), GuestError> {
+    match log(LogLevel::Warn, message).await {
+        Err(e) if terminal(&e) => Err(e),
+        Err(GuestError::Host { .. }) => Ok(()),
+        other => other,
+    }
+}
+
 /// The payload/ref object must contain exactly `keys` — missing
 /// fields or extras are `invalid-response`.
 fn payload_obj<'a>(
     payload: &'a Value,
     keys: &[&str],
 ) -> Result<&'a Map<String, Value>, GuestError> {
+    payload_obj_opt(payload, keys, &[])
+}
+
+/// Like `payload_obj`, but `optional` keys may be absent; keys outside
+/// the union still reject. The host never emits an optional key as
+/// `null` — a present-but-null optional is `invalid-response` in the
+/// same spirit as an unanticipated key.
+fn payload_obj_opt<'a>(
+    payload: &'a Value,
+    keys: &[&str],
+    optional: &[&str],
+) -> Result<&'a Map<String, Value>, GuestError> {
     let obj = payload
         .as_object()
         .ok_or_else(|| bad_payload("must be an object"))?;
     for k in obj.keys() {
-        if !keys.contains(&k.as_str()) {
+        if !keys.contains(&k.as_str()) && !optional.contains(&k.as_str()) {
             return Err(bad_payload("unexpected key"));
         }
     }
@@ -64,13 +105,33 @@ fn payload_obj<'a>(
             return Err(bad_payload("missing key"));
         }
     }
+    for k in optional {
+        if obj.get(*k) == Some(&Value::Null) {
+            return Err(bad_payload("optional key must be absent, not null"));
+        }
+    }
     Ok(obj)
 }
 
-/// A well-formed `sourceRef` for this provider, or a typed rejection:
-/// foreign-but-shaped refs are `not-applicable`, malformed ones are
-/// `invalid-response`. Returned id is the validated `trackId` digits.
+/// A well-formed track `sourceRef` for this provider — the validated
+/// `trackId` digits. Foreign-but-shaped refs are `not-applicable`,
+/// malformed ones `invalid-response`.
 fn itunes_ref(v: &Value) -> Result<String, GuestError> {
+    Ok(itunes_ref_kind(v, &["track"])?.1)
+}
+
+/// A well-formed `entityRef` for `catalog.entity` — `(kind, id)` for
+/// an `album`/`artist` ref. A `playlist` ref is `not-applicable`: the
+/// public API serves no playlist entity.
+fn entity_ref(v: &Value) -> Result<(String, String), GuestError> {
+    itunes_ref_kind(v, &["album", "artist"])
+}
+
+/// Ref validation shared by track and entity refs: the provider must
+/// be `itunes` and `kind` one of `kinds`, else `not-applicable`; a
+/// malformed object or id is `invalid-response`. The returned id is
+/// the validated digit string.
+fn itunes_ref_kind(v: &Value, kinds: &[&str]) -> Result<(String, String), GuestError> {
     let o = payload_obj(v, &["provider", "kind", "id"])?;
     let provider = o["provider"]
         .as_str()
@@ -81,10 +142,10 @@ fn itunes_ref(v: &Value) -> Result<String, GuestError> {
     let id = o["id"]
         .as_str()
         .ok_or_else(|| bad_payload("ref.id must be a string"))?;
-    if provider != "itunes" || kind != "track" {
+    if provider != "itunes" || !kinds.contains(&kind) {
         return Err(failed(
             "not-applicable",
-            "ref is not an itunes track ref".into(),
+            format!("ref is not an itunes {} ref", kinds.join("/")),
         ));
     }
     // The id becomes a URL query segment: ASCII digits only, in u64
@@ -96,7 +157,7 @@ fn itunes_ref(v: &Value) -> Result<String, GuestError> {
         None
     };
     match parsed {
-        Some(n) if n > 0 => Ok(id.to_string()),
+        Some(n) if n > 0 => Ok((kind.to_string(), id.to_string())),
         _ => Err(bad_payload("ref.id must be ASCII digits > 0")),
     }
 }
@@ -112,7 +173,11 @@ fn storefront_of(obj: &Map<String, Value>) -> Result<Option<String>, GuestError>
 }
 
 async fn search(payload: &Value) -> Result<Value, GuestError> {
-    let obj = payload_obj(payload, &["query", "limit", "storefront"])?;
+    let obj = payload_obj_opt(
+        payload,
+        &["query", "limit", "storefront"],
+        &["kinds", "continuation"],
+    )?;
     let query = obj["query"]
         .as_str()
         .map(str::trim)
@@ -132,23 +197,306 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
         .clamp(1, 200);
     let storefront = storefront_of(obj)?;
 
-    let mut url = format!(
-        "{API}/search?term={}&media=music&entity=song&limit={limit}",
-        encode::percent_encode(&query)
-    );
-    if let Some(sf) = &storefront {
-        url.push_str(&format!("&country={sf}"));
+    // `kinds` absent asks for everything the provider serves; a
+    // present array is validated against the contract enum — the
+    // public API serves no `playlist`, so the kind fetches nothing.
+    let kinds: Vec<&str> = match obj.get("kinds") {
+        None => SEARCH_KINDS.to_vec(),
+        Some(Value::Array(list)) if !list.is_empty() => {
+            let mut wanted = Vec::with_capacity(list.len());
+            for k in list {
+                let k = k
+                    .as_str()
+                    .ok_or_else(|| bad_payload("kinds entries must be strings"))?;
+                if !["track", "artist", "album", "playlist"].contains(&k) {
+                    return Err(bad_payload("kinds entry is not a search kind"));
+                }
+                if !wanted.contains(&k) {
+                    wanted.push(k);
+                }
+            }
+            SEARCH_KINDS
+                .iter()
+                .copied()
+                .filter(|k| wanted.contains(k))
+                .collect()
+        }
+        Some(_) => return Err(bad_payload("kinds must be a nonempty array")),
+    };
+    // iTunes search has no paging — this guest never emits a
+    // continuation, so a present one is a foreign token.
+    if let Some(v) = obj.get("continuation") {
+        if !v.is_string() {
+            return Err(bad_payload("continuation must be a string"));
+        }
+        return Err(bad_payload("continuation is not a valid token"));
+    }
+    // In a mixed ask the entity rails cap at ENTITY_MIX_LIMIT; an
+    // explicit `kinds` ask hands every kind the request's own limit.
+    let scoped = obj.contains_key("kinds");
+
+    let mut items: Vec<Value> = Vec::new();
+    let mut entities: Vec<Value> = Vec::new();
+    let mut first_failure: Option<GuestError> = None;
+    let mut fetched = 0usize;
+    let mut failures = 0usize;
+    let q = encode::percent_encode(&query);
+    let country = storefront
+        .as_deref()
+        .map(|sf| format!("&country={sf}"))
+        .unwrap_or_default();
+
+    for kind in &kinds {
+        fetched += 1;
+        let page = if *kind == "track" || scoped {
+            limit
+        } else {
+            ENTITY_MIX_LIMIT
+        };
+        let entity = match *kind {
+            "track" => "song",
+            "artist" => "musicArtist",
+            _ => "album",
+        };
+        let url =
+            format!("{API}/search?term={q}&media=music&entity={entity}&limit={page}{country}");
+        let rows = match http::get_json(&url).await {
+            Ok(http::Outcome::Body(body)) => match parse::parse_rows(&body) {
+                Ok(rows) => {
+                    match *kind {
+                        "track" => {
+                            let tracks =
+                                parse::dedup(rows.iter().filter_map(parse::track_of).collect());
+                            items.extend(tracks.iter().map(|t| {
+                                parse::to_metadata(t, storefront.as_deref(), SEARCH_ARTWORK_SIZE)
+                            }));
+                        }
+                        "artist" => {
+                            entities.extend(rows.iter().filter_map(|r| parse::artist_of(r, None)))
+                        }
+                        _ => entities
+                            .extend(rows.iter().filter_map(|r| parse::collection_of(r, None))),
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            },
+            Ok(http::Outcome::NotFound) => Err(failed(
+                "transient",
+                format!("itunes {kind} search status 404"),
+            )),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = rows {
+            if terminal(&e) {
+                return Err(e);
+            }
+            // Section weather: the rail is simply absent — iTunes has
+            // no continuation to retry it through.
+            failures += 1;
+            if first_failure.is_none() {
+                first_failure = Some(e);
+            }
+            warn("itunes search section unavailable").await?;
+        }
+    }
+    // Every fetched kind failing is a failure, not an empty page.
+    if fetched > 0 && failures == fetched {
+        return Err(first_failure.unwrap_or_else(|| failed("transient", "itunes search".into())));
     }
 
-    match http::get_json(&url).await? {
-        http::Outcome::NotFound => Err(failed("transient", "itunes search status 404".into())),
-        http::Outcome::Body(body) => {
-            let items: Vec<Value> = parse::dedup(parse::parse_tracks(&body)?)
-                .iter()
-                .map(|t| parse::to_metadata(t, storefront.as_deref(), SEARCH_ARTWORK_SIZE))
-                .collect();
-            Ok(json!({ "items": items, "storefront": storefront }))
+    Ok(json!({
+        "items": items,
+        "entities": entities,
+        "top_hit": top_hit(&query, &entities, &items),
+        "continuation": Value::Null,
+        "storefront": storefront,
+    }))
+}
+
+/// The hero card: the first rail entity whose title is an exact
+/// case-folded match of the query — artists first by fetch order —
+/// else a track that matches, else `null`.
+fn top_hit(query: &str, entities: &[Value], items: &[Value]) -> Value {
+    let q = query.trim().to_lowercase();
+    if let Some(e) = entities
+        .iter()
+        .find(|e| e["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
+    {
+        return json!({ "type": "entity", "item": e });
+    }
+    items
+        .iter()
+        .find(|t| t["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
+        .map(|t| json!({ "type": "track", "item": t }))
+        .unwrap_or(Value::Null)
+}
+
+async fn entity(payload: &Value) -> Result<Value, GuestError> {
+    let obj = payload_obj(payload, &["ref"])?;
+    let (kind, id) = entity_ref(&obj["ref"])?;
+    match kind.as_str() {
+        "album" => album_entity(&id).await,
+        _ => artist_entity(&id).await,
+    }
+}
+
+/// `lookup?id=<collection>&entity=song` returns the collection row
+/// first, then every song row — no continuation exists.
+async fn album_entity(id: &str) -> Result<Value, GuestError> {
+    let url = format!("{API}/lookup?id={id}&entity=song&limit={ALBUM_TRACKS_LIMIT}");
+    let body = match http::get_json(&url).await? {
+        http::Outcome::NotFound => {
+            return Err(failed("no-result", format!("itunes album {id} not found")));
         }
+        http::Outcome::Body(body) => body,
+    };
+    let rows = parse::parse_rows(&body)?;
+    let entity = match rows.iter().find_map(|r| parse::collection_of(r, None)) {
+        Some(e) if e["source_ref"]["id"].as_str() == Some(id) => e,
+        _ => {
+            return Err(failed("no-result", format!("itunes album {id} not found")));
+        }
+    };
+    let tracks: Vec<parse::Track> = rows.iter().filter_map(parse::track_of).collect();
+    let items: Vec<Value> = tracks
+        .iter()
+        .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE))
+        .collect();
+    let complete = section_complete(rows.len(), &body, ALBUM_TRACKS_LIMIT);
+    Ok(json!({
+        "entity": entity,
+        "items": items,
+        "complete": complete,
+    }))
+}
+
+/// The artist composite: `lookup?id=<artist>` carries the artist row;
+/// `entity=song`/`entity=album` lookups carry the page's sections.
+/// A section that fails degrades `complete` to `false` — its rows are
+/// left empty, never fabricated.
+async fn artist_entity(id: &str) -> Result<Value, GuestError> {
+    let url = format!("{API}/lookup?id={id}");
+    let body = match http::get_json(&url).await? {
+        http::Outcome::NotFound => {
+            return Err(failed("no-result", format!("itunes artist {id} not found")));
+        }
+        http::Outcome::Body(body) => body,
+    };
+    let rows = parse::parse_rows(&body)?;
+    let entity = match rows.iter().find_map(|r| parse::artist_of(r, None)) {
+        Some(e) if e["source_ref"]["id"].as_str() == Some(id) => e,
+        _ => {
+            return Err(failed("no-result", format!("itunes artist {id} not found")));
+        }
+    };
+
+    let mut items: Vec<Value> = Vec::new();
+    let mut related: Vec<Value> = Vec::new();
+    let mut complete = true;
+
+    // Top-tracks section: the lookup's leading artist row is skipped
+    // by `track_of` on its own.
+    let songs = format!("{API}/lookup?id={id}&entity=song&limit={ARTIST_SONGS_LIMIT}");
+    match section(&songs).await? {
+        Section::Body(body) => match parse::parse_rows(&body) {
+            Ok(rows) => {
+                items.extend(
+                    rows.iter()
+                        .filter_map(parse::track_of)
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE)),
+                );
+                if !section_complete(rows.len(), &body, ARTIST_SONGS_LIMIT) {
+                    complete = false;
+                }
+            }
+            Err(_) => {
+                complete = false;
+                warn("itunes artist songs section unavailable").await?;
+            }
+        },
+        Section::Degraded => {
+            complete = false;
+            warn("itunes artist songs section unavailable").await?;
+        }
+    }
+
+    // Discography rail — collection rows ride `related`, never items.
+    let albums = format!("{API}/lookup?id={id}&entity=album&limit={ARTIST_ALBUMS_LIMIT}");
+    match section(&albums).await? {
+        Section::Body(body) => match parse::parse_rows(&body) {
+            Ok(rows) => {
+                related.extend(
+                    rows.iter()
+                        .filter_map(|r| parse::collection_of(r, Some("discography"))),
+                );
+                if !section_complete(rows.len(), &body, ARTIST_ALBUMS_LIMIT) {
+                    complete = false;
+                }
+            }
+            Err(_) => {
+                complete = false;
+                warn("itunes artist albums section unavailable").await?;
+            }
+        },
+        Section::Degraded => {
+            complete = false;
+            warn("itunes artist albums section unavailable").await?;
+        }
+    }
+
+    Ok(json!({
+        "entity": entity,
+        "items": items,
+        "related": related,
+        "complete": complete,
+    }))
+}
+
+/// One section's honesty check: `complete` only when the body came in
+/// under the request's own limit AND no declared `resultCount` says
+/// more rows existed than arrived — at-cap may have more upstream,
+/// and a declared count past the delivered rows is missing data.
+fn section_complete(rows: usize, body: &[u8], limit: u64) -> bool {
+    rows < limit as usize && parse::result_count(body).is_none_or(|c| c <= rows as u64)
+}
+
+/// The result of a composite-page section fetch.
+enum Section {
+    /// A parseable 2xx body (not necessarily well-shaped inside).
+    Body(Vec<u8>),
+    /// The section is unavailable: not-found, upstream weather, or a
+    /// malformed/empty response.
+    Degraded,
+}
+
+/// Fetch one page section. Terminal host failures
+/// (`cancelled`/`permission-denied`/`invalid-response`) and step
+/// protocol violations propagate; every other failure — including a
+/// guest-side `rate-limit`/`transient` verdict — is a degraded
+/// section the caller flags `complete:false`.
+async fn section(url: &str) -> Result<Section, GuestError> {
+    match http::get_json(url).await {
+        Ok(http::Outcome::Body(v)) => Ok(Section::Body(v)),
+        Ok(http::Outcome::NotFound) => Ok(Section::Degraded),
+        Err(e) if terminal(&e) => Err(e),
+        Err(_) => Ok(Section::Degraded),
+    }
+}
+
+/// Errors a partial page must not swallow: host-declared terminal
+/// kinds and step-protocol violations. Everything else is weather on
+/// one section of a composite page.
+fn terminal(e: &GuestError) -> bool {
+    match e {
+        GuestError::Host { kind, .. } => matches!(
+            kind.as_str(),
+            "cancelled" | "permission-denied" | "invalid-response"
+        ),
+        GuestError::InvalidResponse(_) => true,
+        GuestError::Failed { .. } => false,
     }
 }
 
@@ -219,6 +567,12 @@ mod tests {
     const EMPTY: &str = include_str!("../fixtures/search-empty.json");
     const MALFORMED: &str = include_str!("../fixtures/search-malformed.json");
     const LOOKUP: &str = include_str!("../fixtures/lookup.json");
+    const SEARCH_ARTIST: &str = include_str!("../fixtures/search-artist.json");
+    const SEARCH_ALBUM: &str = include_str!("../fixtures/search-album.json");
+    const LOOKUP_ALBUM: &str = include_str!("../fixtures/lookup-album.json");
+    const LOOKUP_ARTIST: &str = include_str!("../fixtures/lookup-artist.json");
+    const LOOKUP_ARTIST_SONGS: &str = include_str!("../fixtures/lookup-artist-songs.json");
+    const LOOKUP_ARTIST_ALBUMS: &str = include_str!("../fixtures/lookup-artist-albums.json");
 
     fn step(input: &Value) -> Value {
         let out =
@@ -260,12 +614,60 @@ mod tests {
             .unwrap_or_else(|| panic!("result.items not an array: {out}"))
     }
 
+    fn entities_of(out: &Value) -> &Vec<Value> {
+        out["result"]["entities"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.entities not an array: {out}"))
+    }
+
+    fn related_of(out: &Value) -> &Vec<Value> {
+        out["result"]["related"]
+            .as_array()
+            .unwrap_or_else(|| panic!("result.related not an array: {out}"))
+    }
+
     /// Invoke `catalog.search` and return the emitted `http_request`.
     fn search_request(payload: Value) -> Value {
         let out = invoke("catalog.search", payload);
         assert_eq!(out["type"], "host_request", "{out}");
         assert_eq!(out["kind"], "http_request", "{out}");
         out
+    }
+
+    /// Feed `respond(request)` to every emitted `http_request` until a
+    /// terminal output (`done`/`fail`), acking `log` calls and
+    /// collecting their messages. Bounded so a guest that never
+    /// settles fails the test instead of hanging it.
+    fn drive(out: Value, mut respond: impl FnMut(&Value) -> Value) -> (Value, Vec<String>) {
+        let mut logs = Vec::new();
+        let mut out = out;
+        for _ in 0..32 {
+            match (out["type"].as_str(), out["kind"].as_str()) {
+                (Some("host_request"), Some("http_request")) => {
+                    out = step(&respond(&out));
+                }
+                (Some("host_request"), Some("log")) => {
+                    if let Some(m) = out["payload"]["message"].as_str() {
+                        logs.push(m.to_string());
+                    }
+                    out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
+                }
+                _ => return (out, logs),
+            }
+        }
+        panic!("drive exceeded its step budget: {out}")
+    }
+
+    /// The search fixture a typed entity endpoint answers with.
+    fn search_section(req: &Value) -> &'static str {
+        let url = req["payload"]["url"].as_str().unwrap_or_default();
+        if url.contains("entity=musicArtist") {
+            SEARCH_ARTIST
+        } else if url.contains("entity=album") {
+            SEARCH_ALBUM
+        } else {
+            MIXED
+        }
     }
 
     #[test]
@@ -317,20 +719,55 @@ mod tests {
         assert_eq!(out["error"]["kind"], "invalid-response");
     }
 
+    /// A kinds-absent ask fetches track + artist + album rails in one
+    /// pass; entity rows land under `entities`, an exact title match
+    /// is the tagged hero, and track rows carry their entity refs.
     #[test]
     fn search_mixed_fixture_filters_and_maps() {
-        let req = search_request(json!({"query": "x", "limit": 10, "storefront": "US"}));
-        let out = step(&http_ok(req_id(&req), MIXED));
+        let req = search_request(json!({"query": "portishead", "limit": 10, "storefront": "US"}));
+        let (out, _) = drive(step(&http_ok(req_id(&req), MIXED)), |req| {
+            http_ok(req_id(req), search_section(req))
+        });
         assert_eq!(out["type"], "done", "{out}");
         let items = items_of(&out);
         // music-video and zero-id rows dropped; four songs survive.
         assert_eq!(items.len(), 4, "{items:?}");
         assert_eq!(out["result"]["storefront"], "US");
 
+        // Rails: artists first by fetch order, then albums.
+        let entities = entities_of(&out);
+        assert_eq!(entities.len(), 6, "{entities:?}");
+        assert_eq!(entities[0]["kind"], "artist");
+        assert_eq!(entities[0]["title"], "Portishead");
+        assert_eq!(entities[0]["source_ref"]["id"], "2893557");
+        assert_eq!(entities[0]["artwork"], json!([]));
+        assert_eq!(entities[3]["kind"], "album");
+        assert_eq!(entities[3]["title"], "Dummy");
+        assert_eq!(entities[3]["subtitle"], "Portishead");
+        assert!(
+            entities[3]["artwork"][0]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("600x600bb"),
+            "{entities:?}"
+        );
+        // The exact-title artist is the tagged hero.
+        let hit = &out["result"]["top_hit"];
+        assert_eq!(hit["type"], "entity");
+        assert_eq!(hit["item"]["source_ref"]["id"], "2893557");
+        assert_eq!(out["result"]["continuation"], Value::Null);
+
         let first = &items[0];
         assert_eq!(first["title"], "Roads");
         assert_eq!(first["artist"], "Portishead");
         assert_eq!(first["album"], "Dummy");
+        // Upstream ids mint the entity refs.
+        assert_eq!(first["artist_ref"]["kind"], "artist");
+        assert_eq!(first["artist_ref"]["id"], "2893557");
+        assert_eq!(first["album_ref"]["kind"], "album");
+        assert_eq!(first["album_ref"]["id"], "1440760837");
+        // Rows without upstream ids emit honest null refs.
+        assert_eq!(items[1]["artist_ref"], Value::Null, "{items:?}");
         assert_eq!(first["duration_ms"], 307_013);
         assert_eq!(first["release_year"], 1994);
         assert_eq!(first["explicit"], false);
@@ -370,7 +807,9 @@ mod tests {
 
     #[test]
     fn search_duplicates_collapse_only_true_dupes() {
-        let req = search_request(json!({"query": "song", "limit": 50, "storefront": null}));
+        let req = search_request(
+            json!({"query": "song", "limit": 50, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_ok(req_id(&req), DUPLICATES));
         assert_eq!(out["type"], "done", "{out}");
         let items = items_of(&out);
@@ -401,25 +840,142 @@ mod tests {
 
     #[test]
     fn search_empty_is_done_with_no_items() {
-        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        let req = search_request(
+            json!({"query": "x", "limit": 5, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_ok(req_id(&req), EMPTY));
         assert_eq!(out["type"], "done", "{out}");
         assert!(items_of(&out).is_empty());
     }
 
+    /// A `track`-only kinds ask keeps the single-call shape; a
+    /// malformed body is the one section's failure — all sections
+    /// failing is the invocation's `invalid-response`.
     #[test]
     fn malformed_body_is_invalid_response() {
         for body in [MALFORMED, "not json {"] {
-            let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
-            let out = step(&http_ok(req_id(&req), body));
+            let req = search_request(
+                json!({"query": "x", "limit": 5, "storefront": null, "kinds": ["track"]}),
+            );
+            // The section warn rides before the fail.
+            let (out, logs) = drive(step(&http_ok(req_id(&req), body)), |_| {
+                panic!("no further request expected")
+            });
             assert_eq!(out["type"], "fail", "{body}");
             assert_eq!(out["error"]["kind"], "invalid-response", "{body}");
+            assert!(
+                logs.iter().any(|m| m.contains("section unavailable")),
+                "{logs:?}"
+            );
+        }
+    }
+
+    /// Under a mixed ask one rail's weather never sinks the page —
+    /// the failed section is simply absent and the rest delivers.
+    #[test]
+    fn search_section_weather_degrades_a_rail_not_the_page() {
+        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        let mut calls = 0usize;
+        let (out, logs) = drive(step(&http_status(req_id(&req), 500, &[])), |req| {
+            calls += 1;
+            http_ok(req_id(req), search_section(req))
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(calls, 2, "the two healthy sections still fetch");
+        assert!(items_of(&out).is_empty());
+        assert_eq!(entities_of(&out).len(), 6);
+        assert!(
+            logs.iter().any(|m| m.contains("section unavailable")),
+            "{logs:?}"
+        );
+    }
+
+    /// Every fetched section failing is a failure, not an empty page.
+    #[test]
+    fn search_all_sections_fail_is_typed_failure() {
+        let mut out = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        for _ in 0..3 {
+            assert_eq!(out["kind"], "http_request", "{out}");
+            out = step(&http_status(req_id(&out), 500, &[]));
+            // Acks the section-warn log between requests.
+            assert_eq!(out["kind"], "log", "{out}");
+            out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
+        }
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "transient", "{out}");
+    }
+
+    /// `kinds` scopes the ask: one endpoint, the request's own limit.
+    #[test]
+    fn search_kinds_scopes_to_one_call() {
+        let req = search_request(
+            json!({"query": "portishead", "limit": 7, "storefront": "us", "kinds": ["album"]}),
+        );
+        let url = req["payload"]["url"].as_str().unwrap_or_default();
+        assert!(url.contains("entity=album"), "{url}");
+        assert!(url.contains("limit=7"), "{url}");
+        assert!(url.contains("country=US"), "{url}");
+        let (out, _) = drive(step(&http_ok(req_id(&req), SEARCH_ALBUM)), |_| {
+            panic!("no further request expected")
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(entities_of(&out).len(), 3);
+        assert!(entities_of(&out).iter().all(|e| e["kind"] == "album"));
+        assert!(items_of(&out).is_empty());
+    }
+
+    /// `playlist` is contract-valid but unservable — it fetches
+    /// nothing and delivers an honest empty page.
+    #[test]
+    fn search_playlist_kind_is_honest_empty() {
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 5, "storefront": null, "kinds": ["playlist"]}),
+        );
+        assert_eq!(out["type"], "done", "{out}");
+        assert!(items_of(&out).is_empty());
+        assert!(entities_of(&out).is_empty());
+        assert_eq!(out["result"]["top_hit"], Value::Null);
+    }
+
+    /// iTunes never emits a continuation — a present one is a foreign
+    /// token, and a non-string one is malformed.
+    #[test]
+    fn search_continuation_is_invalid_response() {
+        for cont in [json!("tok"), json!(5), json!({"a":1})] {
+            let out = invoke(
+                "catalog.search",
+                json!({"query": "x", "limit": 5, "storefront": null, "continuation": cont}),
+            );
+            assert_eq!(out["type"], "fail", "{cont}");
+            assert_eq!(out["error"]["kind"], "invalid-response", "{cont}");
+        }
+    }
+
+    /// `kinds` shape errors are payload errors before any request.
+    #[test]
+    fn search_kinds_shape_is_validated() {
+        for kinds in [
+            json!([]),
+            json!("album"),
+            json!([5]),
+            json!(["genre"]),
+            json!(["album", "bogus"]),
+        ] {
+            let out = invoke(
+                "catalog.search",
+                json!({"query": "x", "limit": 5, "storefront": null, "kinds": kinds}),
+            );
+            assert_eq!(out["type"], "fail", "{kinds}");
+            assert_eq!(out["error"]["kind"], "invalid-response", "{kinds}");
         }
     }
 
     #[test]
     fn rate_limit_logs_then_fails() {
-        let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
+        let req = search_request(
+            json!({"query": "x", "limit": 1, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
         // The retry hint rides both the diagnostic log and the fail
         // message — the message is the only channel back to the app.
@@ -428,7 +984,11 @@ mod tests {
         let msg = out["payload"]["message"].as_str().unwrap_or_default();
         assert!(msg.contains("retry_after=30"), "{msg}");
         assert!(!msg.contains("http"), "{msg}");
-        let out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
+        // The lone section's rate-limit is the invocation's failure.
+        let (out, _) = drive(
+            step(&json!({"type": "host_ok", "id": req_id(&out)})),
+            |_| panic!("no further request expected"),
+        );
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "rate-limit");
         assert_eq!(
@@ -442,13 +1002,17 @@ mod tests {
         // The log channel's own failure must never displace the typed
         // verdict: the warn request answered `host_error` still leaves
         // `rate-limit`, not the channel's `transient`.
-        let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
+        let req = search_request(
+            json!({"query": "x", "limit": 1, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
         assert_eq!(out["kind"], "log", "{out}");
         let out = step(&json!({
             "type": "host_error", "id": req_id(&out),
             "error": {"kind": "transient", "message": "log channel down"},
         }));
+        // The section warn rides before the verdict.
+        let (out, _) = drive(out, |_| panic!("no further request expected"));
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "rate-limit", "{out}");
     }
@@ -457,7 +1021,9 @@ mod tests {
     fn cancelled_log_call_propagates_over_rate_limit() {
         // Terminal kinds outrank the typed verdict: `cancelled` is the
         // abort signal, never a rate-limit.
-        let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
+        let req = search_request(
+            json!({"query": "x", "limit": 1, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
         assert_eq!(out["kind"], "log", "{out}");
         let out = step(&json!({
@@ -471,8 +1037,12 @@ mod tests {
     #[test]
     fn server_and_other_errors_are_transient() {
         for status in [500_u16, 503, 418] {
-            let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-            let out = step(&http_status(req_id(&req), status, &[]));
+            let req = search_request(
+                json!({"query": "x", "limit": 1, "storefront": null, "kinds": ["track"]}),
+            );
+            let (out, _) = drive(step(&http_status(req_id(&req), status, &[])), |_| {
+                panic!("no further request expected")
+            });
             assert_eq!(out["type"], "fail", "{status}");
             assert_eq!(out["error"]["kind"], "transient", "{status}");
         }
@@ -480,9 +1050,239 @@ mod tests {
 
     #[test]
     fn search_404_is_transient() {
-        let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_status(req_id(&req), 404, &[]));
+        let req = search_request(
+            json!({"query": "x", "limit": 1, "storefront": null, "kinds": ["track"]}),
+        );
+        let (out, _) = drive(step(&http_status(req_id(&req), 404, &[])), |_| {
+            panic!("no further request expected")
+        });
         assert_eq!(out["error"]["kind"], "transient");
+    }
+
+    /// An album page is a `lookup` whose leading collection row is
+    /// the entity and whose track rows are the items.
+    #[test]
+    fn entity_album_page_is_lookup_backed() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "album", "id": "1440760837"}}),
+        );
+        assert_eq!(out["kind"], "http_request", "{out}");
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert!(url.starts_with("https://itunes.apple.com/lookup?"), "{url}");
+        assert!(url.contains("id=1440760837"), "{url}");
+        assert!(url.contains("entity=song"), "{url}");
+
+        let (out, _) = drive(step(&http_ok(req_id(&out), LOOKUP_ALBUM)), |_| {
+            panic!("no further request expected")
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["entity"]["kind"], "album");
+        assert_eq!(out["result"]["entity"]["title"], "Dummy");
+        assert_eq!(out["result"]["entity"]["subtitle"], "Portishead");
+        assert!(
+            out["result"]["entity"]["artwork"][0]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("600x600bb"),
+            "{out}"
+        );
+        let items = items_of(&out);
+        assert_eq!(items.len(), 4, "{items:?}");
+        assert_eq!(items[0]["title"], "Mysterons");
+        assert_eq!(items[0]["album_ref"]["id"], "1440760837");
+        assert_eq!(items[0]["artist_ref"]["id"], "2893557");
+        // resultCount 5 = collection row + 4 songs — complete.
+        assert_eq!(out["result"]["complete"], true);
+        assert_eq!(out["result"]["continuation"], Value::Null);
+    }
+
+    /// An artist page is three lookups: the artist row plus top-songs
+    /// and discography sections riding `related`.
+    #[test]
+    fn entity_artist_page_carries_discography_rail() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "artist", "id": "2893557"}}),
+        );
+        let mut seen = Vec::new();
+        let (out, _) = drive(out, |req| {
+            let url = req["payload"]["url"].as_str().unwrap_or_default();
+            let body = if url.contains("entity=song") {
+                seen.push("songs");
+                LOOKUP_ARTIST_SONGS
+            } else if url.contains("entity=album") {
+                seen.push("albums");
+                LOOKUP_ARTIST_ALBUMS
+            } else {
+                seen.push("artist");
+                LOOKUP_ARTIST
+            };
+            http_ok(req_id(req), body)
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(seen, vec!["artist", "songs", "albums"]);
+
+        assert_eq!(out["result"]["entity"]["kind"], "artist");
+        assert_eq!(out["result"]["entity"]["title"], "Portishead");
+        assert_eq!(out["result"]["entity"]["subtitle"], "Electronic");
+        let items = items_of(&out);
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[0]["title"], "Roads");
+        let related = related_of(&out);
+        assert_eq!(related.len(), 3, "{related:?}");
+        assert!(
+            related
+                .iter()
+                .all(|e| e["kind"] == "album" && e["group"] == "discography"),
+            "{related:?}"
+        );
+        assert_eq!(out["result"]["complete"], true);
+    }
+
+    /// A failed songs section degrades the page honestly — `complete`
+    /// flips false, the rest still delivers.
+    #[test]
+    fn entity_artist_partial_section_is_incomplete_not_failed() {
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "artist", "id": "2893557"}}),
+        );
+        let mut n = 0usize;
+        let (out, logs) = drive(out, |req| {
+            n += 1;
+            match n {
+                1 => http_ok(req_id(req), LOOKUP_ARTIST),
+                2 => http_status(req_id(req), 500, &[]),
+                _ => http_ok(req_id(req), LOOKUP_ARTIST_ALBUMS),
+            }
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false, "{out}");
+        assert!(items_of(&out).is_empty());
+        assert_eq!(related_of(&out).len(), 3);
+        assert!(
+            logs.iter().any(|m| m.contains("section unavailable")),
+            "{logs:?}"
+        );
+    }
+
+    /// A lookup that returns no matching entity row is `no-result`.
+    #[test]
+    fn entity_lookup_miss_is_no_result() {
+        for kind in ["album", "artist"] {
+            let out = invoke(
+                "catalog.entity",
+                json!({"ref": {"provider": "itunes", "kind": kind, "id": "42"}}),
+            );
+            let out = step(&http_ok(req_id(&out), EMPTY));
+            assert_eq!(out["type"], "fail", "{kind}");
+            assert_eq!(out["error"]["kind"], "no-result", "{kind}");
+        }
+    }
+
+    /// A lookup that fills its request limit may have more upstream —
+    /// at-cap pages report `complete:false` since no count proves the
+    /// rest is absent.
+    #[test]
+    fn entity_capped_lookup_is_incomplete() {
+        fn body_of(rows: Vec<Value>) -> String {
+            json!({"resultCount": rows.len(), "results": rows}).to_string()
+        }
+        let song = |i: u64| {
+            json!({"wrapperType": "track", "kind": "song", "trackId": i,
+                   "artistId": 2893557, "collectionId": 1440760837,
+                   "trackName": "s", "artistName": "a", "trackTimeMillis": 1})
+        };
+
+        // Album at cap: collection + 199 songs fills limit=200.
+        let mut rows = vec![json!({"wrapperType": "collection",
+            "collectionId": 1440760837, "collectionName": "Dummy",
+            "artistName": "Portishead"})];
+        rows.extend((1..200).map(song));
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "album", "id": "1440760837"}}),
+        );
+        let (out, _) = drive(step(&http_ok(req_id(&out), &body_of(rows))), |_| {
+            panic!("no further request expected")
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false, "{out}");
+
+        // Artist songs at cap: artist + 49 songs fills limit=50 — the
+        // discography still delivers while the page degrades honest.
+        let mut songs = vec![json!({"wrapperType": "artist", "artistId": 2893557,
+            "artistName": "Portishead"})];
+        songs.extend((1..50).map(song));
+        let mut n = 0usize;
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "artist", "id": "2893557"}}),
+        );
+        let (out, _) = drive(out, |req| {
+            n += 1;
+            match n {
+                1 => http_ok(req_id(req), LOOKUP_ARTIST),
+                2 => http_ok(req_id(req), &body_of(songs.clone())),
+                _ => http_ok(req_id(req), LOOKUP_ARTIST_ALBUMS),
+            }
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false, "{out}");
+        assert_eq!(items_of(&out).len(), 49);
+        assert_eq!(related_of(&out).len(), 3);
+
+        // A declared resultCount past the delivered rows is missing
+        // data even under the limit — collection + 2 songs while the
+        // header claims 5 rows.
+        let short = json!({"resultCount": 5, "results": [
+            {"wrapperType": "collection", "collectionId": 1440760837,
+             "collectionName": "Dummy", "artistName": "Portishead"},
+            song(1),
+            song(2),
+        ]});
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "album", "id": "1440760837"}}),
+        );
+        let (out, _) = drive(step(&http_ok(req_id(&out), &short.to_string())), |_| {
+            panic!("no further request expected")
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(items_of(&out).len(), 2);
+        assert_eq!(out["result"]["complete"], false, "{out}");
+    }
+
+    /// iTunes serves no playlist entity; a foreign provider ref is
+    /// not ours to serve. Both die before any request.
+    #[test]
+    fn entity_unservable_refs_are_not_applicable() {
+        for (kind, provider) in [
+            ("playlist", "itunes"),
+            ("track", "itunes"),
+            ("album", "deezer"),
+        ] {
+            let out = invoke(
+                "catalog.entity",
+                json!({"ref": {"provider": provider, "kind": kind, "id": "42"}}),
+            );
+            assert_eq!(out["type"], "fail", "{kind}:{provider}");
+            assert_eq!(out["error"]["kind"], "not-applicable", "{kind}:{provider}");
+        }
+    }
+
+    /// The entity payload takes only `ref`; anything else is strict.
+    #[test]
+    fn entity_payload_strictness() {
+        for payload in [
+            json!({}),
+            json!({"ref": {"provider": "itunes", "kind": "album", "id": "42"}, "extra": 1}),
+        ] {
+            let out = invoke("catalog.entity", payload.clone());
+            assert_eq!(out["type"], "fail", "{payload}");
+            assert_eq!(out["error"]["kind"], "invalid-response", "{payload}");
+        }
     }
 
     #[test]
@@ -650,7 +1450,9 @@ mod tests {
         // 512 characters is the schema cap, counted in scalars — a
         // 512-CJK-character query (1,536 UTF-8 bytes) is legal.
         let cjk = "曲".repeat(512);
-        let req = search_request(json!({"query": cjk, "limit": 5, "storefront": null}));
+        let req = search_request(
+            json!({"query": cjk, "limit": 5, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_ok(req_id(&req), EMPTY));
         assert_eq!(out["type"], "done");
         let out = invoke(
@@ -660,7 +1462,9 @@ mod tests {
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "invalid-response");
         // The 512-ASCII boundary still emits a request.
-        let req = search_request(json!({"query": "a".repeat(512), "limit": 5, "storefront": null}));
+        let req = search_request(
+            json!({"query": "a".repeat(512), "limit": 5, "storefront": null, "kinds": ["track"]}),
+        );
         let out = step(&http_ok(req_id(&req), EMPTY));
         assert_eq!(out["type"], "done");
     }
@@ -747,11 +1551,16 @@ mod tests {
             ("tomorrow", "itunes rate-limited"),
             ("", "itunes rate-limited"),
         ] {
-            let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
+            let req = search_request(
+                json!({"query": "x", "limit": 1, "storefront": null, "kinds": ["track"]}),
+            );
             let out = step(&http_status(req_id(&req), 429, &[("Retry-After", value)]));
             assert_eq!(out["kind"], "log", "{value}");
             assert_eq!(out["payload"]["message"].as_str(), Some(want), "{value}");
-            let out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
+            let (out, _) = drive(
+                step(&json!({"type": "host_ok", "id": req_id(&out)})),
+                |_| panic!("no further request expected"),
+            );
             assert_eq!(out["error"]["kind"], "rate-limit", "{value}");
             let want_fail = if want.contains("retry_after") {
                 format!("rate-limit: itunes status 429 retry_after={value}")

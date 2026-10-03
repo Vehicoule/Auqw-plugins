@@ -1,0 +1,59 @@
+{
+  "resultCount": 4,
+  "results": [
+    {
+      "wrapperType": "artist",
+      "artistType": "Artist",
+      "artistName": "Portishead",
+      "artistLinkUrl": "https://music.apple.com/us/artist/portishead/2893557",
+      "artistId": 2893557,
+      "primaryGenreName": "Electronic",
+      "primaryGenreId": 7
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "artistId": 2893557,
+      "collectionId": 1440760837,
+      "trackId": 1440761789,
+      "artistName": "Portishead",
+      "collectionName": "Dummy",
+      "trackName": "Roads",
+      "trackTimeMillis": 307013,
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/100x100bb.jpg",
+      "primaryGenreName": "Electronic",
+      "trackExplicitness": "notExplicit",
+      "releaseDate": "1994-08-22T07:00:00Z"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "artistId": 2893557,
+      "collectionId": 1440760837,
+      "trackId": 1440761811,
+      "artistName": "Portishead",
+      "collectionName": "Dummy",
+      "trackName": "Sour Times",
+      "trackTimeMillis": 252040,
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/ab/cd/ef/source/100x100bb.jpg",
+      "primaryGenreName": "Electronic",
+      "trackExplicitness": "notExplicit",
+      "releaseDate": "1994-08-22T07:00:00Z"
+    },
+    {
+      "wrapperType": "track",
+      "kind": "song",
+      "artistId": 2893557,
+      "collectionId": 1440760901,
+      "trackId": 1440761001,
+      "artistName": "Portishead",
+      "collectionName": "Portishead",
+      "trackName": "All Mine",
+      "trackTimeMillis": 243280,
+      "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/aa/bb/cc/source/100x100bb.jpg",
+      "primaryGenreName": "Electronic",
+      "trackExplicitness": "explicit",
+      "releaseDate": "1997-09-30T07:00:00Z"
+    }
+  ]
+}
