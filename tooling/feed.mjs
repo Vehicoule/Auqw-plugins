@@ -16,6 +16,7 @@
 //   tooling/feed.mjs            write releases/feed.json
 //   tooling/feed.mjs --check    verify feed.json matches the dirs (CI)
 
+import { createHash } from 'node:crypto';
 import {
   existsSync,
   readFileSync,
@@ -34,6 +35,8 @@ const fail = (msg) => {
   console.error(`feed: ${msg}`);
   process.exit(1);
 };
+
+const sha256 = (buf) => `sha256:${createHash('sha256').update(buf).digest('hex')}`;
 
 const semverKey = (v) => v.split('.').map((n) => Number.parseInt(n, 10));
 
@@ -74,6 +77,28 @@ const build = () => {
     if (keyId === undefined) keyId = provenance.key_id;
     if (keyId !== provenance.key_id) {
       fail(`${id}/${version}: key_id ${provenance.key_id} mixes with ${keyId}`);
+    }
+    // Re-hash the bytes on disk — the feed must never ship an entry
+    // whose artifact or manifest drifted from what was signed. The
+    // signature itself is still verified at install time (and by
+    // `sign.mjs verify` with the key); this is the keyless integrity
+    // check that catches tampering after the release dir was cut.
+    const wasmBuf = readFileSync(join(rel, `${id}-${version}.wasm`));
+    const wasmSha = sha256(wasmBuf);
+    if (wasmSha !== provenance.wasm_sha256) {
+      fail(`${id}/${version}: wasm digest drift: ${wasmSha} != provenance ${provenance.wasm_sha256}`);
+    }
+    const manifestBuf = readFileSync(join(rel, 'plugin.manifest.json'));
+    const manifestSha = sha256(manifestBuf);
+    if (manifestSha !== provenance.manifest_sha256) {
+      fail(`${id}/${version}: manifest digest drift: ${manifestSha} != provenance ${provenance.manifest_sha256}`);
+    }
+    const manifest = JSON.parse(manifestBuf.toString('utf8'));
+    if (manifest.id !== id || manifest.version !== version || manifest.abi !== provenance.abi_version) {
+      fail(`${id}/${version}: plugin.manifest.json disagrees with the release dir`);
+    }
+    if (manifest.artifact?.digest !== wasmSha) {
+      fail(`${id}/${version}: manifest artifact.digest does not pin the staged wasm`);
     }
     plugins.push({
       id,

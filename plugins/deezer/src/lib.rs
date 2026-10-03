@@ -46,7 +46,7 @@ const METADATA_FETCH_MAX: usize = 30;
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
         match inv.capability.as_str() {
-            "catalog.search" => search(&inv.payload).await,
+            "catalog.search" | "catalog.search.kinds" => search(&inv.payload).await,
             "catalog.metadata" => metadata(&inv.payload).await,
             "catalog.entity" => entity(&inv.payload).await,
             other => Err(failed(
@@ -124,7 +124,9 @@ fn payload_obj_opt<'a>(
 /// A well-formed ref for this provider, or a typed rejection: the
 /// provider must be `deezer` and `kind` one of `kinds`, else
 /// `not-applicable`; a malformed object or id is `invalid-response`.
-/// The returned id is the validated digit string.
+/// The returned id is the canonical digit string — parsed and
+/// re-rendered so a valid non-canonical form (`"01069"`) matches the
+/// resource upstream actually serves.
 fn deezer_ref(v: &Value, kinds: &[&str]) -> Result<(String, String), GuestError> {
     let o = payload_obj(v, &["provider", "kind", "id"])?;
     let provider = o["provider"]
@@ -151,7 +153,7 @@ fn deezer_ref(v: &Value, kinds: &[&str]) -> Result<(String, String), GuestError>
         None
     };
     match parsed {
-        Some(n) if n > 0 => Ok((kind.to_string(), id.to_string())),
+        Some(n) if n > 0 => Ok((kind.to_string(), n.to_string())),
         _ => Err(bad_payload("ref.id must be ASCII digits > 0")),
     }
 }
@@ -247,14 +249,12 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
 
     let mut items: Vec<Value> = Vec::new();
     let mut entities: Vec<Value> = Vec::new();
-    // Done markers carry across pages — a kind that exhausted stays
-    // exhausted and never refetches to repeat its first page beside
-    // deeper rails.
-    let mut more: Map<String, Value> = offsets
-        .iter()
-        .filter(|(_, v)| v.is_null())
-        .map(|(k, _)| (k.clone(), Value::Null))
-        .collect();
+    // The incoming token carries forward whole: done markers keep a
+    // kind exhausted — it never refetches to repeat its first page
+    // beside deeper rails — and pending offsets for kinds outside
+    // this call's `kinds` keep their place. The loop overwrites every
+    // kind it serves with the fresh index or a done marker.
+    let mut more: Map<String, Value> = offsets.clone();
     let mut first_failure: Option<GuestError> = None;
     let mut fetched = 0usize;
     let mut failures = 0usize;
@@ -1036,6 +1036,49 @@ mod tests {
         assert_eq!(next["track"], Value::Null, "{next}");
     }
 
+    /// Pending offsets carry across pages too: a kind left out of
+    /// this call's `kinds` keeps its place in the emitted token, so
+    /// a later scoped page resumes the rail instead of restarting it
+    /// or dropping it entirely.
+    #[test]
+    fn search_continuation_carries_pending_offsets() {
+        let token = r#"{"track":25,"album":40}"#;
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["album"], "continuation": token}),
+        );
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(
+            url, "https://api.deezer.com/search/album?q=x&limit=10&index=40",
+            "{url}"
+        );
+        // Album exhausts on this page; track's pending offset still
+        // keeps the token alive — an all-done map would end the
+        // continuation and lose the rail.
+        let out = step(&http_ok(req_id(&out), EMPTY));
+        assert_eq!(out["type"], "done", "{out}");
+        let next: Value =
+            serde_json::from_str(out["result"]["continuation"].as_str().unwrap_or_default())
+                .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
+        assert_eq!(next["track"], 25, "{next}");
+        assert_eq!(next["album"], Value::Null, "{next}");
+    }
+
+    /// `catalog.search.kinds` is the declared scoped-search
+    /// capability — the guest serves it through the same handler so
+    /// the manifest declaration is never silent scope.
+    #[test]
+    fn catalog_search_kinds_dispatches_to_search() {
+        let out = invoke(
+            "catalog.search.kinds",
+            json!({"query": "x", "limit": 5, "storefront": null, "kinds": ["track"]}),
+        );
+        assert_eq!(out["kind"], "http_request", "{out}");
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(url, "https://api.deezer.com/search?q=x&limit=5", "{url}");
+    }
+
     /// A `next` that can't move the offset forward ends the rail
     /// rather than emitting a self-referential token that refetches
     /// the same page forever.
@@ -1404,6 +1447,24 @@ mod tests {
                 .ends_with("/track/18446744073709551615"),
             "{out}"
         );
+    }
+
+    /// A valid but non-canonical id canonicalizes before the
+    /// request — `id_matches` compares the body's canonical form, so
+    /// `"01069"` resolves the artist upstream serves as `1069`.
+    #[test]
+    fn ref_id_canonicalizes_leading_zeros() {
+        let out = invoke(
+            "catalog.metadata",
+            json!({"refs": [{"provider": "deezer", "kind": "artist", "id": "01069"}]}),
+        );
+        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        assert_eq!(url, "https://api.deezer.com/artist/1069", "{url}");
+        let out = step(&http_ok(req_id(&out), ARTIST));
+        assert_eq!(out["type"], "done", "{out}");
+        let items = items_of(&out);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["source_ref"]["id"], "1069");
     }
 
     /// The host admits 32 HTTP calls per invocation, so a batch

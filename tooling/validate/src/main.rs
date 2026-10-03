@@ -314,6 +314,7 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             "catalog.entity",
             "catalog.metadata",
             "catalog.search",
+            "catalog.search.kinds",
             "catalog.suggest",
             "lyrics.plain",
             "lyrics.synced",
@@ -338,8 +339,7 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     {
         return Err("manifest.capabilities outside the set this ABI serves".into());
     }
-    // permissions: ^(network:(\*\.)?[a-z0-9.-]+|pot-provider|kv)$ —
-    // `kv` is a 0.2 permission and forbidden on a 0.1 manifest.
+    // permissions: ^(network:(\*\.)?[a-z0-9.-]+|pot-provider|kv)$
     let perms = manifest["permissions"]
         .as_array()
         .ok_or_else(|| "manifest.permissions must be an array".to_string())?;
@@ -449,6 +449,25 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
             .iter()
             .any(|seg| seg.windows(needle.len()).any(|w| w == needle.as_bytes()))
     };
+    // The host grants a non-wildcard destination on exact host
+    // equality (`host == pattern`), so the literal must stand on
+    // hostname boundaries: a longer name that merely embeds the
+    // declared one (`xapi.deezer.com`, `api.deezer.com.evil.tld`) can
+    // never be fetched through the grant. Neighbor bytes are compared
+    // directly — alphanumerics (DNS is case-insensitive), `.`, `-`,
+    // `_` continue a name; anything else (or the segment edge) is a
+    // boundary.
+    let host_byte = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_');
+    let has_host = |host: &str| {
+        let needle = host.as_bytes();
+        segments.iter().any(|seg| {
+            seg.windows(needle.len()).enumerate().any(|(i, w)| {
+                w == needle
+                    && (i == 0 || !host_byte(seg[i - 1]))
+                    && (i + needle.len() == seg.len() || !host_byte(seg[i + needle.len()]))
+            })
+        })
+    };
 
     let perms = manifest["permissions"]
         .as_array()
@@ -466,7 +485,7 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
             // destination must appear as a literal (its URLs are
             // formatted in the guest). Wildcards are exempt: their
             // URLs arrive in provider payloads.
-            has("http_request") && (dest.contains('*') || has(dest))
+            has("http_request") && (dest.contains('*') || has_host(dest))
         } else {
             // Permission kinds without a statically-decidable use.
             true
@@ -732,7 +751,7 @@ mod tests {
         assert_eq!(
             check_manifest(&manifest(
                 "0.1.0",
-                "[\"catalog.entity\",\"lyrics.plain\",\"lyrics.synced\",\"radio.seed\"]",
+                "[\"catalog.entity\",\"catalog.search.kinds\",\"lyrics.plain\",\"lyrics.synced\",\"radio.seed\"]",
                 "[]"
             )),
             Ok(())
@@ -941,6 +960,34 @@ mod tests {
         assert_eq!(
             check_guest_alignment(
                 &manifest("0.3.0", "[]", "[\"network:*.googlevideo.com\"]"),
+                &wasm
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn alignment_network_destination_anchors_on_hostname_boundaries() {
+        // The host grants on exact host equality, so a longer name
+        // that merely embeds the declared one is dead scope — case,
+        // `_`, and label extensions all fail the boundary.
+        let wasm = wasm_with_literals(&[
+            "http_request",
+            "xapi.deezer.com",
+            "api.deezer.com.evil.tld",
+            "Wapi.deezer.com",
+            "_api.deezer.com",
+        ]);
+        assert!(check_guest_alignment(
+            &manifest("0.3.0", "[]", "[\"network:api.deezer.com\"]"),
+            &wasm
+        )
+        .is_err_and(|e| e.contains("api.deezer.com")));
+        // The same host inside a formatted URL is a real use.
+        let wasm = wasm_with_literals(&["http_request", "https://api.deezer.com/search"]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest("0.3.0", "[]", "[\"network:api.deezer.com\"]"),
                 &wasm
             ),
             Ok(())
