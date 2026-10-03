@@ -956,6 +956,11 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // so the value would wall this rung on every later resolve
             // too, and the attested pass replays the same one.
             let mut dropped_visitor = false;
+            // Set when the booked verdict came off a 401 that carried
+            // the trust token but whose bare re-ask the budget denied:
+            // the refusal charged to the credential, not the rung, so
+            // it stages no rung backoff.
+            let mut token_refusal = false;
             let verdict = 'request: loop {
                 http_calls += 1;
                 let sent = http_request(player_request(
@@ -987,12 +992,15 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
                 // Re-asks consume from the same budget — one only runs
                 // while the probe chain behind it still fits, else the
                 // rung keeps this verdict rather than dying mid-draw.
-                if r.status == 401
-                    && access_token.is_some()
-                    && http_calls + RUNG_CHAIN_CALLS <= HTTP_CALL_BUDGET
-                {
-                    access_token.take();
-                    continue 'request;
+                // A 401 proves the carried token dead either way, so
+                // it drops unconditionally and the rest of the ladder
+                // runs bare; only the bare re-ask holds the bound,
+                // matching the visitor drop below.
+                if r.status == 401 && access_token.take().is_some() {
+                    if http_calls + RUNG_CHAIN_CALLS <= HTTP_CALL_BUDGET {
+                        continue 'request;
+                    }
+                    token_refusal = true;
                 }
                 let verdict = classify_response(&r);
                 if rung_visitor.is_some() && !dropped_visitor && walled_by_bot(&verdict) {
@@ -1038,15 +1046,18 @@ async fn resolve(payload: &Value) -> Result<Value, GuestError> {
             // interstitial or consent page answering OK, a truncated
             // envelope) or plain transport weather — never a reason to
             // starve the rungs behind it. A 401 that carried the token
-            // was already re-asked bare above, so every outcome
-            // reaching here is the rung's own and stages its backoff:
-            // Bot also books the attested-replay slot.
+            // was already re-asked bare above — or, denied the re-ask,
+            // still dropped it and rides `token_refusal` — so every
+            // outcome reaching here is the rung's own and stages its
+            // backoff: Bot also books the attested-replay slot.
             let body: Value = match verdict {
                 PlayerVerdict::Outcome(outcome) => {
-                    if let Some((reason, ms)) = backoff_for(outcome) {
-                        dirty_backoffs[i] = true;
-                        stage_backoff(&backoff_key, now_ms().await?.saturating_add(ms), reason)
-                            .await?;
+                    if !token_refusal {
+                        if let Some((reason, ms)) = backoff_for(outcome) {
+                            dirty_backoffs[i] = true;
+                            stage_backoff(&backoff_key, now_ms().await?.saturating_add(ms), reason)
+                                .await?;
+                        }
                     }
                     outcomes[i] = Some(outcome);
                     if pass == 0 && outcome == RungOutcome::Bot {
@@ -4883,6 +4894,51 @@ mod tests {
         )
         .unwrap_or_default();
         assert_eq!(stored["reason"], "transport");
+    }
+
+    #[test]
+    fn budget_denied_401_still_drops_the_token() {
+        // Rungs 0-6 each draw the four-call worst chain — player,
+        // hinted probe, redirect re-probe, fallback — 28 calls. Rung
+        // 7's authed send is the 29th: its 401 proves the token dead,
+        // but the bare re-ask's whole chain no longer fits inside the
+        // 32-call budget, so the rung keeps the refusal verdict…
+        let mut h = Harness::new();
+        let mut out = h.invoke(json!({ "source_ref": VID, "access_token": "dead-tok" }));
+        for i in 0..7 {
+            assert_eq!(rung_of(&out), i);
+            out = feed(&mut h, &out, OK);
+            probe_of(&out);
+            out = h.answer_headers(
+                &out,
+                302,
+                &[("Location", "https://rr9.googlevideo.com/alt")],
+                0,
+            );
+            out = h.answer(&out, 416, "");
+            out = answer_fallback_416(&mut h, &out);
+        }
+        assert_eq!(rung_of(&out), 7);
+        assert_eq!(
+            header_of(&out, "Authorization").as_deref(),
+            Some("Bearer dead-tok")
+        );
+        let out = h.answer(&out, 401, "{}");
+        // …yet the proven-dead token still drops: rung 8's bare-pass
+        // shot — its minimal chain fits in the three calls left —
+        // rides no Authorization, and the resolve finishes on it.
+        assert_eq!(rung_of(&out), 8);
+        assert_eq!(header_of(&out, "Authorization"), None);
+        let out = feed(&mut h, &out, OK);
+        probe_of(&out);
+        let out = answer_probe_206(&mut h, &out);
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["client"], "ANDROID_VR@1.43.32");
+        // The denied re-ask's 401 blamed the token, not rung 7 — no
+        // transport backoff is committed against it.
+        assert!(!h
+            .committed
+            .contains_key(&format!("backoff/a/{VID}/ANDROID_VR@1.60.19")));
     }
 
     #[test]
