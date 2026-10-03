@@ -10,6 +10,9 @@
 # immutable; sign refuses an existing <id>/<version> unless --force).
 # Commit the result on a branch per conventions.md (s<slice>/topic).
 set -e
+# A relative --key-file is the caller's path — resolve it against their
+# working directory before cd'ing into the repo.
+caller_pwd="$PWD"
 cd "$(dirname "$0")/.."
 
 plugin="${1:?usage: tooling/release.sh <plugin-id> [--force] [--key-file <path>]}"
@@ -27,7 +30,13 @@ while [ $# -gt 0 ]; do
 done
 # Reuse the positional list to carry the key option into sign + verify.
 set --
-[ -n "$key_file" ] && set -- --key-file "$key_file"
+if [ -n "$key_file" ]; then
+    case "$key_file" in
+        /*) ;;
+        *) key_file="$caller_pwd/$key_file" ;;
+    esac
+    set -- --key-file "$key_file"
+fi
 
 if [ ! -f "plugins/${plugin}/manifest.json" ]; then
     echo "release: no plugins/${plugin}/manifest.json" >&2

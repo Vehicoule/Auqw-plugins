@@ -50,8 +50,11 @@ const readVersion = (manifestPath) => {
 const { name: sdkName, version: sdkVersion } = readVersion(join(sdkPath, 'Cargo.toml'));
 if (sdkName !== 'auqw-guest-sdk') fail(`expected auqw-guest-sdk at ${sdkPath}, found ${sdkName}`);
 
-const listFiles = (dir) =>
-  execFileSync('git', ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard'])
+// cargo package builds the package file list from the git index —
+// untracked working-tree files never ship. The vendor side keeps
+// --others so stray files in vendor/ still surface as drift.
+const listFiles = (dir, { untracked = true } = {}) =>
+  execFileSync('git', ['-C', dir, 'ls-files', '--cached', ...(untracked ? ['--others', '--exclude-standard'] : [])])
     .toString()
     .split('\n')
     .filter((f) => f && !f.endsWith('.crate'));
@@ -80,7 +83,7 @@ if (matching.length === 0) {
   report(cmp > 0 ? 1 : 2, `SDK source is ${sdkVersion}; newest vendor dir is ${newest.version} — run tooling/vendor-sdk.sh`);
 } else {
   const vendor = matching[0];
-  const sdkFiles = listFiles(sdkPath);
+  const sdkTracked = new Set(listFiles(sdkPath, { untracked: false }));
   const vendorFiles = listFiles(vendor.dir);
   // Package members generated at vendor time — the normalized
   // Cargo.toml, generated Cargo.lock, and .cargo_vcs_info.json — have
@@ -99,8 +102,12 @@ if (matching.length === 0) {
   for (const f of comparable) {
     const sdkRel = counterpart(f);
     const sdkFile = join(sdkPath, sdkRel);
-    if (!existsSync(sdkFile)) {
-      report(2, `${f} has no SDK source counterpart (${sdkRel})`);
+    // Files under the crate root must also be tracked — an untracked
+    // counterpart cannot reproduce the vendored member. The LICENSE
+    // overlay is copied from the working tree, so existence is enough.
+    const packaged = f === 'LICENSE' ? existsSync(sdkFile) : sdkTracked.has(sdkRel) && existsSync(sdkFile);
+    if (!packaged) {
+      report(2, `${f} has no packaged SDK counterpart (${sdkRel})`);
       continue;
     }
     if (readFileSync(sdkFile).equals(readFileSync(join(vendor.dir, f)))) {
@@ -111,7 +118,7 @@ if (matching.length === 0) {
   }
   // Reverse direction: a tracked SDK file the package would carry but
   // the vendor dir lacks. The source Cargo.toml lands as Cargo.toml.orig.
-  const newInSdk = sdkFiles.filter((f) => !vendorFiles.includes(f === 'Cargo.toml' ? 'Cargo.toml.orig' : f));
+  const newInSdk = [...sdkTracked].filter((f) => !vendorFiles.includes(f === 'Cargo.toml' ? 'Cargo.toml.orig' : f));
   for (const f of newInSdk) {
     report(2, `${f} exists in SDK source but not in vendor/auqw-guest-sdk-${vendor.version}`);
   }
