@@ -69,15 +69,6 @@ pub fn parse_tracks(body: &[u8]) -> Result<Vec<Track>, GuestError> {
     Ok(parse_rows(body)?.iter().filter_map(track_of).collect())
 }
 
-/// The body's declared `resultCount` — lookup pages count their
-/// leading entity row, so completeness math compares against `rows`.
-pub fn result_count(body: &[u8]) -> Option<u64> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    v.as_object()
-        .and_then(|o| o.get("resultCount"))
-        .and_then(Value::as_u64)
-}
-
 /// A song row (`wrapperType`=`track`/`kind`=`song`), or `None` for
 /// entity rows and under-formed tracks.
 pub fn track_of(row: &Value) -> Option<Track> {

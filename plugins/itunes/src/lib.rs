@@ -33,6 +33,8 @@ const ENTITY_MIX_LIMIT: u64 = 10;
 /// Section sizes for the artist composite page.
 const ARTIST_SONGS_LIMIT: u64 = 50;
 const ARTIST_ALBUMS_LIMIT: u64 = 200;
+/// Album pages ask for the whole tracklist in one lookup.
+const ALBUM_TRACKS_LIMIT: u64 = 200;
 
 fn dispatch(inv: Invocation) -> GuestFuture {
     Box::pin(async move {
@@ -342,7 +344,7 @@ async fn entity(payload: &Value) -> Result<Value, GuestError> {
 /// `lookup?id=<collection>&entity=song` returns the collection row
 /// first, then every song row — no continuation exists.
 async fn album_entity(id: &str) -> Result<Value, GuestError> {
-    let url = format!("{API}/lookup?id={id}&entity=song&limit=200");
+    let url = format!("{API}/lookup?id={id}&entity=song&limit={ALBUM_TRACKS_LIMIT}");
     let body = match http::get_json(&url).await? {
         http::Outcome::NotFound => {
             return Err(failed("no-result", format!("itunes album {id} not found")));
@@ -361,9 +363,10 @@ async fn album_entity(id: &str) -> Result<Value, GuestError> {
         .iter()
         .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE))
         .collect();
-    // `resultCount` counts the leading collection row — a short body
-    // is an honest partial page, not a missing one.
-    let complete = parse::result_count(&body).is_none_or(|c| items.len() + 1 >= c as usize);
+    // `resultCount` only counts the rows returned — a body at the
+    // requested limit may have more upstream, so at-cap is honest
+    // `complete:false` and only an under-fill proves exhaustion.
+    let complete = rows.len() < ALBUM_TRACKS_LIMIT as usize;
     Ok(json!({
         "entity": entity,
         "items": items,
@@ -409,8 +412,9 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
                             .iter()
                             .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE)),
                     );
-                    // resultCount counts the artist row too.
-                    if parse::result_count(&body).is_some_and(|c| items.len() + 1 < c as usize) {
+                    // At-cap means possibly-truncated — rows fill the
+                    // request's own limit, not an upstream total.
+                    if rows.len() >= ARTIST_SONGS_LIMIT as usize {
                         complete = false;
                     }
                 }
@@ -431,13 +435,11 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
     match section(&albums).await? {
         Section::Body(body) => match parse::parse_rows(&body) {
             Ok(rows) => {
-                let before = related.len();
                 related.extend(
                     rows.iter()
                         .filter_map(|r| parse::collection_of(r, Some("discography"))),
                 );
-                let delivered = related.len() - before;
-                if parse::result_count(&body).is_some_and(|c| delivered + 1 < c as usize) {
+                if rows.len() >= ARTIST_ALBUMS_LIMIT as usize {
                     complete = false;
                 }
             }
@@ -1176,6 +1178,59 @@ mod tests {
             assert_eq!(out["type"], "fail", "{kind}");
             assert_eq!(out["error"]["kind"], "no-result", "{kind}");
         }
+    }
+
+    /// A lookup that fills its request limit may have more upstream —
+    /// at-cap pages report `complete:false` since no count proves the
+    /// rest is absent.
+    #[test]
+    fn entity_capped_lookup_is_incomplete() {
+        fn body_of(rows: Vec<Value>) -> String {
+            json!({"resultCount": rows.len(), "results": rows}).to_string()
+        }
+        let song = |i: u64| {
+            json!({"wrapperType": "track", "kind": "song", "trackId": i,
+                   "artistId": 2893557, "collectionId": 1440760837,
+                   "trackName": "s", "artistName": "a", "trackTimeMillis": 1})
+        };
+
+        // Album at cap: collection + 199 songs fills limit=200.
+        let mut rows = vec![json!({"wrapperType": "collection",
+            "collectionId": 1440760837, "collectionName": "Dummy",
+            "artistName": "Portishead"})];
+        rows.extend((1..200).map(song));
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "album", "id": "1440760837"}}),
+        );
+        let (out, _) = drive(step(&http_ok(req_id(&out), &body_of(rows))), |_| {
+            panic!("no further request expected")
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false, "{out}");
+
+        // Artist songs at cap: artist + 49 songs fills limit=50 — the
+        // discography still delivers while the page degrades honest.
+        let mut songs = vec![json!({"wrapperType": "artist", "artistId": 2893557,
+            "artistName": "Portishead"})];
+        songs.extend((1..50).map(song));
+        let mut n = 0usize;
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "artist", "id": "2893557"}}),
+        );
+        let (out, _) = drive(out, |req| {
+            n += 1;
+            match n {
+                1 => http_ok(req_id(req), LOOKUP_ARTIST),
+                2 => http_ok(req_id(req), &body_of(songs.clone())),
+                _ => http_ok(req_id(req), LOOKUP_ARTIST_ALBUMS),
+            }
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["complete"], false, "{out}");
+        assert_eq!(items_of(&out).len(), 49);
+        assert_eq!(related_of(&out).len(), 3);
     }
 
     /// iTunes serves no playlist entity; a foreign provider ref is
