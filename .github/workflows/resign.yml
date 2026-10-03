@@ -98,9 +98,11 @@ jobs:
           # manifest can attest elevated permissions under the
           # canonical signature. When the source manifest still names
           # the dispatched version, the shipped manifest must be its
-          # exact bytes; when it has moved on, the wasm check above is
-          # the binding one (and already fails for a source tree that
-          # no longer builds this release).
+          # exact bytes. When it has moved on the grant-bearing fields
+          # still compare — everything but `version` and `artifact`,
+          # whose digest the rebuilt-wasm check above already binds —
+          # so a moved-on source never leaves id/abi/capabilities/
+          # permissions unconstrained.
           # A second pin lives in the Auqw repo: providers.lock.json's
           # manifest_digest records each release manifest's sha256, and
           # sign.mjs reports the digest it writes into provenance.json
@@ -119,6 +121,29 @@ jobs:
           if [ "$SRC_VERSION" = "$VERSION" ]; then
             cmp -s "$SOURCE" "$RELEASED" \
               || { echo "release manifest diverges from the reviewed $SOURCE" >&2; exit 1; }
+          else
+            node -e '
+              const fs = require("node:fs");
+              const [src, rel] = process.argv.slice(1)
+                .map((p) => JSON.parse(fs.readFileSync(p, "utf8")));
+              // Every field except `version` and `artifact` is a
+              // grant the signature attests — compare them wholesale,
+              // order-insensitively (grant lists are sets).
+              const strip = ({version, artifact, ...grants}) => grants;
+              const canon = (v) => Array.isArray(v)
+                ? v.map(canon).sort()
+                : v && typeof v === "object"
+                  ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])]))
+                  : v;
+              const s = JSON.stringify(canon(strip(src)));
+              const r = JSON.stringify(canon(strip(rel)));
+              if (s !== r) {
+                console.error("release manifest grants diverge from the reviewed source manifest");
+                console.error(`  source:  ${s}`);
+                console.error(`  release: ${r}`);
+                process.exit(1);
+              }
+            ' "$SOURCE" "$RELEASED"
           fi
 
       - name: materialize the canonical key
