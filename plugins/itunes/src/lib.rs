@@ -363,10 +363,7 @@ async fn album_entity(id: &str) -> Result<Value, GuestError> {
         .iter()
         .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE))
         .collect();
-    // `resultCount` only counts the rows returned — a body at the
-    // requested limit may have more upstream, so at-cap is honest
-    // `complete:false` and only an under-fill proves exhaustion.
-    let complete = rows.len() < ALBUM_TRACKS_LIMIT as usize;
+    let complete = section_complete(rows.len(), &body, ALBUM_TRACKS_LIMIT);
     Ok(json!({
         "entity": entity,
         "items": items,
@@ -402,28 +399,24 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
     // by `track_of` on its own.
     let songs = format!("{API}/lookup?id={id}&entity=song&limit={ARTIST_SONGS_LIMIT}");
     match section(&songs).await? {
-        Section::Body(body) => {
-            match parse::parse_rows(&body) {
-                Ok(rows) => {
-                    items.extend(
-                        rows.iter()
-                            .filter_map(parse::track_of)
-                            .collect::<Vec<_>>()
-                            .iter()
-                            .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE)),
-                    );
-                    // At-cap means possibly-truncated — rows fill the
-                    // request's own limit, not an upstream total.
-                    if rows.len() >= ARTIST_SONGS_LIMIT as usize {
-                        complete = false;
-                    }
-                }
-                Err(_) => {
+        Section::Body(body) => match parse::parse_rows(&body) {
+            Ok(rows) => {
+                items.extend(
+                    rows.iter()
+                        .filter_map(parse::track_of)
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(|t| parse::to_metadata(t, None, SEARCH_ARTWORK_SIZE)),
+                );
+                if !section_complete(rows.len(), &body, ARTIST_SONGS_LIMIT) {
                     complete = false;
-                    warn("itunes artist songs section unavailable").await?;
                 }
             }
-        }
+            Err(_) => {
+                complete = false;
+                warn("itunes artist songs section unavailable").await?;
+            }
+        },
         Section::Degraded => {
             complete = false;
             warn("itunes artist songs section unavailable").await?;
@@ -439,7 +432,7 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
                     rows.iter()
                         .filter_map(|r| parse::collection_of(r, Some("discography"))),
                 );
-                if rows.len() >= ARTIST_ALBUMS_LIMIT as usize {
+                if !section_complete(rows.len(), &body, ARTIST_ALBUMS_LIMIT) {
                     complete = false;
                 }
             }
@@ -460,6 +453,14 @@ async fn artist_entity(id: &str) -> Result<Value, GuestError> {
         "related": related,
         "complete": complete,
     }))
+}
+
+/// One section's honesty check: `complete` only when the body came in
+/// under the request's own limit AND no declared `resultCount` says
+/// more rows existed than arrived — at-cap may have more upstream,
+/// and a declared count past the delivered rows is missing data.
+fn section_complete(rows: usize, body: &[u8], limit: u64) -> bool {
+    rows < limit as usize && parse::result_count(body).is_none_or(|c| c <= rows as u64)
 }
 
 /// The result of a composite-page section fetch.
@@ -1231,6 +1232,26 @@ mod tests {
         assert_eq!(out["result"]["complete"], false, "{out}");
         assert_eq!(items_of(&out).len(), 49);
         assert_eq!(related_of(&out).len(), 3);
+
+        // A declared resultCount past the delivered rows is missing
+        // data even under the limit — collection + 2 songs while the
+        // header claims 5 rows.
+        let short = json!({"resultCount": 5, "results": [
+            {"wrapperType": "collection", "collectionId": 1440760837,
+             "collectionName": "Dummy", "artistName": "Portishead"},
+            song(1),
+            song(2),
+        ]});
+        let out = invoke(
+            "catalog.entity",
+            json!({"ref": {"provider": "itunes", "kind": "album", "id": "1440760837"}}),
+        );
+        let (out, _) = drive(step(&http_ok(req_id(&out), &short.to_string())), |_| {
+            panic!("no further request expected")
+        });
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(items_of(&out).len(), 2);
+        assert_eq!(out["result"]["complete"], false, "{out}");
     }
 
     /// iTunes serves no playlist entity; a foreign provider ref is
