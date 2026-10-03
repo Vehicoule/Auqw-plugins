@@ -158,7 +158,16 @@ fn track_row_of(r: &Map<String, Value>) -> Option<Value> {
             if duration_ms.is_none() {
                 duration_ms = duration_ms_of(text);
             }
-            if ci == 0 && second_col_text.is_none() && !is_furniture(text) {
+            // The artist fallback keeps names and artist links —
+            // a validated album endpoint must not report itself as
+            // the track's artist.
+            if ci == 0
+                && second_col_text.is_none()
+                && !is_furniture(text)
+                && browse(run)
+                    .and_then(endpoint_of)
+                    .is_none_or(|(kind, _)| kind != "album")
+            {
                 second_col_text = Some(text.to_string());
             }
         }
@@ -376,7 +385,7 @@ fn section_list(body: &Value) -> Vec<&Value> {
 /// Every `musicShelfRenderer` / `musicCarouselShelfRenderer` in the
 /// section list, as `(title, contents)` — carousels title via
 /// `musicCarouselShelfBasicHeaderRenderer`.
-fn shelves_of(sections: &[&Value]) -> Vec<(String, Vec<Value>)> {
+fn shelves_of<'a>(sections: &[&'a Value]) -> Vec<(String, Vec<&'a Value>)> {
     let mut out = Vec::new();
     for s in sections {
         for key in [
@@ -404,7 +413,7 @@ fn shelves_of(sections: &[&Value]) -> Vec<(String, Vec<Value>)> {
             let contents = shelf
                 .get("contents")
                 .and_then(Value::as_array)
-                .cloned()
+                .map(|a| a.iter().collect())
                 .unwrap_or_default();
             out.push((title, contents));
         }
@@ -416,7 +425,7 @@ fn shelves_of(sections: &[&Value]) -> Vec<(String, Vec<Value>)> {
 /// is `{<rendererName>: <renderer>}`; entity rows map through
 /// `entity_row_of` (two-row cells included), track rows through
 /// `track_row_of` (list items and panels).
-fn rows_of(contents: &[Value]) -> Vec<&Map<String, Value>> {
+fn rows_of<'a>(contents: &[&'a Value]) -> Vec<&'a Map<String, Value>> {
     let mut renderers = Vec::new();
     let mut nodes = 0usize;
     for c in contents {
@@ -510,7 +519,7 @@ fn search_request(query: &str, params: Option<&str>, visitor: Option<&str>) -> H
 /// — a scoped "album" query keeps album rows only; `None` is the
 /// unfiltered page (everything it served).
 fn fold_rows(
-    contents: &[Value],
+    contents: &[&Value],
     want: Option<&str>,
     items: &mut Vec<Value>,
     entities: &mut Vec<Value>,
@@ -555,6 +564,19 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
         .as_u64()
         .ok_or_else(|| bad_payload("limit must be an integer"))?
         .clamp(1, 200) as usize;
+    // `storefront` validates like the catalog peers even though this
+    // provider serves one global catalog — the value isn't
+    // forwarded upstream, but a malformed payload is still
+    // `invalid-response`.
+    match &obj["storefront"] {
+        Value::Null => {}
+        Value::String(sf) if sf.len() == 2 && sf.bytes().all(|b| b.is_ascii_alphabetic()) => {}
+        _ => {
+            return Err(bad_payload(
+                "storefront must be null or a two-letter country",
+            ))
+        }
+    }
     let kinds: Vec<&str> = match obj.get("kinds") {
         None => SEARCH_KINDS.to_vec(),
         Some(Value::Array(list)) if !list.is_empty() => {
@@ -606,15 +628,29 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
         .await?
         {
             Section::Body(body) => {
-                for s in section_list(&body) {
-                    if let Some(card) = s.get("musicCardShelfRenderer").and_then(Value::as_object) {
-                        if top_hit.is_null() {
-                            top_hit = card_hit(card);
+                if section_list(&body).is_empty() {
+                    // A 200 body that isn't a results page — `{}` or
+                    // an error envelope is invalid-response, never
+                    // a clean zero-result search.
+                    failures = 1;
+                    first_failure = Some(failed(
+                        "invalid-response",
+                        "search body carried no results sections".into(),
+                    ));
+                    warn("ytm search body carried no results sections").await?;
+                } else {
+                    for s in section_list(&body) {
+                        if let Some(card) =
+                            s.get("musicCardShelfRenderer").and_then(Value::as_object)
+                        {
+                            if top_hit.is_null() {
+                                top_hit = card_hit(card);
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    for (_title, contents) in shelves_of(&[s]) {
-                        fold_rows(&contents, None, &mut items, &mut entities);
+                        for (_title, contents) in shelves_of(&[s]) {
+                            fold_rows(&contents, None, &mut items, &mut entities);
+                        }
                     }
                 }
             }
@@ -637,10 +673,35 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
             .await?
             {
                 Section::Body(body) => {
-                    for s in section_list(&body) {
-                        for (_title, contents) in shelves_of(&[s]) {
-                            fold_rows(&contents, Some(kind), &mut items, &mut entities);
+                    if section_list(&body).is_empty() {
+                        failures += 1;
+                        if first_failure.is_none() {
+                            first_failure = Some(failed(
+                                "invalid-response",
+                                "search body carried no results sections".into(),
+                            ));
                         }
+                        warn("ytm search body carried no results sections").await?;
+                    } else {
+                        // Each scoped ask caps at the request's own
+                        // limit — a shared cap would let an earlier
+                        // kind starve the later ones.
+                        let mut kind_items = Vec::new();
+                        let mut kind_entities = Vec::new();
+                        for s in section_list(&body) {
+                            for (_title, contents) in shelves_of(&[s]) {
+                                fold_rows(
+                                    &contents,
+                                    Some(kind),
+                                    &mut kind_items,
+                                    &mut kind_entities,
+                                );
+                            }
+                        }
+                        kind_items.truncate(limit);
+                        kind_entities.truncate(limit);
+                        items.extend(kind_items);
+                        entities.extend(kind_entities);
                     }
                 }
                 Section::Degraded(e) => {
@@ -660,8 +721,12 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
             .take()
             .unwrap_or_else(|| failed("transient", "ytm search".into())));
     }
-    items.truncate(limit);
-    entities.truncate(limit);
+    // Unfiltered caps the mixed page at the request limit; scoped
+    // asks already capped each kind inside its own section loop.
+    if !scoped {
+        items.truncate(limit);
+        entities.truncate(limit);
+    }
     // Fallback hero when the card was absent or unservable: the first
     // exact case-folded title match — entities before tracks.
     if top_hit.is_null() {
@@ -829,11 +894,21 @@ pub async fn entity(payload: &Value) -> Result<Value, GuestError> {
             }
         }
     }
+    // `complete` claims the page delivered in full — a continuation
+    // marker on any served section means a listing is paginated and
+    // what came back isn't the whole tracklist.
+    let complete = {
+        let mut nodes = 0usize;
+        find_key(&body, "continuationItemRenderer", 0, &mut nodes).is_none() && {
+            let mut nodes = 0usize;
+            find_key(&body, "nextContinuationData", 0, &mut nodes).is_none()
+        }
+    };
     Ok(json!({
         "entity": entity,
         "items": items,
         "related": related,
-        "complete": true,
+        "complete": complete,
     }))
 }
 
@@ -1188,5 +1263,198 @@ mod tests {
         let out = h.answer(&out, 404, "{}");
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "no-result");
+    }
+
+    #[test]
+    fn continuation_marker_marks_entity_incomplete() {
+        let mut h = Harness::new();
+        let out = h.invoke(
+            "catalog.entity",
+            json!({ "ref": { "provider": "youtube-music", "kind": "playlist",
+                             "id": "VLPLportisheadmix" } }),
+        );
+        // A paginated playlist: the tracklist shelf carries a
+        // continuationItemRenderer — the page isn't the whole truth.
+        let mut body: Value =
+            serde_json::from_str(BROWSE_PLAYLIST).unwrap_or_else(|e| panic!("fixture json: {e}"));
+        let mut nodes = 0usize;
+        let Some(shelf) = find_key(&body, "musicPlaylistShelfRenderer", 0, &mut nodes)
+            .and_then(Value::as_object)
+            .cloned()
+        else {
+            panic!("playlist shelf");
+        };
+        let mut shelf = shelf;
+        let Some(contents) = shelf["contents"].as_array_mut() else {
+            panic!("shelf contents");
+        };
+        contents.push(json!({
+            "continuationItemRenderer": {
+                "continuationEndpoint": {
+                    "continuationCommand": { "token": "CAES" }
+                }
+            }
+        }));
+        // Walk to the shelf's slot and swap in the paginated copy.
+        let mut nodes = 0usize;
+        let target = find_key_mut(&mut body, "musicPlaylistShelfRenderer", 0, &mut nodes)
+            .unwrap_or_else(|| panic!("shelf slot"));
+        *target = json!(shelf);
+        let out = h.answer(&out, 200, &body.to_string());
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["complete"], false);
+        let Some(items) = out["result"]["items"].as_array() else {
+            panic!("items array");
+        };
+        assert_eq!(items.len(), 2, "the delivered rows still surface");
+    }
+
+    /// find_key's mutable twin — test-only, rewrites one node.
+    fn find_key_mut<'a>(
+        v: &'a mut Value,
+        key: &str,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> Option<&'a mut Value> {
+        if depth > MAX_DEPTH || *nodes >= MAX_NODES {
+            return None;
+        }
+        *nodes += 1;
+        match v {
+            Value::Object(o) => {
+                if o.contains_key(key) {
+                    return o.get_mut(key);
+                }
+                for (_k, child) in o.iter_mut() {
+                    if matches!(child, Value::Object(_) | Value::Array(_)) {
+                        if let Some(found) = find_key_mut(child, key, depth + 1, nodes) {
+                            return Some(found);
+                        }
+                    }
+                }
+                None
+            }
+            Value::Array(a) => a
+                .iter_mut()
+                .find_map(|c| find_key_mut(c, key, depth + 1, nodes)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn empty_object_body_is_invalid_response_not_empty_results() {
+        let mut h = Harness::new();
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "x", "limit": 10, "storefront": null }),
+        );
+        let out = h.answer(&out, 200, "{}");
+        assert_eq!(out["type"], "fail");
+        assert_eq!(out["error"]["kind"], "invalid-response");
+    }
+
+    #[test]
+    fn malformed_storefront_is_rejected() {
+        let mut h = Harness::new();
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "x", "limit": 10, "storefront": 123 }),
+        );
+        assert_eq!(out["type"], "fail");
+        assert_eq!(out["error"]["kind"], "invalid-response");
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "x", "limit": 10, "storefront": "USA" }),
+        );
+        assert_eq!(out["error"]["kind"], "invalid-response");
+        // A two-letter code validates even though this provider
+        // ignores it upstream.
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "x", "limit": 10, "storefront": "US",
+                    "kinds": ["track"] }),
+        );
+        assert_eq!(out["kind"], "http_request");
+    }
+
+    #[test]
+    fn scoped_multi_kind_caps_per_kind() {
+        // kinds album+artist at limit 1: each kind's own filtered
+        // request caps at 1 — the artist survives the album's cap.
+        let mut h = Harness::new();
+        let out = h.invoke(
+            "catalog.search",
+            json!({ "query": "portishead", "limit": 1, "storefront": null,
+                    "kinds": ["album", "artist"] }),
+        );
+        fn artist_row(id: &str, name: &str) -> Value {
+            json!({
+                "musicResponsiveListItemRenderer": {
+                    "navigationEndpoint": {"browseEndpoint": {
+                        "browseId": id,
+                        "browseEndpointContextSupportedConfigs": {
+                            "browseEndpointContextMusicConfig": {
+                                "pageType": "MUSIC_PAGE_TYPE_ARTIST"}}}},
+                    "flexColumns": [{
+                        "musicResponsiveListItemFlexColumnRenderer": {
+                            "text": {"runs": [{"text": name}]}}}]
+                }
+            })
+        }
+        let artists_body = json!({
+            "contents": {
+                "sectionListRenderer": {
+                    "contents": [{
+                        "musicShelfRenderer": {
+                            "title": {"runs": [{"text": "Artists"}]},
+                            "contents": [
+                                artist_row("UCportishead9", "Portishead"),
+                                artist_row("UCmassive001", "Massive Attack"),
+                            ]
+                        }
+                    }]
+                }
+            }
+        })
+        .to_string();
+        let out = h.answer(&out, 200, SEARCH_ALBUMS);
+        assert_eq!(out["kind"], "http_request");
+        let out = h.answer(&out, 200, &artists_body);
+        assert_eq!(out["type"], "done");
+        let Some(entities) = out["result"]["entities"].as_array() else {
+            panic!("entities array");
+        };
+        let kinds: Vec<&str> = entities.iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert_eq!(kinds, ["album", "artist"], "each kind keeps its own cap");
+    }
+
+    #[test]
+    fn album_run_never_becomes_the_track_artist() {
+        // A second column holding only an album link leaves `artist`
+        // null rather than naming the album twice.
+        let row = json!({
+            "navigationEndpoint": {"watchEndpoint": {"videoId": "roadsvideo0"}},
+            "flexColumns": [
+                {"musicResponsiveListItemFlexColumnRenderer": {
+                    "text": {"runs": [{"text": "Roads"}]}}},
+                {"musicResponsiveListItemFlexColumnRenderer": {
+                    "text": {"runs": [
+                        {"text": "Dummy", "navigationEndpoint": {"browseEndpoint": {
+                            "browseId": "MPREb_dummy",
+                            "browseEndpointContextSupportedConfigs": {
+                                "browseEndpointContextMusicConfig": {
+                                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}}
+                    ]}}}
+            ]
+        });
+        let Some(r) = row.as_object() else {
+            panic!("row object");
+        };
+        let Some(t) = track_row_of(r) else {
+            panic!("track row");
+        };
+        assert_eq!(t["album"], "Dummy");
+        assert_eq!(t["artist"], Value::Null);
+        assert_eq!(t["album_ref"]["id"], "MPREb_dummy");
     }
 }

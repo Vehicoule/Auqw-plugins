@@ -1,8 +1,9 @@
 # youtube-music
 
 `playback.resolve` + `playback.candidates` + `radio.seed` +
-`catalog.suggest` provider for Auqw (ABI 0.3.0), built on the
-vendored `auqw-guest-sdk` async dispatch.
+`catalog.suggest` + `catalog.search` + `catalog.entity` provider
+for Auqw (ABI 0.3.0), built on the vendored `auqw-guest-sdk` async
+dispatch.
 
 ## playback.resolve
 
@@ -128,6 +129,36 @@ response for `musicResponsiveListItemRenderer` rows (bounded: depth 64,
 each row to `trackMetadata` with honest nulls where upstream is silent.
 Artwork is the largest HTTPS thumbnail only. The WEB_REMIX visitor is
 persisted under `visitor/web-remix` with the same staging semantics.
+
+## catalog.search
+
+Typed catalog search over WEB_REMIX `youtubei/v1/search`. The payload
+is `{query, limit, storefront}` plus optional `kinds` and
+`continuation`. `storefront` validates (null or two letters) but is
+never forwarded — this provider serves one global catalog.
+An unfiltered ask is one request: the `musicCardShelfRenderer`
+top result decodes to tagged `top_hit`, and every shelf's rows
+discriminate themselves by their own endpoints (servable browse
+pageType → `entities`, watch id → `items`; profiles/podcasts drop —
+a `Videos` shelf row is a playable track). A `kinds` ask re-queries
+under that kind's InnerTube `params`, one request per kind, with
+degraded rails warned-and-absent and all-fail surfacing the first
+typed failure; each kind caps at the request limit independently.
+First page only: `continuation` is always null and a supplied one is
+a foreign token.
+
+## catalog.entity
+
+Album/artist/playlist pages over WEB_REMIX `youtubei/v1/browse` on
+the browseId minted into entity refs (`MPREb_`, `UC`, `VL`).
+Detail/immersive headers → `entityMetadata`;
+`musicShelfRenderer`/`musicPlaylistShelfRenderer` rows
+(`musicResponsiveListItemRenderer` or `playlistPanelVideoRenderer`)
+→ `items`; artist carousels → `related` under
+`discography`/`appears-on`/`related` groups. A `continuationItemRenderer`
+anywhere on the page marks `complete:false` — a paginated listing is
+never reported as whole. Foreign refs are `not-applicable`; 4xx is
+`no-result`.
 
 ## catalog.suggest
 
