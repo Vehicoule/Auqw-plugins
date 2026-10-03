@@ -1,0 +1,27 @@
+{
+  "name": "youtube-music catalog.entity — album page yields header and tracklist",
+  "plugin": "youtube-music",
+  "capability": "catalog.entity",
+  "request": {
+    "ref": { "provider": "youtube-music", "kind": "album", "id": "MPREb_dummy" }
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/browse",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/catalog-browse-album.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "entity": { "kind": "album", "title": "Dummy" },
+      "items": [
+        { "title": "Mysterons", "artist_ref": { "id": "UCportishead9" } },
+        { "title": "SOS" }
+      ],
+      "complete": true
+    },
+    "max_http_calls": 1
+  }
+}

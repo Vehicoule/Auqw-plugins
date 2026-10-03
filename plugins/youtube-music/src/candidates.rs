@@ -15,18 +15,18 @@ use crate::parse::{visitor_data, visitor_token};
 
 /// InnerTube `search`. The `key` is YouTube's public embedded API key
 /// — every official client carries it on each `youtubei` call.
-const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
+pub(crate) const SEARCH_URL: &str = "https://music.youtube.com/youtubei/v1/search?key=AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30&prettyPrint=false";
 pub(crate) const CLIENT_NAME_ID: &str = "67";
 pub(crate) const CLIENT_VERSION: &str = "1.20260114.01.00";
 pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 /// InnerTube `params` selecting the songs filter.
-const SONGS_PARAMS: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
+pub(crate) const SONGS_PARAMS: &str = "EgWKAQIIAWoMEA4QChADEAQQCRAF";
 pub(crate) const VISITOR_KEY: &str = "visitor/web-remix";
 /// Response-walk bounds — upstream trees are deep but a pathological
 /// response must not spin the guest.
-const MAX_DEPTH: usize = 64;
-const MAX_NODES: usize = 10_000;
+pub(crate) const MAX_DEPTH: usize = 64;
+pub(crate) const MAX_NODES: usize = 10_000;
 
 /// A validated `playback.candidates` payload.
 struct CandidatesPayload {
@@ -279,7 +279,7 @@ pub async fn candidates(payload: &Value) -> Result<Value, GuestError> {
 /// `musicResponsiveListItemRenderer` in traversal order — shelf,
 /// item-section, and card shapes all nest them. Bounded so a
 /// pathological body cannot spin the guest.
-fn collect_renderers<'a>(
+pub(crate) fn collect_renderers<'a>(
     v: &'a Value,
     out: &mut Vec<&'a Map<String, Value>>,
     depth: usize,
@@ -310,7 +310,7 @@ fn collect_renderers<'a>(
 }
 
 /// Nested `Map` lookup — borrows, never clones.
-fn get_path<'a>(m: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
+pub(crate) fn get_path<'a>(m: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     let mut v = m.get(*keys.first()?)?;
     for k in &keys[1..] {
         v = v.get(*k)?;
@@ -321,7 +321,7 @@ fn get_path<'a>(m: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
 /// The row's video id: navigation watchEndpoint, overlay
 /// playNavigationEndpoint, or `playlistItemData` — first match with a
 /// valid id wins.
-fn video_id_of(r: &Map<String, Value>) -> Option<String> {
+pub(crate) fn video_id_of(r: &Map<String, Value>) -> Option<String> {
     const PATHS: &[&[&str]] = &[
         &["navigationEndpoint", "watchEndpoint", "videoId"],
         &[
@@ -364,7 +364,7 @@ pub(crate) fn runs_text(text: &Value) -> Option<String> {
 }
 
 /// The text node of a flex/fixed column entry.
-fn text_of(col: &Value) -> Option<String> {
+pub(crate) fn text_of(col: &Value) -> Option<String> {
     let renderer = col
         .get("musicResponsiveListItemFlexColumnRenderer")
         .or_else(|| col.get("musicResponsiveListItemFixedColumnRenderer"))?;
@@ -372,7 +372,7 @@ fn text_of(col: &Value) -> Option<String> {
 }
 
 /// Every `{text:{runs:[..]}}` inside a column entry.
-fn column_runs(col: &Value) -> Vec<&Map<String, Value>> {
+pub(crate) fn column_runs(col: &Value) -> Vec<&Map<String, Value>> {
     let mut runs = Vec::new();
     for key in [
         "musicResponsiveListItemFlexColumnRenderer",
@@ -539,7 +539,7 @@ pub(crate) fn best_artwork(v: &Value) -> Option<Value> {
 /// The same scan rooted at a renderer map — `item_of` holds `&Map`
 /// and cloning it into a `Value` just to name the root one is a deep
 /// clone of every renderer the search walks.
-fn best_artwork_obj(o: &Map<String, Value>) -> Option<Value> {
+pub(crate) fn best_artwork_obj(o: &Map<String, Value>) -> Option<Value> {
     let mut best: Option<(u64, Value)> = None;
     // One node for the root object itself, matching `artwork_walk`'s
     // accounting on a `Value::Object` at depth 0.

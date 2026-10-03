@@ -1,0 +1,29 @@
+{
+  "name": "youtube-music catalog.entity — artist page yields top songs and related rails",
+  "plugin": "youtube-music",
+  "capability": "catalog.entity",
+  "request": {
+    "ref": { "provider": "youtube-music", "kind": "artist", "id": "UCportishead9" }
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/browse",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/catalog-browse-artist.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "entity": { "kind": "artist", "title": "Portishead" },
+      "items": [{ "title": "Roads" }, { "title": "Glory Box" }],
+      "related": [
+        { "kind": "album", "group": "discography" },
+        { "kind": "playlist", "group": "appears-on" },
+        { "kind": "artist", "group": "related" }
+      ],
+      "complete": true
+    },
+    "max_http_calls": 1
+  }
+}

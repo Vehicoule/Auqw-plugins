@@ -1,14 +1,16 @@
 {
   "abi": "0.3.0",
   "artifact": {
-    "digest": "sha256:6bc0c88a306717b76605a379bc4eda45d74c667e3ddcdf40203ef07edb9064fa",
+    "digest": "sha256:7a0c74588c91fd3c039343a91bb2c150268fe87b6ecc311ef8d0f0930cf0e046",
     "path": "dist/youtube-music.wasm"
   },
   "capabilities": [
     "playback.resolve",
     "playback.candidates",
     "radio.seed",
-    "catalog.suggest"
+    "catalog.suggest",
+    "catalog.entity",
+    "catalog.search"
   ],
   "id": "youtube-music",
   "permissions": [

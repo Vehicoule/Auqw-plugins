@@ -101,6 +101,8 @@ pub fn dispatch(inv: Invocation) -> GuestFuture {
             "playback.candidates" => crate::candidates::candidates(&inv.payload).await,
             "radio.seed" => crate::radio::radio_seed(&inv.payload).await,
             "catalog.suggest" => crate::suggest::suggest(&inv.payload).await,
+            "catalog.search" => crate::catalog::search(&inv.payload).await,
+            "catalog.entity" => crate::catalog::entity(&inv.payload).await,
             other => Err(failed(
                 "not-applicable",
                 format!("capability {other} not supported"),
@@ -281,7 +283,7 @@ fn parse_resolve_payload(payload: &Value) -> Result<ResolvePayload, GuestError> 
 /// `cancelled` is the abort signal, `permission-denied` and
 /// `invalid-response` are contract violations. Anything else is
 /// weather — retryable by nature.
-fn is_terminal_kind(kind: &str) -> bool {
+pub(crate) fn is_terminal_kind(kind: &str) -> bool {
     matches!(kind, "cancelled" | "permission-denied" | "invalid-response")
 }
 

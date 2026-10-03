@@ -1,0 +1,24 @@
+{
+  "name": "youtube-music catalog.entity — playlist page yields header and tracklist",
+  "plugin": "youtube-music",
+  "capability": "catalog.entity",
+  "request": {
+    "ref": { "provider": "youtube-music", "kind": "playlist", "id": "VLPLportisheadmix" }
+  },
+  "upstreams": [
+    {
+      "url_contains": "music.youtube.com/youtubei/v1/browse",
+      "status": 200,
+      "body_file": "../../plugins/youtube-music/fixtures/catalog-browse-playlist.json"
+    }
+  ],
+  "expect": {
+    "result": "ok",
+    "result_subset": {
+      "entity": { "kind": "playlist", "title": "This Is Portishead" },
+      "items": [{ "title": "Roads" }, { "title": "Glory Box" }],
+      "complete": true
+    },
+    "max_http_calls": 1
+  }
+}

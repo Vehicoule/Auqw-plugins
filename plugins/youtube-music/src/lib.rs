@@ -5,6 +5,7 @@
 //! over the WEB_REMIX `next` endpoint (ABI 0.3.0).
 
 mod candidates;
+mod catalog;
 mod guest;
 mod parse;
 mod radio;

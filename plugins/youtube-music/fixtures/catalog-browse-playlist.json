@@ -1,0 +1,68 @@
+{
+  "responseContext": {},
+  "header": {
+    "musicEditablePlaylistDetailHeaderRenderer": {
+      "title": { "runs": [{ "text": "This Is Portishead" }] },
+      "subtitle": {
+        "runs": [
+          { "text": "Playlist" },
+          { "text": " • " },
+          { "text": "YouTube Music" },
+          { "text": " • " },
+          { "text": "42 songs" }
+        ]
+      },
+      "thumbnail": {
+        "croppedSquareThumbnailRenderer": {
+          "thumbnail": {
+            "thumbnails": [
+              { "url": "https://lh3.googleusercontent.com/thisis=w544-h544", "width": 544, "height": 544 }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "contents": {
+    "singleColumnBrowseResultsRenderer": {
+      "tabs": [
+        {
+          "tabRenderer": {
+            "content": {
+              "sectionListRenderer": {
+                "contents": [
+                  {
+                    "musicPlaylistShelfRenderer": {
+                      "contents": [
+                        {
+                          "playlistPanelVideoRenderer": {
+                            "videoId": "roadsvideo0",
+                            "title": { "runs": [{ "text": "Roads" }] },
+                            "shortBylineText": {
+                              "runs": [{ "text": "Portishead" }]
+                            },
+                            "lengthText": { "runs": [{ "text": "5:02" }] }
+                          }
+                        },
+                        {
+                          "playlistPanelVideoRenderer": {
+                            "videoId": "gloryboxvid",
+                            "title": { "runs": [{ "text": "Glory Box" }] },
+                            "shortBylineText": {
+                              "runs": [{ "text": "Portishead" }]
+                            },
+                            "lengthText": { "runs": [{ "text": "5:06" }] }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
