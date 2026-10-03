@@ -1672,7 +1672,7 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
     // Every rung resolved but every mint refused the boundary probe:
     // provider serving is restricted right now — retryable weather.
     if !outcomes.is_empty() && outcomes.iter().all(|o| *o == RungOutcome::Capped) {
-        return failed("transient", "streams-capped".into());
+        return failed("streams-capped", "streams-capped".into());
     }
     // Ranking fallback: the last outcome that is not a restricted-
     // format verdict decides — mixed into weather, a SABR/ciphered
@@ -1713,7 +1713,7 @@ fn ladder_error(outcomes: &[RungOutcome], pin_missing: bool, pin_seen: bool) -> 
         | RungOutcome::CipheredOnly
         | RungOutcome::RateLimited
         | RungOutcome::Transport => failed("transient", "transport".into()),
-        RungOutcome::Capped => failed("transient", "streams-capped".into()),
+        RungOutcome::Capped => failed("streams-capped", "streams-capped".into()),
     }
 }
 
@@ -2394,7 +2394,7 @@ mod tests {
         probe_of(&out);
         out = h.answer(&out, 404, "");
         assert_eq!(out["type"], "fail", "{out}");
-        assert_eq!(out["error"]["kind"], "transient", "{out}");
+        assert_eq!(out["error"]["kind"], "streams-capped", "{out}");
         assert!(
             out["error"]["message"]
                 .as_str()
@@ -2803,7 +2803,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "streams-capped".to_string())
+            ("streams-capped".to_string(), "streams-capped".to_string())
         );
     }
 
@@ -4658,7 +4658,7 @@ mod tests {
         }
         assert_eq!(
             fail_kind(&out),
-            ("transient".to_string(), "streams-capped".to_string())
+            ("streams-capped".to_string(), "streams-capped".to_string())
         );
     }
 

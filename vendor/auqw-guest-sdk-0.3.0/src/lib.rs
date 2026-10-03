@@ -136,6 +136,7 @@ const ERROR_KINDS: &[&str] = &[
     "invalid-response",
     "timeout",
     "cancelled",
+    "streams-capped",
 ];
 
 /// Shim state kept between `handle` entries. Guests are single-
