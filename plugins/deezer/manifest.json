@@ -6,6 +6,7 @@
   },
   "capabilities": [
     "catalog.search",
+    "catalog.search.kinds",
     "catalog.metadata",
     "catalog.entity"
   ],
