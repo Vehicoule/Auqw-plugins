@@ -69,7 +69,7 @@ vendor directory.
 | `plugins/youtube-music` | `playback.resolve` + `playback.candidates` + `radio.seed` + `catalog.suggest` + `catalog.search` + `catalog.entity` guest (ABI 0.1.0) |
 | `plugins/itunes` | iTunes catalog guest (`catalog.search`/`metadata`/`artwork`) |
 | `plugins/deezer` | Deezer catalog guest (`catalog.search`/`metadata`/`entity`, ABI 0.1.0) |
-| `vendor/auqw-guest-sdk-0.3.0` | Packaged guest SDK source (the dir name is historical; guests pin `abi "0.1.0"`) |
+| `vendor/auqw-guest-sdk-0.3.0` | Packaged guest SDK 0.3.0 source (the crate version; guests' manifests pin `abi "0.1.0"`, a separate value) |
 | `tooling/validate` | Standalone artifact validator |
 | `tooling/build.sh` | Build + stage + validate one plugin |
 | `tooling/sign.mjs` | ed25519 release signing: keygen/sign/verify/pubkey |

@@ -3,7 +3,7 @@ name = "auqw-lyrics-lrclib"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "LRCLIB lyrics guest: lyrics.plain + lyrics.synced (ABI 0.3.0)"
+description = "LRCLIB lyrics guest: lyrics.plain + lyrics.synced (ABI 0.1.0)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

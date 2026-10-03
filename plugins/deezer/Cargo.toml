@@ -3,7 +3,7 @@ name = "auqw-deezer"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Deezer catalog guest: catalog.search/metadata/entity (ABI 0.3.0)"
+description = "Deezer catalog guest: catalog.search/metadata/entity (ABI 0.1.0)"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
