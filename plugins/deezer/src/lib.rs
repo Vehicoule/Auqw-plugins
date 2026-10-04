@@ -342,10 +342,11 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
     }))
 }
 
-/// A title's matchable form: lowercase, Latin diacritics folded to
-/// base letters, non-alphanumeric runs collapsed to single spaces, a
-/// leading "the" dropped. "Beyoncé" and "beyonce", "THE  BEATLES"
-/// and "the-beatles" all compare alike.
+/// A title's matchable form: lowercase FIRST (so accents fold on
+/// capitals too), then Latin diacritics folded to base letters,
+/// combining marks riding their base letter, non-alphanumeric runs
+/// collapsed to single spaces, a leading "the" dropped. "Beyoncé",
+/// "beyonce" and "BEYONCÉ" all compare alike.
 fn normalize_title(s: &str) -> String {
     fn fold(c: char) -> &'static str {
         match c {
@@ -377,19 +378,23 @@ fn normalize_title(s: &str) -> String {
     }
     let mut out = String::with_capacity(s.len());
     let mut pending_space = false;
-    for c in s.trim().chars() {
-        let folded = fold(c);
+    for m in s.trim().chars().flat_map(char::to_lowercase) {
+        // A combining mark rides its base letter — a decomposed é
+        // normalizes identically to the composed one, not as a
+        // separator.
+        if ('\u{300}'..='\u{36f}').contains(&m) {
+            continue;
+        }
+        let folded = fold(m);
         if folded.is_empty() {
-            for m in c.to_lowercase() {
-                if m.is_alphanumeric() {
-                    if pending_space && !out.is_empty() {
-                        out.push(' ');
-                    }
-                    pending_space = false;
-                    out.push(m);
-                } else {
-                    pending_space = true;
+            if m.is_alphanumeric() {
+                if pending_space && !out.is_empty() {
+                    out.push(' ');
                 }
+                pending_space = false;
+                out.push(m);
+            } else {
+                pending_space = true;
             }
         } else {
             if pending_space && !out.is_empty() {
@@ -405,26 +410,44 @@ fn normalize_title(s: &str) -> String {
     }
 }
 
-/// The title with trailing `(…)`/`[…]` groups dropped — "Roads (2009
-/// Remaster)" still names "roads". Nested/leading groups keep the
-/// full title: a cut only counts when plain text precedes it.
+/// The title with complete trailing `(…)`/`[…]` groups dropped —
+/// "Roads (2009 Remaster)" still names "roads". A bracket group only
+/// strips when it closes cleanly at the very end: "Song [Live] Part
+/// Two" keeps its interior group and its whole title.
 fn core_title(s: &str) -> &str {
-    match s.find(['(', '[']) {
-        Some(i) if s[..i].trim().is_empty() => s,
-        Some(i) => s[..i].trim_end(),
-        None => s,
+    let mut out = s;
+    loop {
+        let t = out.trim_end();
+        let Some(open) = t.rfind(|c| c == '(' || c == '[') else { break };
+        let close = if t.as_bytes()[open] == b'(' { ')' } else { ']' };
+        let tail = &t[open..];
+        if !tail.ends_with(close)
+            || tail.matches(close).count() != 1
+            || t[..open].trim().is_empty()
+        {
+            break;
+        }
+        out = t[..open].trim_end();
     }
+    out
 }
 
-/// Hero match strength, strongest first: 2 = normalized equal, 1 =
-/// the title starts with the query, 0 = the title contains it. The
-/// loose tiers only fire on a ≥3-char normalized query — a one- or
-/// two-letter ask matching by substring is noise, not a top hit.
+/// Hero match strength, strongest first: 3 = the full normalized
+/// title equals the query, 2 = only the edition-stripped core does,
+/// 1 = a title starts with the query, 0 = one contains it. Full
+/// equality outranking core equality lets the studio "Roads" beat
+/// "Roads (Live)" — the parenthesized version is a different
+/// recording, not the same song. The loose tiers only fire on a
+/// ≥3-char normalized query — a one- or two-letter ask matching by
+/// substring is noise, not a top hit.
 fn title_match(query: &str, title: &str) -> Option<u8> {
     let q = normalize_title(query);
     let t = normalize_title(title);
+    if t == q {
+        return Some(3);
+    }
     let core = normalize_title(core_title(title));
-    if t == q || core == q {
+    if core == q {
         return Some(2);
     }
     if q.chars().count() < 3 {
@@ -446,7 +469,7 @@ fn title_match(query: &str, title: &str) -> Option<u8> {
 /// for almost every real query; prefix and substring tiers catch the
 /// artist/album the user actually named.
 fn top_hit(query: &str, entities: &[Value], items: &[Value]) -> Value {
-    for tier in [2u8, 1, 0] {
+    for tier in [3u8, 2, 1, 0] {
         if let Some(e) = entities.iter().find(|e| {
             e["title"]
                 .as_str()
@@ -1054,15 +1077,24 @@ mod tests {
         assert_eq!(hit["item"]["title"], "Trip-Hop Classics", "{out}");
     }
 
-    /// The matcher's tiers: normalized equal (diacritics, case,
-    /// punctuation, leading "the", edition parentheticals), then
+    /// The matcher's tiers: full normalized equal (diacritics, case,
+    /// punctuation, leading "the"), then edition-stripped equal, then
     /// prefix, then substring — both loose tiers gated on ≥3 chars.
     #[test]
     fn title_match_tiers() {
-        assert_eq!(title_match("roads", "Roads"), Some(2));
+        assert_eq!(title_match("roads", "Roads"), Some(3));
+        // A version/edition tag is a different recording: it scores one
+        // tier below a full-title exact, so the studio cut wins.
+        assert_eq!(title_match("roads", "Roads (Live)"), Some(2));
         assert_eq!(title_match("roads", "Roads (2009 Remaster)"), Some(2));
-        assert_eq!(title_match("beyonce", "Beyoncé"), Some(2));
-        assert_eq!(title_match("beatles", "The Beatles"), Some(2));
+        // An interior bracket group is title text — "Song [Live] Part
+        // Two" prefixes "song", it does not equal it.
+        assert_eq!(title_match("song", "Song [Live] Part Two"), Some(1));
+        assert_eq!(title_match("beyonce", "Beyoncé"), Some(3));
+        assert_eq!(title_match("beyonce", "BEYONCÉ"), Some(3));
+        // Decomposed accents normalize like composed ones.
+        assert_eq!(title_match("beyonce", "Beyonce\u{301}"), Some(3));
+        assert_eq!(title_match("beatles", "The Beatles"), Some(3));
         assert_eq!(title_match("trip-hop", "Trip-Hop Classics"), Some(1));
         assert_eq!(title_match("phonk", "Brazilian Phonk Mano"), Some(0));
         assert_eq!(title_match("ab", "Abbey Road"), None);
