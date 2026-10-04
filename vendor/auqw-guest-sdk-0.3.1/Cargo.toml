@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "auqw-guest-sdk"
-version = "0.3.0"
+version = "0.3.1"
 build = false
 autolib = false
 autobins = false

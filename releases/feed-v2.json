@@ -1,0 +1,85 @@
+{
+  "keyId": "42d8cac606f16c04",
+  "plugins": [
+    {
+      "id": "deezer",
+      "version": "0.1.4",
+      "abi": "0.3.0",
+      "wasm_sha256": "sha256:175bba30b3b0617e3389273f97bdb4418bd33ecb20abf2c0d87e8c060c7c4425",
+      "manifest_sha256": "sha256:0bc41c62c1c4f86bb7db96c5073dbcee65484775d78161ad8780948f6a5061e2",
+      "signature": "9OZLjnHmfZ0N4ErVIKmRt8ZmHHa29RdCBokYTXIq3Zeu5L1/E+tQCp2lFcUqLb27GCW78p29E9CXe1eQnNMtAg=="
+    },
+    {
+      "id": "deezer",
+      "version": "0.2.2",
+      "abi": "0.1.0",
+      "wasm_sha256": "sha256:4f1c58b55b2c0010fa73b51f30ee0804a04a8e79df699f37d1cb8329815c43cf",
+      "manifest_sha256": "sha256:bd0163ff75e39c4f387738714aee7425e87d63f268208a9497b29a5890fcab01",
+      "signature": "turJiWJ7lNDVGaJqzv58aAQrlEjUZOYarg8blfSsRiZsGSjsYTZwUcJd7l0FFzeTb8EE6UpItdiC+epHp0K5Cg=="
+    },
+    {
+      "id": "itunes",
+      "version": "0.1.0",
+      "abi": "0.2.0",
+      "wasm_sha256": "sha256:a91bbdfca835784adca2dd10b8fa817bedd054e9386b05aa815714a35a99567d",
+      "manifest_sha256": "sha256:bf8c3b0afcabc90879dc080e919b6401e1e59e76782f9f78a32ca22a6ce640df",
+      "signature": "RVOJYIxcULoMNUqlIX0gUbN610eJgvNYqU5xKe4903DP70qntMdSe/OMRcS8NF6DXzzC8KXwTB8TMo1nfGu+Bg=="
+    },
+    {
+      "id": "itunes",
+      "version": "0.2.4",
+      "abi": "0.3.0",
+      "wasm_sha256": "sha256:192ed4fdf1c9fa3a5b821ac21733f33bf26ebe13b2416ef3bcfe90d4406af2e2",
+      "manifest_sha256": "sha256:3c8d1d7277578d52f69e5bbe667bd5b5108e58520a94273be6810089233156a4",
+      "signature": "K+GpcOpIU2vHiiglx75F36PtzgmPkAyIB8A3etYcw0oNlibXoum7F3VNIb6Yg3zJt7bF1Bn7FQ4604JuYN/ZBg=="
+    },
+    {
+      "id": "itunes",
+      "version": "0.3.2",
+      "abi": "0.1.0",
+      "wasm_sha256": "sha256:b08a2a4b90c52bbc03944825a66af18913266f24b92f4f0b584802c00523627b",
+      "manifest_sha256": "sha256:bbd47da0957e9bc440e41da26f49b8864196da168f04e18f0b93d46a3b42542a",
+      "signature": "p6yDa7g0981W7sxzL0VC53IwmpnT2VCCNpGvzrl65C/Nx/Nc2o9SOePycdRL/xbhs7puZZ5/SR0KuU3UnSpeAA=="
+    },
+    {
+      "id": "lyrics-lrclib",
+      "version": "0.1.4",
+      "abi": "0.3.0",
+      "wasm_sha256": "sha256:6e759cabd05b35dd0b3baa070f217dd7ad9aa1377fd6c7eab2b838ab6cea3203",
+      "manifest_sha256": "sha256:6063ae631a87266ed2a95fbf78347a8cb81757a0b9a2f7e3d29bec6024c2e292",
+      "signature": "c2wy3IR7BwiYT/kIscKLQlhUTLmUDFM8dtA0xZoo8LzbqGGgpU8vsSQm5TNVfHDcEsiQ9S0ZQ/PHXzxR+5mOAA=="
+    },
+    {
+      "id": "lyrics-lrclib",
+      "version": "0.2.1",
+      "abi": "0.1.0",
+      "wasm_sha256": "sha256:8deda366dd33f1b6376a0838591e2acdbb4ef0aa040eb7a47b7b7c35cfe4800a",
+      "manifest_sha256": "sha256:891771ac041a3424dd0cae9c99d9b1c5bdea8ae23b7c049c3c7570d40d5fb3c2",
+      "signature": "CyEuoCKaSptAwzITHxOW5Y3MX3HcQs3mA3TAvU1gB8RJjndI6TePS6dORoAy09kynR+ihd69DACugMgQ2BmcBg=="
+    },
+    {
+      "id": "youtube-music",
+      "version": "0.2.0",
+      "abi": "0.2.0",
+      "wasm_sha256": "sha256:e763c7b70f9eb50e3ed63550e87f31b9a2ab18aa92cd774bcb5981738f974fe0",
+      "manifest_sha256": "sha256:bac70dce05bc3e55b37a83a846300bb33bf638a2a3747ffd95618eef0a9a7e61",
+      "signature": "oouuI4OLUmBZWQyMcuCdHGOCqee/Pyzr0UbZQQyWTEqpbZdBajkV6cU+FufEucpBA8kbnEmRspen5zAwKGMXBg=="
+    },
+    {
+      "id": "youtube-music",
+      "version": "0.4.13",
+      "abi": "0.3.0",
+      "wasm_sha256": "sha256:1a8772ea54c31c723dab025e1f7df3f866ff5b06eb494c94b2b10ed841b87fce",
+      "manifest_sha256": "sha256:b5067d631d876a1d8c4c52b415228fa0ccb6cca132bbe912e973350f8748717e",
+      "signature": "nZscMqAQVG14BIoN/sxtU3Je/6dOSJGBkVmGmSj0daraxK1XS7HTjy9ktcmbEhxaT/HoeRkvJXGnPTSEJr3CCg=="
+    },
+    {
+      "id": "youtube-music",
+      "version": "0.5.2",
+      "abi": "0.1.0",
+      "wasm_sha256": "sha256:7cd83bbf7e6b61892ad8c9cc7537b6d4b591391fb61ef75c582d0aa9273b63cd",
+      "manifest_sha256": "sha256:960ffb7ede1dfcb3cebddf897731251533b699b8e24b4ef260d86d967587853b",
+      "signature": "L6VEqv9pEvrXZ8XaFSBBr5+UKuNTkGboe2l8uKKLHpQslauqlBGtpxwOwnIsd0Y2RZ3aAI1lQL0tAfoi0aYnBQ=="
+    }
+  ]
+}
