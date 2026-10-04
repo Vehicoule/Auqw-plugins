@@ -1,7 +1,7 @@
 {
   "abi": "0.1.0",
   "artifact": {
-    "digest": "sha256:5ffa9b5ea7774943779fecd654c05d29df557bf2d0d587c80eac2d81800e1592",
+    "digest": "sha256:27888587475415ce971fefd1247bb4c613e9007ddef8e78069ee4d7a84330bde",
     "path": "dist/itunes.wasm"
   },
   "capabilities": [
