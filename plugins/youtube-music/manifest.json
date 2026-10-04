@@ -8,7 +8,9 @@
     "playback.resolve",
     "playback.candidates",
     "radio.seed",
-    "catalog.suggest"
+    "catalog.suggest",
+    "catalog.entity",
+    "catalog.search"
   ],
   "id": "youtube-music",
   "permissions": [

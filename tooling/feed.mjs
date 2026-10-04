@@ -76,6 +76,16 @@ const build = () => {
       /^\d+\.\d+\.\d+$/.test(v),
     );
     if (versions.length === 0) continue;
+    // sign.mjs's VERSION_RE admits leading zeros (`0.02.1`); two
+    // spellings of the same numbers tie under cmpSemver and make the
+    // "latest" pick depend on readdir order, so a version dir must be
+    // spelled canonically.
+    for (const v of versions) {
+      const canonical = semverKey(v).join('.');
+      if (v !== canonical) {
+        fail(`${id}/${v}: non-canonical version dir (canonical spelling: ${canonical})`);
+      }
+    }
     // First pass: provenance per version, latest version per abi
     // line. Ascending order means a later set() wins the line.
     const byAbi = new Map();
@@ -94,6 +104,13 @@ const build = () => {
       ) {
         fail(`${id}/${version}: provenance is incomplete or disagrees with the dir`);
       }
+      // The client strictly validates every entry: keyId must equal
+      // the embedded trust id's 16-hex shape. One malformed entry
+      // makes it reject the WHOLE feed, so refuse here — the same
+      // way digest drift is refused — instead of publishing it.
+      if (typeof provenance.key_id !== 'string' || !/^[0-9a-f]{16}$/.test(provenance.key_id)) {
+        fail(`${id}/${version}: key_id is not 16 lowercase hex chars`);
+      }
       if (keyId === undefined) keyId = provenance.key_id;
       if (keyId !== provenance.key_id) {
         fail(`${id}/${version}: key_id ${provenance.key_id} mixes with ${keyId}`);
@@ -106,6 +123,13 @@ const build = () => {
         readFileSync(join(rel, 'provenance.json'), 'utf8'),
       );
       const signature = readFileSync(join(rel, 'signature'), 'utf8').trim();
+      // The signature must strict-base64-decode to a 64-byte ed25519
+      // signature — one malformed entry makes the client reject the
+      // whole feed, same as digest drift.
+      const sigBytes = Buffer.from(signature, 'base64');
+      if (sigBytes.length !== 64 || sigBytes.toString('base64') !== signature) {
+        fail(`${id}/${version}: signature is not strict-base64 ed25519`);
+      }
       // Re-hash the bytes on disk — the feed must never ship an
       // entry whose artifact or manifest drifted from what was
       // signed. The signature itself is still verified at install
