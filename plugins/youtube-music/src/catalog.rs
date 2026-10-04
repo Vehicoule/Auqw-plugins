@@ -359,6 +359,103 @@ fn card_hit(card: &Map<String, Value>) -> Value {
     Value::Null
 }
 
+/// A title's matchable form: lowercase, Latin diacritics folded to
+/// base letters, non-alphanumeric runs collapsed to single spaces, a
+/// leading "the" dropped. "Beyoncé" and "beyonce", "THE  BEATLES"
+/// and "the-beatles" all compare alike.
+fn normalize_title(s: &str) -> String {
+    fn fold(c: char) -> &'static str {
+        match c {
+            'à'..='å' | 'ā' | 'ă' | 'ą' => "a",
+            'æ' => "ae",
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
+            'ď' | 'đ' | 'ð' => "d",
+            'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+            'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+            'ĥ' | 'ħ' => "h",
+            'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+            'ĵ' => "j",
+            'ķ' | 'ĸ' => "k",
+            'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+            'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => "n",
+            'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+            'œ' => "oe",
+            'ŕ' | 'ŗ' | 'ř' => "r",
+            'ś' | 'ŝ' | 'ş' | 'š' => "s",
+            'ß' => "ss",
+            'ţ' | 'ť' | 'ŧ' => "t",
+            'þ' => "th",
+            'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+            'ŵ' => "w",
+            'ý' | 'ÿ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            _ => "",
+        }
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for c in s.trim().chars() {
+        let folded = fold(c);
+        if folded.is_empty() {
+            for m in c.to_lowercase() {
+                if m.is_alphanumeric() {
+                    if pending_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    pending_space = false;
+                    out.push(m);
+                } else {
+                    pending_space = true;
+                }
+            }
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push_str(folded);
+        }
+    }
+    match out.strip_prefix("the ") {
+        Some(rest) => rest.to_string(),
+        None => out,
+    }
+}
+
+/// The title with trailing `(…)`/`[…]` groups dropped — "Roads (2009
+/// Remaster)" still names "roads". Nested/leading groups keep the
+/// full title: a cut only counts when plain text precedes it.
+fn core_title(s: &str) -> &str {
+    match s.find(['(', '[']) {
+        Some(i) if s[..i].trim().is_empty() => s,
+        Some(i) => s[..i].trim_end(),
+        None => s,
+    }
+}
+
+/// Hero match strength, strongest first: 2 = normalized equal, 1 =
+/// the title starts with the query, 0 = the title contains it. The
+/// loose tiers only fire on a ≥3-char normalized query — a one- or
+/// two-letter ask matching by substring is noise, not a top hit.
+fn title_match(query: &str, title: &str) -> Option<u8> {
+    let q = normalize_title(query);
+    let t = normalize_title(title);
+    let core = normalize_title(core_title(title));
+    if t == q || core == q {
+        return Some(2);
+    }
+    if q.chars().count() < 3 {
+        return None;
+    }
+    if t.starts_with(&q) || core.starts_with(&q) {
+        return Some(1);
+    }
+    if t.contains(&q) || core.contains(&q) {
+        return Some(0);
+    }
+    None
+}
+
 /// A shelf's title → the contract kind its rows are; `None` for
 /// non-contract sections (videos, profiles, podcasts, episodes).
 fn kind_of_shelf_title(t: &str) -> Option<&'static str> {
@@ -730,20 +827,26 @@ pub async fn search(payload: &Value) -> Result<Value, GuestError> {
         items.truncate(limit);
         entities.truncate(limit);
     }
-    // Fallback hero when the card was absent or unservable: the first
-    // exact case-folded title match — entities before tracks.
+    // Fallback hero when the card was absent or unservable: strongest
+    // normalized title match — entities before tracks at each tier.
     if top_hit.is_null() {
-        let q = query.to_lowercase();
-        if let Some(e) = entities
-            .iter()
-            .find(|e| e["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
-        {
-            top_hit = json!({ "type": "entity", "item": e });
-        } else if let Some(t) = items
-            .iter()
-            .find(|t| t["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
-        {
-            top_hit = json!({ "type": "track", "item": t });
+        for tier in [2u8, 1, 0] {
+            if let Some(e) = entities.iter().find(|e| {
+                e["title"]
+                    .as_str()
+                    .is_some_and(|t| title_match(&query, t) == Some(tier))
+            }) {
+                top_hit = json!({ "type": "entity", "item": e });
+                break;
+            }
+            if let Some(t) = items.iter().find(|t| {
+                t["title"]
+                    .as_str()
+                    .is_some_and(|t| title_match(&query, t) == Some(tier))
+            }) {
+                top_hit = json!({ "type": "track", "item": t });
+                break;
+            }
         }
     }
     Ok(json!({
@@ -1024,6 +1127,21 @@ mod tests {
             }));
             self.drive(next)
         }
+    }
+
+    /// The matcher's tiers: normalized equal (diacritics, case,
+    /// punctuation, leading "the", edition parentheticals), then
+    /// prefix, then substring — both loose tiers gated on ≥3 chars.
+    #[test]
+    fn title_match_tiers() {
+        assert_eq!(title_match("roads", "Roads"), Some(2));
+        assert_eq!(title_match("roads", "Roads (2009 Remaster)"), Some(2));
+        assert_eq!(title_match("beyonce", "Beyoncé"), Some(2));
+        assert_eq!(title_match("beatles", "The Beatles"), Some(2));
+        assert_eq!(title_match("trip-hop", "Trip-Hop Classics"), Some(1));
+        assert_eq!(title_match("phonk", "Brazilian Phonk Mano"), Some(0));
+        assert_eq!(title_match("ab", "Abbey Road"), None);
+        assert_eq!(title_match("jazz", "Portishead"), None);
     }
 
     #[test]

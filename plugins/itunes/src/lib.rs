@@ -314,22 +314,127 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
     }))
 }
 
-/// The hero card: the first rail entity whose title is an exact
-/// case-folded match of the query — artists first by fetch order —
-/// else a track that matches, else `null`.
-fn top_hit(query: &str, entities: &[Value], items: &[Value]) -> Value {
-    let q = query.trim().to_lowercase();
-    if let Some(e) = entities
-        .iter()
-        .find(|e| e["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
-    {
-        return json!({ "type": "entity", "item": e });
+/// A title's matchable form: lowercase, Latin diacritics folded to
+/// base letters, non-alphanumeric runs collapsed to single spaces, a
+/// leading "the" dropped. "Beyoncé" and "beyonce", "THE  BEATLES"
+/// and "the-beatles" all compare alike.
+fn normalize_title(s: &str) -> String {
+    fn fold(c: char) -> &'static str {
+        match c {
+            'à'..='å' | 'ā' | 'ă' | 'ą' => "a",
+            'æ' => "ae",
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
+            'ď' | 'đ' | 'ð' => "d",
+            'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
+            'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
+            'ĥ' | 'ħ' => "h",
+            'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
+            'ĵ' => "j",
+            'ķ' | 'ĸ' => "k",
+            'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
+            'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => "n",
+            'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+            'œ' => "oe",
+            'ŕ' | 'ŗ' | 'ř' => "r",
+            'ś' | 'ŝ' | 'ş' | 'š' => "s",
+            'ß' => "ss",
+            'ţ' | 'ť' | 'ŧ' => "t",
+            'þ' => "th",
+            'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
+            'ŵ' => "w",
+            'ý' | 'ÿ' => "y",
+            'ź' | 'ż' | 'ž' => "z",
+            _ => "",
+        }
     }
-    items
-        .iter()
-        .find(|t| t["title"].as_str().is_some_and(|t| t.to_lowercase() == q))
-        .map(|t| json!({ "type": "track", "item": t }))
-        .unwrap_or(Value::Null)
+    let mut out = String::with_capacity(s.len());
+    let mut pending_space = false;
+    for c in s.trim().chars() {
+        let folded = fold(c);
+        if folded.is_empty() {
+            for m in c.to_lowercase() {
+                if m.is_alphanumeric() {
+                    if pending_space && !out.is_empty() {
+                        out.push(' ');
+                    }
+                    pending_space = false;
+                    out.push(m);
+                } else {
+                    pending_space = true;
+                }
+            }
+        } else {
+            if pending_space && !out.is_empty() {
+                out.push(' ');
+            }
+            pending_space = false;
+            out.push_str(folded);
+        }
+    }
+    match out.strip_prefix("the ") {
+        Some(rest) => rest.to_string(),
+        None => out,
+    }
+}
+
+/// The title with trailing `(…)`/`[…]` groups dropped — "Roads (2009
+/// Remaster)" still names "roads". Nested/leading groups keep the
+/// full title: a cut only counts when plain text precedes it.
+fn core_title(s: &str) -> &str {
+    match s.find(['(', '[']) {
+        Some(i) if s[..i].trim().is_empty() => s,
+        Some(i) => s[..i].trim_end(),
+        None => s,
+    }
+}
+
+/// Hero match strength, strongest first: 2 = normalized equal, 1 =
+/// the title starts with the query, 0 = the title contains it. The
+/// loose tiers only fire on a ≥3-char normalized query — a one- or
+/// two-letter ask matching by substring is noise, not a top hit.
+fn title_match(query: &str, title: &str) -> Option<u8> {
+    let q = normalize_title(query);
+    let t = normalize_title(title);
+    let core = normalize_title(core_title(title));
+    if t == q || core == q {
+        return Some(2);
+    }
+    if q.chars().count() < 3 {
+        return None;
+    }
+    if t.starts_with(&q) || core.starts_with(&q) {
+        return Some(1);
+    }
+    if t.contains(&q) || core.contains(&q) {
+        return Some(0);
+    }
+    None
+}
+
+/// The hero card: the strongest title match wins, entity rails before
+/// tracks at the same strength — artists first by fetch order, and the
+/// first match at each tier is the best hit since the API orders by
+/// relevance. Exact titles used to be the only match, which left the
+/// hero as the first track row for almost every real query; prefix
+/// and substring tiers catch the entity the user actually named.
+fn top_hit(query: &str, entities: &[Value], items: &[Value]) -> Value {
+    for tier in [2u8, 1, 0] {
+        if let Some(e) = entities.iter().find(|e| {
+            e["title"]
+                .as_str()
+                .is_some_and(|t| title_match(query, t) == Some(tier))
+        }) {
+            return json!({ "type": "entity", "item": e });
+        }
+        if let Some(t) = items.iter().find(|t| {
+            t["title"]
+                .as_str()
+                .is_some_and(|t| title_match(query, t) == Some(tier))
+        }) {
+            return json!({ "type": "track", "item": t });
+        }
+    }
+    Value::Null
 }
 
 async fn entity(payload: &Value) -> Result<Value, GuestError> {
@@ -803,6 +908,21 @@ mod tests {
         // Preview URLs never cross into the result.
         let s = out["result"].to_string();
         assert!(!s.contains("previewUrl") && !s.contains("audio-ssl"), "{s}");
+    }
+
+    /// The matcher's tiers: normalized equal (diacritics, case,
+    /// punctuation, leading "the", edition parentheticals), then
+    /// prefix, then substring — both loose tiers gated on ≥3 chars.
+    #[test]
+    fn title_match_tiers() {
+        assert_eq!(title_match("roads", "Roads"), Some(2));
+        assert_eq!(title_match("roads", "Roads (2009 Remaster)"), Some(2));
+        assert_eq!(title_match("beyonce", "Beyoncé"), Some(2));
+        assert_eq!(title_match("beatles", "The Beatles"), Some(2));
+        assert_eq!(title_match("trip-hop", "Trip-Hop Classics"), Some(1));
+        assert_eq!(title_match("phonk", "Brazilian Phonk Mano"), Some(0));
+        assert_eq!(title_match("ab", "Abbey Road"), None);
+        assert_eq!(title_match("jazz", "Portishead"), None);
     }
 
     #[test]
