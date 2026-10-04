@@ -3,11 +3,16 @@
 // builder re-hashes the staged wasm and manifest and refuses digest
 // drift, a manifest that disagrees with the release dir, or a
 // manifest whose artifact.digest no longer pins the staged bytes.
+// It also refuses entries the client's strict feed parser would
+// reject (a signature that isn't base64 ed25519, a malformed key_id —
+// one bad entry poisons the whole feed) and non-canonical version
+// dirs whose semver ties would make the "latest" pick
+// nondeterministic.
 //
 // Run: node --test tooling/feed.test.mjs   (from the repo root)
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -79,6 +84,52 @@ test('feed check refuses manifest digest drift', () => {
     const r = run(repo);
     assert.notEqual(r.status, 0, 'feed check must fail on manifest drift');
     assert.match(r.stderr, /manifest digest drift/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('feed check refuses a malformed signature', () => {
+  const repo = repoCopy();
+  try {
+    const v = latestRelease('deezer');
+    // Strict-base64 but 3 bytes, not a 64-byte ed25519 signature —
+    // the client's parser would reject the whole feed over this.
+    writeFileSync(join(repo, 'releases', 'deezer', v, 'signature'), 'AAAA\n');
+    const r = run(repo);
+    assert.notEqual(r.status, 0, 'feed check must fail on a malformed signature');
+    assert.match(r.stderr, /signature/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('feed check refuses a malformed key_id', () => {
+  const repo = repoCopy();
+  try {
+    const v = latestRelease('deezer');
+    const provenancePath = join(repo, 'releases', 'deezer', v, 'provenance.json');
+    const provenance = JSON.parse(readFileSync(provenancePath, 'utf8'));
+    provenance.key_id = 'not-hex';
+    writeFileSync(provenancePath, `${JSON.stringify(provenance, null, 2)}\n`);
+    const r = run(repo);
+    assert.notEqual(r.status, 0, 'feed check must fail on a malformed key_id');
+    assert.match(r.stderr, /key_id/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test('feed check refuses a non-canonical version dir', () => {
+  const repo = repoCopy();
+  try {
+    // `0.02.1` parses numerically equal to `0.2.1` under cmpSemver —
+    // coexisting spellings would make the "latest" pick depend on
+    // readdir order rather than recency.
+    mkdirSync(join(repo, 'releases', 'deezer', '0.02.1'));
+    const r = run(repo);
+    assert.notEqual(r.status, 0, 'feed check must fail on a non-canonical version dir');
+    assert.match(r.stderr, /canonical/);
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }
