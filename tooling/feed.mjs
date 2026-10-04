@@ -58,6 +58,16 @@ const build = () => {
       /^\d+\.\d+\.\d+$/.test(v),
     );
     if (versions.length === 0) continue;
+    // sign.mjs's VERSION_RE admits leading zeros (`0.02.1`); two
+    // spellings of the same numbers tie under cmpSemver and make the
+    // "latest" pick depend on readdir order, so a version dir must be
+    // spelled canonically.
+    for (const v of versions) {
+      const canonical = semverKey(v).join('.');
+      if (v !== canonical) {
+        fail(`${id}/${v}: non-canonical version dir (canonical spelling: ${canonical})`);
+      }
+    }
     const version = versions.sort(cmpSemver).at(-1);
     const rel = join(dir, version);
     const provenance = JSON.parse(
@@ -73,6 +83,18 @@ const build = () => {
       provenance.key_id === undefined
     ) {
       fail(`${id}/${version}: provenance is incomplete or disagrees with the dir`);
+    }
+    // The client strictly validates every entry: signature must
+    // strict-base64-decode to a 64-byte ed25519 signature and keyId
+    // must equal the embedded trust id's 16-hex shape. One malformed
+    // entry makes it reject the WHOLE feed, so refuse here — the same
+    // way digest drift is refused — instead of publishing it.
+    if (typeof provenance.key_id !== 'string' || !/^[0-9a-f]{16}$/.test(provenance.key_id)) {
+      fail(`${id}/${version}: key_id is not 16 lowercase hex chars`);
+    }
+    const sigBytes = Buffer.from(signature, 'base64');
+    if (sigBytes.length !== 64 || sigBytes.toString('base64') !== signature) {
+      fail(`${id}/${version}: signature is not strict-base64 ed25519`);
     }
     if (keyId === undefined) keyId = provenance.key_id;
     if (keyId !== provenance.key_id) {
