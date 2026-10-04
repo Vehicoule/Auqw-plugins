@@ -303,13 +303,15 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
     if !version_ok {
         return Err("manifest.version must be semver x.y.z".into());
     }
-    // abi: single "0.1.0" — the tier matrix existed for an installed
-    // base the prerelease never had; the one ABI serves every
-    // capability. Revisions stay immutable: a future ABI's
-    // capabilities never become valid on 0.1.0.
+    // abi: the 0.1.x line — the tier matrix existed for an installed
+    // base the prerelease never had; one line serves every
+    // capability (0.1.1 is additive: it adds only the http_batch
+    // host_request kind, which needs no capability bit). Revisions
+    // stay immutable: a future ABI's capabilities never become valid
+    // on 0.1.0.
     let abi = field_str("abi")?;
     let allowed_caps: &[&str] = match abi {
-        "0.1.0" => &[
+        "0.1.0" | "0.1.1" => &[
             "catalog.artwork",
             "catalog.entity",
             "catalog.metadata",
@@ -323,7 +325,7 @@ fn check_manifest(manifest: &serde_json::Value) -> Result<(), String> {
             "radio.seed",
         ],
         _ => {
-            return Err("manifest.abi must be \"0.1.0\"".into());
+            return Err("manifest.abi must be \"0.1.0\" or \"0.1.1\"".into());
         }
     };
     // capabilities: non-empty subset of the ABI's set
@@ -481,11 +483,16 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
         } else if p == "pot-provider" {
             has("pot_token")
         } else if let Some(dest) = p.strip_prefix("network:") {
-            // The guest must fetch at all, and a non-wildcard
+            // The guest must fetch at all — via `http_request` or, on
+            // the 0.1.1 line, `http_batch` — and a non-wildcard
             // destination must appear as a literal (its URLs are
             // formatted in the guest). Wildcards are exempt: their
             // URLs arrive in provider payloads.
-            has("http_request") && (dest.contains('*') || has_host(dest))
+            // (`http_batch` only counts on the 0.1.1 line — a 0.1.0
+            // host rejects the kind, so a batch-only 0.1.0 guest
+            // could never actually fetch.)
+            (has("http_request") || (manifest["abi"] == "0.1.1" && has("http_batch")))
+                && (dest.contains('*') || has_host(dest))
         } else {
             // Permission kinds without a statically-decidable use.
             true

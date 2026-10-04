@@ -35,7 +35,15 @@ fn failed(kind: &str, message: String) -> GuestError {
 /// envelopes, `invalid-response` on a non-JSON 2xx body; host and
 /// transport failures propagate with their `host_error` kind.
 pub async fn get_json(url: &str) -> Result<Outcome, GuestError> {
-    let resp = http_request(HttpRequest {
+    let resp = http_request(get(url)).await?;
+    classify(resp).await
+}
+
+/// The request shape every Deezer API call shares — one header set,
+/// so a batch fan-out issues the identical requests a sequential
+/// loop would.
+pub fn get(url: &str) -> HttpRequest {
+    HttpRequest {
         method: "GET".into(),
         url: url.into(),
         headers: vec![
@@ -43,8 +51,12 @@ pub async fn get_json(url: &str) -> Result<Outcome, GuestError> {
             ("Accept".into(), "application/json".into()),
         ],
         body: None,
-    })
-    .await?;
+    }
+}
+
+/// Status/envelope mapping for a response the caller already holds —
+/// shared between the single-call path and a batched fan-out.
+pub async fn classify(resp: HttpResponse) -> Result<Outcome, GuestError> {
     match resp.status {
         200..=299 => {
             let body: Value = serde_json::from_slice(&resp.body)

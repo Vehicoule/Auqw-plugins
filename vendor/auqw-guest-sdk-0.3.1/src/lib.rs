@@ -1,4 +1,4 @@
-//! Guest-side SDK over the Auqw plugin step ABI (0.1.0).
+//! Guest-side SDK over the Auqw plugin step ABI (0.1.x).
 //!
 //! A plugin crate writes an ordinary `async` dispatch function and
 //! exports it with [`export_plugin!`]; the shim below inverts the ABI's
@@ -118,6 +118,11 @@ impl LogLevel {
         }
     }
 }
+
+/// `http_batch` bound: one step carries at most this many authorized
+/// calls (the host mirrors the cap). [`http_requests`] splits longer
+/// slices into sequential batches.
+const MAX_BATCH_REQUESTS: usize = 8;
 
 /// The `errorKind` vocabulary from `messages.schema.json`: the only
 /// kinds a `host_error` may carry and the only kinds a guest `fail`
@@ -285,7 +290,14 @@ fn step(msg: Value) -> Value {
             FUTURE.with(|f| *f.borrow_mut() = Some(dispatch(invocation)));
             drive()
         }
-        Some("http_response" | "kv_response" | "host_ok" | "now_response" | "host_error") => {
+        Some(
+            "http_response"
+            | "http_batch_response"
+            | "kv_response"
+            | "host_ok"
+            | "now_response"
+            | "host_error",
+        ) => {
             if let Err(e) = validate_reply(&msg) {
                 return fail("invalid-response", &e.to_string());
             }
@@ -330,6 +342,7 @@ fn validate_reply(msg: &Value) -> Result<(), GuestError> {
     };
     let allowed: &[&str] = match t {
         "http_response" => &["type", "id", "status", "headers", "body"],
+        "http_batch_response" => &["type", "id", "results"],
         "host_error" => &["type", "id", "error"],
         "kv_response" => &["type", "id", "value"],
         "host_ok" => &["type", "id"],
@@ -360,17 +373,74 @@ fn validate_reply(msg: &Value) -> Result<(), GuestError> {
                 .get("headers")
                 .and_then(Value::as_array)
                 .ok_or_else(|| bad("http_response.headers missing".into()))?;
-            for h in headers {
-                let pair = h.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
-                    bad("http_response header must be a [name, value] pair".into())
-                })?;
-                if !pair.iter().all(Value::is_string) {
-                    return Err(bad("http_response header entries must be strings".into()));
-                }
-            }
+            check_header_pairs(headers, "http_response")?;
             msg.get("body")
                 .and_then(Value::as_str)
                 .ok_or_else(|| bad("http_response.body missing".into()))?;
+        }
+        "http_batch_response" => {
+            // Each item is a standalone `http_response` minus the
+            // envelope, or an `{error:{kind,message}}` verdict — exact
+            // keys and the same field discipline as the single reply.
+            let results = msg
+                .get("results")
+                .and_then(Value::as_array)
+                .ok_or_else(|| bad("http_batch_response.results missing".into()))?;
+            if results.is_empty() || results.len() > MAX_BATCH_REQUESTS {
+                return Err(bad(format!(
+                    "http_batch_response.results must carry 1..={MAX_BATCH_REQUESTS} items"
+                )));
+            }
+            for (i, item) in results.iter().enumerate() {
+                let bad_item = |m: &str| bad(format!("http_batch_response.results[{i}].{m}"));
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| bad_item("must be an object"))?;
+                if item.get("error").is_some() {
+                    for key in obj.keys() {
+                        if key != "error" {
+                            return Err(bad_item("carries an undeclared key"));
+                        }
+                    }
+                    let err_obj = item["error"]
+                        .as_object()
+                        .ok_or_else(|| bad_item("error must be an object"))?;
+                    for key in err_obj.keys() {
+                        if !["kind", "message"].contains(&key.as_str()) {
+                            return Err(bad_item("error carries an undeclared key"));
+                        }
+                    }
+                    let kind = item["error"]
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| bad_item("error.kind missing"))?;
+                    if !ERROR_KINDS.contains(&kind) {
+                        return Err(bad_item("error.kind is not in the ABI taxonomy"));
+                    }
+                    item["error"]
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| bad_item("error.message missing"))?;
+                    continue;
+                }
+                for key in obj.keys() {
+                    if !["status", "headers", "body"].contains(&key.as_str()) {
+                        return Err(bad_item("carries an undeclared key"));
+                    }
+                }
+                item.get("status")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| u16::try_from(v).ok())
+                    .ok_or_else(|| bad_item("status missing or out of range"))?;
+                let headers = item
+                    .get("headers")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| bad_item("headers missing"))?;
+                check_header_pairs(headers, &format!("http_batch_response.results[{i}]"))?;
+                item.get("body")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| bad_item("body missing"))?;
+            }
         }
         "host_error" => {
             let error = msg
@@ -413,6 +483,21 @@ fn validate_reply(msg: &Value) -> Result<(), GuestError> {
         }
         // `host_ok` carries only type+id — checked above.
         _ => {}
+    }
+    Ok(())
+}
+
+/// `[["name","value"], ...]` pairs, all strings — shared by
+/// `http_response` and each ok item of `http_batch_response`.
+fn check_header_pairs(headers: &[Value], what: &str) -> Result<(), GuestError> {
+    let bad = |m: &str| Err(GuestError::InvalidResponse(format!("{what} {m}")));
+    for h in headers {
+        let pair = h.as_array().filter(|p| p.len() == 2).ok_or_else(|| {
+            GuestError::InvalidResponse(format!("{what} header must be a [name, value] pair"))
+        })?;
+        if !pair.iter().all(Value::is_string) {
+            return bad("header entries must be strings");
+        }
     }
     Ok(())
 }
@@ -606,7 +691,14 @@ fn expect_type(resp: Value, want_type: &str) -> Result<Value, GuestError> {
 
 fn parse_http_response(resp: Value) -> Result<HttpResponse, GuestError> {
     let resp = expect_type(resp, "http_response")?;
-    let bad = |m: &str| GuestError::InvalidResponse(format!("http_response.{m}"));
+    parse_http_fields(&resp, "http_response")
+}
+
+/// Decode the status/headers/body triple a host call replied with —
+/// shared between the single `http_response` and each
+/// `http_batch_response` item; `what` prefixes error text.
+fn parse_http_fields(resp: &Value, what: &str) -> Result<HttpResponse, GuestError> {
+    let bad = |m: &str| GuestError::InvalidResponse(format!("{what}.{m}"));
     let status = resp
         .get("status")
         .and_then(Value::as_u64)
@@ -659,6 +751,82 @@ pub async fn http_request(req: HttpRequest) -> Result<HttpResponse, GuestError> 
     )
     .await?;
     parse_http_response(resp)
+}
+
+/// Fan several authorized HTTPS requests out through `http_batch`
+/// host requests — the only way to fetch concurrently under the
+/// one-call-in-flight ABI. Each batch carries at most
+/// `MAX_BATCH_REQUESTS` (8) items; a longer slice is split into
+/// sequential batches and an empty slice returns empty without a
+/// step. The host runs a batch's calls in parallel and answers
+/// `http_batch_response` with per-item results in request order; an
+/// `Err` item keeps single-call semantics (that call's
+/// [`GuestError::Host`]) without sinking its siblings.
+///
+/// # Errors
+/// [`GuestError::Host`] when a batch itself is refused —
+/// `unsupported` on a host that predates the kind — so a caller can
+/// fall back to sequential [`http_request`]s.
+/// [`GuestError::InvalidResponse`] on a protocol violation.
+pub async fn http_requests(
+    requests: &[HttpRequest],
+) -> Result<Vec<Result<HttpResponse, GuestError>>, GuestError> {
+    let mut out = Vec::with_capacity(requests.len());
+    for chunk in requests.chunks(MAX_BATCH_REQUESTS) {
+        out.append(&mut http_batch_once(chunk).await?);
+    }
+    Ok(out)
+}
+
+/// One `http_batch` host request for `requests.len() <= 8`.
+async fn http_batch_once(
+    requests: &[HttpRequest],
+) -> Result<Vec<Result<HttpResponse, GuestError>>, GuestError> {
+    let reqs: Vec<Value> = requests
+        .iter()
+        .map(|r| {
+            json!({
+                "method": r.method,
+                "url": r.url,
+                "headers": r.headers,
+                "body": r.body.as_ref().map(|b| B64.encode(b)),
+            })
+        })
+        .collect();
+    let resp = host_call("http_batch", json!({ "requests": reqs })).await?;
+    let resp = expect_type(resp, "http_batch_response")?;
+    let bad = |m: &str| GuestError::InvalidResponse(format!("http_batch_response.{m}"));
+    let results = resp
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("results missing"))?;
+    if results.len() != requests.len() {
+        return Err(bad("results length mismatch"));
+    }
+    let mut out = Vec::with_capacity(results.len());
+    for item in results {
+        if let Some(err) = item.get("error") {
+            out.push(Err(GuestError::Host {
+                kind: err
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("transient")
+                    .to_string(),
+                message: err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            }));
+        } else {
+            // A shape or decode failure is a protocol violation — it
+            // aborts the whole call like a malformed single
+            // `http_response`; only the host's own `{error}` verdicts
+            // arrive as per-item `Err`.
+            out.push(Ok(parse_http_fields(item, "http_batch_response item")?));
+        }
+    }
+    Ok(out)
 }
 
 /// Ask the host to mint a PO token for `content_binding` against its
@@ -966,6 +1134,201 @@ mod tests {
         let out = step_json(&json!({
             "type": "http_response", "id": id, "status": 200,
             "headers": [["only-name"]], "body": "",
+        }));
+        assert_eq!(out["type"], "fail");
+        assert_eq!(out["error"]["kind"], "invalid-response");
+        reset();
+    }
+
+    fn batch_dispatch(_inv: Invocation) -> GuestFuture {
+        Box::pin(async move {
+            let reqs = ["https://a.test/1", "https://a.test/2", "https://a.test/3"]
+                .iter()
+                .map(|u| HttpRequest {
+                    method: "GET".into(),
+                    url: u.to_string(),
+                    headers: vec![],
+                    body: None,
+                })
+                .collect::<Vec<_>>();
+            let results = http_requests(&reqs).await?;
+            let statuses: Vec<Value> = results
+                .iter()
+                .map(|r| match r {
+                    Ok(resp) => json!({ "status": resp.status }),
+                    Err(GuestError::Host { kind, .. }) => json!({ "err": kind }),
+                    Err(_) => json!({ "err": "other" }),
+                })
+                .collect();
+            Ok(json!({ "statuses": statuses }))
+        })
+    }
+
+    /// One `http_batch` step returns per-item results in request
+    /// order — ok items decode like a standalone `http_response`,
+    /// `error` items surface as that call's `GuestError::Host`.
+    #[test]
+    fn http_batch_decodes_per_item_results() {
+        reset();
+        dispatch_register(batch_dispatch);
+        let out = step_json(&json!({
+            "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+        }));
+        assert_eq!(out["kind"], "http_batch");
+        assert_eq!(out["payload"]["requests"].as_array().map(Vec::len), Some(3));
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let out = step_json(&json!({
+            "type": "http_batch_response", "id": id,
+            "results": [
+                { "status": 200, "headers": [], "body": "" },
+                { "error": { "kind": "permission-denied", "message": "nope" } },
+                { "status": 404, "headers": [], "body": "" },
+            ],
+        }));
+        assert_eq!(out["type"], "done");
+        assert_eq!(
+            out["result"]["statuses"],
+            json!([{"status": 200}, {"err": "permission-denied"}, {"status": 404}])
+        );
+        reset();
+    }
+
+    /// A top-level `host_error` to the batch (an old host's
+    /// `unsupported`) fails the whole call — the dispatch surfaces it
+    /// so the caller can fall back to sequential requests.
+    #[test]
+    fn http_batch_unsupported_fails_whole_call() {
+        reset();
+        dispatch_register(batch_dispatch);
+        let out = step_json(&json!({
+            "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+        }));
+        assert_eq!(out["kind"], "http_batch");
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let out = step_json(&json!({
+            "type": "host_error", "id": id,
+            "error": { "kind": "unsupported", "message": "no http_batch" },
+        }));
+        assert_eq!(out["type"], "fail");
+        assert_eq!(out["error"]["kind"], "unsupported");
+        reset();
+    }
+
+    fn batch9_dispatch(_inv: Invocation) -> GuestFuture {
+        Box::pin(async move {
+            let reqs = (1..=9)
+                .map(|i| HttpRequest {
+                    method: "GET".into(),
+                    url: format!("https://a.test/{i}"),
+                    headers: vec![],
+                    body: None,
+                })
+                .collect::<Vec<_>>();
+            let results = http_requests(&reqs).await?;
+            Ok(json!({ "n": results.len() }))
+        })
+    }
+
+    /// Nine requests exceed the per-step cap: the SDK splits them
+    /// into sequential `http_batch` steps (8 + 1), each one step of
+    /// the ABI's one-in-flight protocol.
+    #[test]
+    fn http_batch_chunks_past_cap() {
+        reset();
+        dispatch_register(batch9_dispatch);
+        let out = step_json(&json!({
+            "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+        }));
+        assert_eq!(out["kind"], "http_batch");
+        assert_eq!(out["payload"]["requests"].as_array().map(Vec::len), Some(8));
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let eight: Vec<Value> = (0..8)
+            .map(|_| json!({ "status": 200, "headers": [], "body": "" }))
+            .collect();
+        let out = step_json(&json!({
+            "type": "http_batch_response", "id": id, "results": eight,
+        }));
+        assert_eq!(out["kind"], "http_batch");
+        assert_eq!(out["payload"]["requests"].as_array().map(Vec::len), Some(1));
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let out = step_json(&json!({
+            "type": "http_batch_response", "id": id,
+            "results": [{ "status": 200, "headers": [], "body": "" }],
+        }));
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["n"], json!(9));
+        reset();
+    }
+
+    fn empty_batch_dispatch(_inv: Invocation) -> GuestFuture {
+        Box::pin(async move {
+            let results = http_requests(&[]).await?;
+            Ok(json!({ "n": results.len() }))
+        })
+    }
+
+    /// An empty slice returns empty without emitting a host request —
+    /// a zero-item batch is off-contract on the wire.
+    #[test]
+    fn http_batch_empty_short_circuits() {
+        reset();
+        dispatch_register(empty_batch_dispatch);
+        let out = step_json(&json!({
+            "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+        }));
+        assert_eq!(out["type"], "done");
+        assert_eq!(out["result"]["n"], json!(0));
+        reset();
+    }
+
+    /// Batch items must be exactly `{status,headers,body}` or
+    /// `{error:{kind,message}}` — extra keys anywhere are protocol
+    /// violations, matching the single-response discipline.
+    #[test]
+    fn http_batch_strict_item_shape() {
+        for item in [
+            json!({ "status": 200, "headers": [], "body": "", "extra": 1 }),
+            json!({ "error": { "kind": "transient", "message": "x" }, "status": 200 }),
+            json!({ "status": 200, "headers": [["only-name"]], "body": "" }),
+        ] {
+            reset();
+            dispatch_register(batch_dispatch);
+            let out = step_json(&json!({
+                "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+            }));
+            assert_eq!(out["kind"], "http_batch");
+            let id = out["id"].as_u64().unwrap_or(u64::MAX);
+            let out = step_json(&json!({
+                "type": "http_batch_response", "id": id,
+                "results": [item, { "status": 200, "headers": [], "body": "" },
+                            { "status": 200, "headers": [], "body": "" }],
+            }));
+            assert_eq!(out["type"], "fail");
+            assert_eq!(out["error"]["kind"], "invalid-response");
+        }
+        reset();
+    }
+
+    /// A malformed item (undecodable body) is a protocol violation on
+    /// the whole batch — like a malformed single `http_response`, it
+    /// fails the call instead of landing as a retriable per-item
+    /// verdict a caller could mistake for HTTP weather.
+    #[test]
+    fn http_batch_malformed_item_fails_the_call() {
+        reset();
+        dispatch_register(batch_dispatch);
+        let out = step_json(&json!({
+            "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+        }));
+        assert_eq!(out["kind"], "http_batch");
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let out = step_json(&json!({
+            "type": "http_batch_response", "id": id,
+            "results": [
+                { "status": 200, "headers": [], "body": "!" },
+                { "status": 200, "headers": [], "body": "" },
+                { "status": 200, "headers": [], "body": "" },
+            ],
         }));
         assert_eq!(out["type"], "fail");
         assert_eq!(out["error"]["kind"], "invalid-response");

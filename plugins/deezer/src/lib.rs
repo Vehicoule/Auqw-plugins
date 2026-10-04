@@ -18,7 +18,9 @@ mod encode;
 mod http;
 mod parse;
 
-use auqw_guest_sdk::{export_plugin, log, GuestError, GuestFuture, Invocation, LogLevel};
+use auqw_guest_sdk::{
+    export_plugin, http_requests, log, GuestError, GuestFuture, HttpRequest, Invocation, LogLevel,
+};
 use serde_json::{json, Map, Value};
 
 const API: &str = "https://api.deezer.com";
@@ -256,16 +258,16 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
     // kind it serves with the fresh index or a done marker.
     let mut more: Map<String, Value> = offsets.clone();
     let mut first_failure: Option<GuestError> = None;
-    let mut fetched = 0usize;
     let mut failures = 0usize;
     let q = encode::percent_encode(&query);
 
+    // The fetch plan first — a done kind keeps its marker and never
+    // refetches.
+    let mut plan: Vec<(&str, u64, String)> = Vec::new();
     for kind in &kinds {
-        // A done kind keeps its marker and never refetches.
         if offsets.get(*kind).is_some_and(Value::is_null) {
             continue;
         }
-        fetched += 1;
         let off = offsets.get(*kind).and_then(Value::as_u64).unwrap_or(0);
         let page = if *kind == "track" || scoped {
             limit
@@ -282,7 +284,54 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
             "track" => format!("{API}/search?q={q}&limit={page}{index}"),
             other => format!("{API}/search/{other}?q={q}&limit={page}{index}"),
         };
-        let rows = match http::get_json(&url).await {
+        plan.push((*kind, off, url));
+    }
+    let fetched = plan.len();
+
+    // One host round for the whole rail set: the 0.1.1 abi pin puts
+    // this guest on a host that serves `http_batch`; the sequential
+    // path stays for a manifest downgrade landing on a 0.1.0 host,
+    // which answers `unsupported`.
+    let mut outcomes: Vec<Result<http::Outcome, GuestError>> = Vec::with_capacity(fetched);
+    match fetched {
+        0 => {}
+        1 => outcomes.push(http::get_json(&plan[0].2).await),
+        _ => {
+            let reqs: Vec<HttpRequest> = plan.iter().map(|(_, _, url)| http::get(url)).collect();
+            match http_requests(&reqs).await {
+                Ok(results) => {
+                    for res in results {
+                        match res {
+                            Ok(resp) => match http::classify(resp).await {
+                                // A terminal leg aborts the page —
+                                // later siblings never classify or
+                                // mutate, same as the sequential loop.
+                                Err(e) if terminal(&e) => return Err(e),
+                                other => outcomes.push(other),
+                            },
+                            Err(e) if terminal(&e) => return Err(e),
+                            Err(e) => outcomes.push(Err(e)),
+                        }
+                    }
+                }
+                Err(GuestError::Host { ref kind, .. }) if kind == "unsupported" => {
+                    // Old host: sequential legs, terminal early-out
+                    // like the pre-batch loop — a cancelled search
+                    // fetches nothing further.
+                    for (_, _, url) in &plan {
+                        match http::get_json(url).await {
+                            Err(e) if terminal(&e) => return Err(e),
+                            other => outcomes.push(other),
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    for ((kind, off, _url), res) in plan.iter().zip(outcomes) {
+        let rows = match res {
             Ok(http::Outcome::Body(v)) => match *kind {
                 "track" => parse::search_items(&v).map(|mut r| items.append(&mut r)),
                 "artist" => {
@@ -297,7 +346,7 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
                 // The link's own `index` is the next offset — a short
                 // page advances by fewer rows than `limit`, so `off +
                 // page` would skip rows. No `next` marks the kind done.
-                match parse::next_index(&v, off) {
+                match parse::next_index(&v, *off) {
                     Some(idx) => more.insert(kind.to_string(), json!(idx)),
                     None => more.insert(kind.to_string(), Value::Null),
                 };
@@ -825,12 +874,61 @@ mod tests {
             .unwrap_or_else(|| panic!("result.related not an array: {out}"))
     }
 
-    /// Invoke `catalog.search` and return the emitted `http_request`.
+    /// Invoke `catalog.search` and return the emitted host request —
+    /// `http_request` for a single leg, `http_batch` for several.
     fn search_request(payload: Value) -> Value {
         let out = invoke("catalog.search", payload);
         assert_eq!(out["type"], "host_request", "{out}");
-        assert_eq!(out["kind"], "http_request", "{out}");
+        assert!(
+            matches!(
+                out["kind"].as_str(),
+                Some("http_request") | Some("http_batch")
+            ),
+            "{out}"
+        );
         out
+    }
+
+    /// The emitted request's track leg — the payload itself for a
+    /// single `http_request`, `payload.requests[0]` of an `http_batch`
+    /// (the plan orders track first).
+    fn track_leg(out: &Value) -> &Value {
+        if out["kind"] == "http_batch" {
+            &out["payload"]["requests"][0]
+        } else {
+            &out["payload"]
+        }
+    }
+
+    /// Feed `respond` to one emitted request and return the guest's
+    /// next output: a single `http_request` gets its `http_response`;
+    /// an `http_batch` gets one `http_batch_response` built by running
+    /// `respond` over every item.
+    fn respond_to<F: Fn(&Value) -> Value>(out: &Value, respond: &F) -> Value {
+        if out["kind"] != "http_batch" {
+            return step(&respond(out));
+        }
+        let Some(reqs) = out["payload"]["requests"].as_array() else {
+            panic!("http_batch.requests missing: {out}");
+        };
+        let results: Vec<Value> = reqs
+            .iter()
+            .map(|r| {
+                let mut item = respond(&json!({ "payload": r }));
+                let Some(obj) = item.as_object_mut() else {
+                    panic!("response is not an object: {item}");
+                };
+                // A batch item is the `http_response` envelope minus
+                // its framing: status/headers/body, or an `error`.
+                obj.remove("type");
+                obj.remove("id");
+                item
+            })
+            .collect();
+        step(&json!({
+            "type": "http_batch_response", "id": req_id(out),
+            "results": results,
+        }))
     }
 
     /// Ack a `log` request and return the next step output.
@@ -859,8 +957,10 @@ mod tests {
         let mut out = out;
         for _ in 0..32 {
             match (out["type"].as_str(), out["kind"].as_str()) {
-                (Some("host_request"), Some("http_request")) => {
-                    out = step(&respond(&out));
+                (Some("host_request"), Some(kind))
+                    if kind == "http_request" || kind == "http_batch" =>
+                {
+                    out = respond_to(&out, &respond);
                 }
                 (Some("host_request"), Some("log")) => {
                     if let Some(m) = out["payload"]["message"].as_str() {
@@ -886,24 +986,39 @@ mod tests {
         }
     }
 
+    /// The fixture the emitted URL answers with — `SEARCH` for the
+    /// track leg (`/search?`), the section fixture for the typed
+    /// entity legs. A batch carries every leg in one envelope, so the
+    /// responder keys on the URL like the sequential path did on the
+    /// request order.
+    fn search_body(req: &Value) -> &'static str {
+        let url = req["payload"]["url"].as_str().unwrap_or_default();
+        if url.contains("/search?") {
+            SEARCH
+        } else {
+            search_section(req)
+        }
+    }
+
     #[test]
     fn search_request_is_encoded_and_bounded() {
         let out = search_request(json!({
             "query": "Roads & 夜", "limit": 500, "storefront": "us",
         }));
-        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        let leg = track_leg(&out);
+        let url = leg["url"].as_str().unwrap_or_default();
         assert!(url.starts_with("https://api.deezer.com/search?"), "{url}");
         assert!(url.contains("q=Roads%20%26%20%E5%A4%9C"), "{url}");
         assert!(url.contains("limit=25"), "{url}");
-        assert_eq!(out["payload"]["method"], "GET");
-        let headers = out["payload"]["headers"].to_string();
+        assert_eq!(leg["method"], "GET");
+        let headers = leg["headers"].to_string();
         assert!(headers.contains("Auqw/0.1"), "{headers}");
     }
 
     #[test]
     fn search_limit_floor() {
         let out = search_request(json!({"query": "x", "limit": 0, "storefront": null}));
-        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        let url = track_leg(&out)["url"].as_str().unwrap_or_default();
         assert!(url.contains("limit=1"), "{url}");
     }
 
@@ -932,9 +1047,9 @@ mod tests {
     #[test]
     fn search_fixture_maps_rows() {
         let req = search_request(json!({"query": "x", "limit": 10, "storefront": "US"}));
-        let out = step(&http_ok(req_id(&req), SEARCH));
-        // A mixed ask fans out to the three typed entity endpoints.
-        let (out, _) = drive(out, |req| http_ok(req_id(req), search_section(req)));
+        // A mixed ask fans out to all four kinds under one batch.
+        let respond = |r: &Value| http_ok(req_id(r), search_body(r));
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         let items = items_of(&out);
         // Bad rows dropped: zero-id, non-track type, title-less, the
@@ -1058,9 +1173,8 @@ mod tests {
     #[test]
     fn search_exact_artist_is_top_hit() {
         let req = search_request(json!({"query": "portishead", "limit": 5, "storefront": null}));
-        let (out, _) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
-            http_ok(req_id(req), search_section(req))
-        });
+        let respond = |r: &Value| http_ok(req_id(r), search_body(r));
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         let hit = &out["result"]["top_hit"];
         assert_eq!(hit["type"], "entity", "{out}");
@@ -1072,9 +1186,8 @@ mod tests {
     #[test]
     fn search_exact_track_is_top_hit() {
         let req = search_request(json!({"query": "roads", "limit": 5, "storefront": null}));
-        let (out, _) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
-            http_ok(req_id(req), search_section(req))
-        });
+        let respond = |r: &Value| http_ok(req_id(r), search_body(r));
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         let hit = &out["result"]["top_hit"];
         assert_eq!(hit["type"], "track", "{out}");
@@ -1087,9 +1200,8 @@ mod tests {
     #[test]
     fn search_prefix_entity_is_top_hit() {
         let req = search_request(json!({"query": "trip-hop", "limit": 5, "storefront": null}));
-        let (out, _) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
-            http_ok(req_id(req), search_section(req))
-        });
+        let respond = |r: &Value| http_ok(req_id(r), search_body(r));
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         let hit = &out["result"]["top_hit"];
         assert_eq!(hit["type"], "entity", "{out}");
@@ -1128,14 +1240,15 @@ mod tests {
     #[test]
     fn search_section_failure_keeps_its_offset() {
         let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
-        let (out, logs) = drive(step(&http_ok(req_id(&req), SEARCH)), |req| {
-            let url = req["payload"]["url"].as_str().unwrap_or_default();
+        let respond = |r: &Value| {
+            let url = r["payload"]["url"].as_str().unwrap_or_default();
             if url.contains("/search/album") {
-                http_status(req_id(req), 500, &[])
+                http_status(req_id(r), 500, &[])
             } else {
-                http_ok(req_id(req), search_section(req))
+                http_ok(req_id(r), search_body(r))
             }
-        });
+        };
+        let (out, logs) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         let entities = entities_of(&out);
         assert!(
@@ -1160,18 +1273,23 @@ mod tests {
             json!({"query": "x", "limit": 10, "storefront": null,
                    "kinds": ["track", "album"], "continuation": token}),
         );
-        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        // Both pending kinds ride the one batch.
+        assert_eq!(out["kind"], "http_batch", "{out}");
+        let Some(reqs) = out["payload"]["requests"].as_array() else {
+            panic!("http_batch.requests missing: {out}");
+        };
+        let url = reqs[0]["url"].as_str().unwrap_or_default();
         assert!(
             url.contains("/search?") && url.contains("index=10"),
             "{url}"
         );
-        let out = step(&http_ok(req_id(&out), EMPTY));
-        let url = out["payload"]["url"].as_str().unwrap_or_default();
+        let url = reqs[1]["url"].as_str().unwrap_or_default();
         assert!(
             url.contains("/search/album?") && url.contains("index=5"),
             "{url}"
         );
-        let out = step(&http_ok(req_id(&out), EMPTY));
+        let respond = |r: &Value| http_ok(req_id(r), EMPTY);
+        let (out, _) = drive(respond_to(&out, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         assert_eq!(out["result"]["continuation"], Value::Null);
     }
@@ -1347,9 +1465,8 @@ mod tests {
     #[test]
     fn search_empty_is_done_with_no_items() {
         let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
-        let (out, _) = drive(step(&http_ok(req_id(&req), EMPTY)), |req| {
-            http_ok(req_id(req), EMPTY)
-        });
+        let respond = |r: &Value| http_ok(req_id(r), EMPTY);
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done", "{out}");
         assert!(items_of(&out).is_empty());
         assert!(entities_of(&out).is_empty());
@@ -1363,9 +1480,8 @@ mod tests {
             let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
             // Every kind degrades on the malformed body — all-failed
             // propagates the first failure.
-            let (out, _) = drive(step(&http_ok(req_id(&req), body)), |req| {
-                http_ok(req_id(req), body)
-            });
+            let respond = |r: &Value| http_ok(req_id(r), body);
+            let (out, _) = drive(respond_to(&req, &respond), respond);
             assert_eq!(out["type"], "fail", "{body}");
             assert_eq!(out["error"]["kind"], "invalid-response", "{body}");
         }
@@ -1376,10 +1492,8 @@ mod tests {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
         // Every kind hits the same quota — all-failed propagates the
         // typed verdict.
-        let (out, logs) = drive(
-            step(&http_status(req_id(&req), 429, &[("Retry-After", "30")])),
-            |req| http_status(req_id(req), 429, &[("Retry-After", "30")]),
-        );
+        let respond = |r: &Value| http_status(req_id(r), 429, &[("Retry-After", "30")]);
+        let (out, logs) = drive(respond_to(&req, &respond), respond);
         // The retry hint rides both the diagnostic log and the fail
         // message — the message is the only channel back to the app.
         assert!(
@@ -1398,9 +1512,8 @@ mod tests {
     fn quota_envelope_is_rate_limit() {
         // Deezer answers quota exhaustion as 200 + an error envelope.
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let (out, _) = drive(step(&http_ok(req_id(&req), QUOTA)), |req| {
-            http_ok(req_id(req), QUOTA)
-        });
+        let respond = |r: &Value| http_ok(req_id(r), QUOTA);
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "rate-limit");
     }
@@ -1411,7 +1524,8 @@ mod tests {
         // verdict: a warn request answered `host_error` still leaves
         // `rate-limit`, not the channel's `transient`.
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let mut out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
+        let respond = |r: &Value| http_status(req_id(r), 429, &[]);
+        let mut out = respond_to(&req, &respond);
         // Every log call answers `transient`; every request 429s.
         for _ in 0..32 {
             match (out["type"].as_str(), out["kind"].as_str()) {
@@ -1421,8 +1535,8 @@ mod tests {
                         "error": {"kind": "transient", "message": "log channel down"},
                     }));
                 }
-                (Some("host_request"), Some("http_request")) => {
-                    out = step(&http_status(req_id(&out), 429, &[]));
+                (Some("host_request"), _) => {
+                    out = respond_to(&out, &respond);
                 }
                 _ => break,
             }
@@ -1436,7 +1550,8 @@ mod tests {
         // Terminal kinds outrank the typed verdict: `cancelled` is the
         // abort signal, never a rate-limit.
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let out = step(&http_status(req_id(&req), 429, &[("Retry-After", "30")]));
+        let respond = |r: &Value| http_status(req_id(r), 429, &[("Retry-After", "30")]);
+        let out = respond_to(&req, &respond);
         assert_eq!(out["kind"], "log", "{out}");
         let out = step(&json!({
             "type": "host_error", "id": req_id(&out),
@@ -1450,9 +1565,8 @@ mod tests {
     fn server_and_other_errors_are_transient() {
         for status in [500_u16, 503, 418] {
             let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-            let (out, _) = drive(step(&http_status(req_id(&req), status, &[])), |req| {
-                http_status(req_id(req), status, &[])
-            });
+            let respond = |r: &Value| http_status(req_id(r), status, &[]);
+            let (out, _) = drive(respond_to(&req, &respond), respond);
             assert_eq!(out["type"], "fail", "{status}");
             assert_eq!(out["error"]["kind"], "transient", "{status}");
         }
@@ -1461,18 +1575,13 @@ mod tests {
     #[test]
     fn unknown_error_envelope_is_transient() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let (out, _) = drive(
-            step(&http_ok(
-                req_id(&req),
+        let respond = |r: &Value| {
+            http_ok(
+                req_id(r),
                 r#"{"error":{"type":"ParameterException","message":"bad parameter","code":501}}"#,
-            )),
-            |req| {
-                http_ok(
-                    req_id(req),
-                    r#"{"error":{"type":"ParameterException","message":"bad parameter","code":501}}"#,
-                )
-            },
-        );
+            )
+        };
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "fail", "{out}");
         assert_eq!(out["error"]["kind"], "transient");
         assert!(
@@ -1487,9 +1596,8 @@ mod tests {
     #[test]
     fn search_404_is_transient() {
         let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-        let (out, _) = drive(step(&http_status(req_id(&req), 404, &[])), |req| {
-            http_status(req_id(req), 404, &[])
-        });
+        let respond = |r: &Value| http_status(req_id(r), 404, &[]);
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["error"]["kind"], "transient");
     }
 
@@ -2089,9 +2197,8 @@ mod tests {
         // character query is legal.
         let req =
             search_request(json!({"query": "曲".repeat(512), "limit": 5, "storefront": null}));
-        let (out, _) = drive(step(&http_ok(req_id(&req), EMPTY)), |req| {
-            http_ok(req_id(req), EMPTY)
-        });
+        let respond = |r: &Value| http_ok(req_id(r), EMPTY);
+        let (out, _) = drive(respond_to(&req, &respond), respond);
         assert_eq!(out["type"], "done");
     }
 
@@ -2109,10 +2216,8 @@ mod tests {
             ("", "deezer rate-limited"),
         ] {
             let req = search_request(json!({"query": "x", "limit": 1, "storefront": null}));
-            let (out, logs) = drive(
-                step(&http_status(req_id(&req), 429, &[("Retry-After", value)])),
-                |req| http_status(req_id(req), 429, &[("Retry-After", value)]),
-            );
+            let respond = |r: &Value| http_status(req_id(r), 429, &[("Retry-After", value)]);
+            let (out, logs) = drive(respond_to(&req, &respond), respond);
             assert!(logs.iter().any(|m| m == want), "{value}: {logs:?}");
             assert_eq!(out["error"]["kind"], "rate-limit", "{value}");
             let want_fail = if want.contains("retry_after") {
@@ -2126,6 +2231,66 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// A host that predates `http_batch` answers `unsupported` — the
+    /// guest falls back to one request per kind and still finishes.
+    #[test]
+    fn old_host_falls_back_to_sequential_fetches() {
+        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        assert_eq!(req["kind"], "http_batch", "{req}");
+        let mut out = step(&json!({
+            "type": "host_error", "id": req_id(&req),
+            "error": {"kind": "unsupported", "message": "unknown kind"},
+        }));
+        // The four sequential calls arrive one at a time — never a
+        // second batch.
+        for _ in 0..8 {
+            match (out["type"].as_str(), out["kind"].as_str()) {
+                (Some("host_request"), Some("http_request")) => {
+                    out = step(&http_ok(req_id(&out), search_body(&out)));
+                }
+                (Some("host_request"), Some("log")) => {
+                    out = step(&json!({"type": "host_ok", "id": req_id(&out)}));
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(out["type"], "done", "{out}");
+        assert!(!items_of(&out).is_empty(), "{out}");
+        assert!(!entities_of(&out).is_empty(), "{out}");
+    }
+
+    /// On the sequential fallback a terminal leg aborts the search —
+    /// remaining kinds are never fetched (the pre-batch loop's
+    /// early-out survives the batch restructure).
+    #[test]
+    fn old_host_fallback_stops_on_terminal_leg() {
+        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        assert_eq!(req["kind"], "http_batch", "{req}");
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&req),
+            "error": {"kind": "unsupported", "message": "unknown kind"},
+        }));
+        assert_eq!(out["kind"], "http_request", "{out}");
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&out),
+            "error": {"kind": "cancelled", "message": "invocation stopped"},
+        }));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "cancelled", "{out}");
+    }
+
+    /// A refused batch call propagates the host error verbatim.
+    #[test]
+    fn refused_batch_propagates() {
+        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&req),
+            "error": {"kind": "permission-denied", "message": "no network"},
+        }));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "permission-denied", "{out}");
     }
 
     #[test]
