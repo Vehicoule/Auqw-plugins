@@ -333,8 +333,13 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
         "entities": entities,
         "top_hit": top_hit(&query, &entities, &items),
         // Only a pending offset keeps the page alive — a token of pure
-        // done-markers is the honest end, same as an empty one.
-        "continuation": match more.values().any(Value::is_u64) {
+        // done-markers is the honest end, same as an empty one. And
+        // only a call that served a kind may emit one: when every
+        // requested kind already carried a done marker (`fetched` ==
+        // 0) the surviving u64s belong to kinds this call didn't
+        // serve, so re-emitting them is a self-referential token —
+        // the same scope would page it forever with zero new rows.
+        "continuation": match fetched > 0 && more.values().any(Value::is_u64) {
             true => json!(serde_json::to_string(&more).unwrap_or_default()),
             false => Value::Null,
         },
@@ -1063,6 +1068,18 @@ mod tests {
                 .unwrap_or_else(|_| panic!("continuation is not JSON: {out}"));
         assert_eq!(next["track"], 25, "{next}");
         assert_eq!(next["album"], Value::Null, "{next}");
+
+        // Paging the same scope with that token can't move forward —
+        // album is done and track isn't served by this call — so the
+        // rail terminates instead of echoing the token back forever.
+        let out = invoke(
+            "catalog.search",
+            json!({"query": "x", "limit": 10, "storefront": null,
+                   "kinds": ["album"],
+                   "continuation": out["result"]["continuation"]}),
+        );
+        assert_eq!(out["type"], "done", "{out}");
+        assert_eq!(out["result"]["continuation"], Value::Null);
     }
 
     /// `catalog.search.kinds` is the declared scoped-search
