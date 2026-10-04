@@ -483,11 +483,12 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
         } else if p == "pot-provider" {
             has("pot_token")
         } else if let Some(dest) = p.strip_prefix("network:") {
-            // The guest must fetch at all, and a non-wildcard
+            // The guest must fetch at all — via `http_request` or, on
+            // the 0.1.1 line, `http_batch` — and a non-wildcard
             // destination must appear as a literal (its URLs are
             // formatted in the guest). Wildcards are exempt: their
             // URLs arrive in provider payloads.
-            has("http_request") && (dest.contains('*') || has_host(dest))
+            (has("http_request") || has("http_batch")) && (dest.contains('*') || has_host(dest))
         } else {
             // Permission kinds without a statically-decidable use.
             true

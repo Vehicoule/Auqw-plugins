@@ -315,8 +315,14 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
                     }
                 }
                 Err(GuestError::Host { ref kind, .. }) if kind == "unsupported" => {
+                    // Old host: sequential legs, terminal early-out
+                    // like the pre-batch loop — a cancelled search
+                    // fetches nothing further.
                     for (_, _, url) in &plan {
-                        outcomes.push(http::get_json(url).await);
+                        match http::get_json(url).await {
+                            Err(e) if terminal(&e) => return Err(e),
+                            other => outcomes.push(other),
+                        }
                     }
                 }
                 Err(e) => return Err(e),
@@ -2253,6 +2259,26 @@ mod tests {
         assert_eq!(out["type"], "done", "{out}");
         assert!(!items_of(&out).is_empty(), "{out}");
         assert!(!entities_of(&out).is_empty(), "{out}");
+    }
+
+    /// On the sequential fallback a terminal leg aborts the search —
+    /// remaining kinds are never fetched (the pre-batch loop's
+    /// early-out survives the batch restructure).
+    #[test]
+    fn old_host_fallback_stops_on_terminal_leg() {
+        let req = search_request(json!({"query": "x", "limit": 5, "storefront": null}));
+        assert_eq!(req["kind"], "http_batch", "{req}");
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&req),
+            "error": {"kind": "unsupported", "message": "unknown kind"},
+        }));
+        assert_eq!(out["kind"], "http_request", "{out}");
+        let out = step(&json!({
+            "type": "host_error", "id": req_id(&out),
+            "error": {"kind": "cancelled", "message": "invocation stopped"},
+        }));
+        assert_eq!(out["type"], "fail", "{out}");
+        assert_eq!(out["error"]["kind"], "cancelled", "{out}");
     }
 
     /// A refused batch call propagates the host error verbatim.

@@ -819,7 +819,11 @@ async fn http_batch_once(
                     .to_string(),
             }));
         } else {
-            out.push(parse_http_fields(item, "http_batch_response item"));
+            // A shape or decode failure is a protocol violation — it
+            // aborts the whole call like a malformed single
+            // `http_response`; only the host's own `{error}` verdicts
+            // arrive as per-item `Err`.
+            out.push(Ok(parse_http_fields(item, "http_batch_response item")?));
         }
     }
     Ok(out)
@@ -1302,6 +1306,32 @@ mod tests {
             assert_eq!(out["type"], "fail");
             assert_eq!(out["error"]["kind"], "invalid-response");
         }
+        reset();
+    }
+
+    /// A malformed item (undecodable body) is a protocol violation on
+    /// the whole batch — like a malformed single `http_response`, it
+    /// fails the call instead of landing as a retriable per-item
+    /// verdict a caller could mistake for HTTP weather.
+    #[test]
+    fn http_batch_malformed_item_fails_the_call() {
+        reset();
+        dispatch_register(batch_dispatch);
+        let out = step_json(&json!({
+            "type": "invoke", "request_id": "r", "capability": "x", "payload": {},
+        }));
+        assert_eq!(out["kind"], "http_batch");
+        let id = out["id"].as_u64().unwrap_or(u64::MAX);
+        let out = step_json(&json!({
+            "type": "http_batch_response", "id": id,
+            "results": [
+                { "status": 200, "headers": [], "body": "!" },
+                { "status": 200, "headers": [], "body": "" },
+                { "status": 200, "headers": [], "body": "" },
+            ],
+        }));
+        assert_eq!(out["type"], "fail");
+        assert_eq!(out["error"]["kind"], "invalid-response");
         reset();
     }
 
