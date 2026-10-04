@@ -411,23 +411,43 @@ fn normalize_title(s: &str) -> String {
 }
 
 /// The title with complete trailing `(…)`/`[…]` groups dropped —
-/// "Roads (2009 Remaster)" still names "roads". A bracket group only
-/// strips when it closes cleanly at the very end: "Song [Live] Part
-/// Two" keeps its interior group and its whole title.
+/// "Roads (2009 Remaster)" still names "roads", and a nested label
+/// like "(Live [2020])" strips as one group. A bracket suffix only
+/// counts when it balances cleanly at the very end: "Song [Live]
+/// Part Two" keeps its interior group and its whole title.
 fn core_title(s: &str) -> &str {
-    let mut out = s;
-    loop {
-        let t = out.trim_end();
-        let Some(open) = t.rfind(['(', '[']) else {
-            break;
-        };
-        let close = if t.as_bytes()[open] == b'(' { ')' } else { ']' };
-        let tail = &t[open..];
-        if !tail.ends_with(close) || tail.matches(close).count() != 1 || t[..open].trim().is_empty()
-        {
-            break;
+    let mut out = s.trim_end();
+    while out.ends_with(')') || out.ends_with(']') {
+        // Balance from the closer backward — a well-formed group,
+        // nested labels and all, ends where its depth returns to
+        // zero. A crossed or stranded bracket fails the parse and
+        // keeps the whole title.
+        let mut stack: Vec<char> = Vec::new();
+        let mut start = None;
+        for (i, c) in out.char_indices().rev() {
+            let closer = match c {
+                ')' | ']' => {
+                    stack.push(c);
+                    continue;
+                }
+                '(' => ')',
+                '[' => ']',
+                _ => continue,
+            };
+            if stack.pop() != Some(closer) {
+                break;
+            }
+            if stack.is_empty() {
+                start = Some(i);
+                break;
+            }
         }
-        out = t[..open].trim_end();
+        match start {
+            Some(i) if !out[..i].trim().is_empty() => {
+                out = out[..i].trim_end();
+            }
+            _ => break,
+        }
     }
     out
 }
@@ -1087,6 +1107,8 @@ mod tests {
         // tier below a full-title exact, so the studio cut wins.
         assert_eq!(title_match("roads", "Roads (Live)"), Some(2));
         assert_eq!(title_match("roads", "Roads (2009 Remaster)"), Some(2));
+        // A nested edition suffix still strips to the core title.
+        assert_eq!(title_match("roads", "Roads (Live [2020])"), Some(2));
         // An interior bracket group is title text — "Song [Live] Part
         // Two" prefixes "song", it does not equal it.
         assert_eq!(title_match("song", "Song [Live] Part Two"), Some(1));
