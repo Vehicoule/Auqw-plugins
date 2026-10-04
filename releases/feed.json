@@ -3,19 +3,19 @@
   "plugins": [
     {
       "id": "deezer",
-      "version": "0.2.1",
+      "version": "0.2.2",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:b5fedd6ad67a26292cd7c275b26f039a6b069ab53b31ca2a39fd838c549c6509",
-      "manifest_sha256": "sha256:8aafa7934ebf5fbbeb0c29b37e31837dc0010f38c00686027fcf860b32a1efa2",
-      "signature": "+HV/lNbiX7e/Gt33T+eps8ZDVwH8DWxqXBRdOH6ZBjcj/gdUMwHumMlx7/G1LuYR0b+h7/MS8+NUen2+fi1EBg=="
+      "wasm_sha256": "sha256:4f1c58b55b2c0010fa73b51f30ee0804a04a8e79df699f37d1cb8329815c43cf",
+      "manifest_sha256": "sha256:bd0163ff75e39c4f387738714aee7425e87d63f268208a9497b29a5890fcab01",
+      "signature": "turJiWJ7lNDVGaJqzv58aAQrlEjUZOYarg8blfSsRiZsGSjsYTZwUcJd7l0FFzeTb8EE6UpItdiC+epHp0K5Cg=="
     },
     {
       "id": "itunes",
-      "version": "0.3.1",
+      "version": "0.3.2",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:29e00e11992059d8cdfa1af7d11f9fcc214dd966490d0efd64ce849f1845eba8",
-      "manifest_sha256": "sha256:da9557d7552ea5fa353d1d50c477596912d1fdc6e3beea48478d7788098a508a",
-      "signature": "d/Jko+qhdxEyuOwKw4da1BqM4xFxkpYutK25XLKEAUjj7XZAkoEapbyuNvdgrp6FpwipOGbQA8CYQQBXi8v6DA=="
+      "wasm_sha256": "sha256:b08a2a4b90c52bbc03944825a66af18913266f24b92f4f0b584802c00523627b",
+      "manifest_sha256": "sha256:bbd47da0957e9bc440e41da26f49b8864196da168f04e18f0b93d46a3b42542a",
+      "signature": "p6yDa7g0981W7sxzL0VC53IwmpnT2VCCNpGvzrl65C/Nx/Nc2o9SOePycdRL/xbhs7puZZ5/SR0KuU3UnSpeAA=="
     },
     {
       "id": "lyrics-lrclib",
@@ -27,11 +27,11 @@
     },
     {
       "id": "youtube-music",
-      "version": "0.5.1",
+      "version": "0.5.2",
       "abi": "0.1.0",
-      "wasm_sha256": "sha256:55d72c5468ae742eda0f3bd36625df35947a862793e3122b865dc7eaa8673198",
-      "manifest_sha256": "sha256:40ac4c43133c0c27b04b539e8429574ad9787b51db6c5d740304ff6457f24c24",
-      "signature": "P4e4gRhMmG46kaZpyfOKIePMJrdy18HCD+Ux93fPWAs7wzGxKVCoHjmrbR6bFNcDQy4zkjeOoXpeUL8QjXGHBw=="
+      "wasm_sha256": "sha256:7cd83bbf7e6b61892ad8c9cc7537b6d4b591391fb61ef75c582d0aa9273b63cd",
+      "manifest_sha256": "sha256:960ffb7ede1dfcb3cebddf897731251533b699b8e24b4ef260d86d967587853b",
+      "signature": "L6VEqv9pEvrXZ8XaFSBBr5+UKuNTkGboe2l8uKKLHpQslauqlBGtpxwOwnIsd0Y2RZ3aAI1lQL0tAfoi0aYnBQ=="
     }
   ]
 }
