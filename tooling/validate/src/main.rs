@@ -488,7 +488,11 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
             // destination must appear as a literal (its URLs are
             // formatted in the guest). Wildcards are exempt: their
             // URLs arrive in provider payloads.
-            (has("http_request") || has("http_batch")) && (dest.contains('*') || has_host(dest))
+            // (`http_batch` only counts on the 0.1.1 line — a 0.1.0
+            // host rejects the kind, so a batch-only 0.1.0 guest
+            // could never actually fetch.)
+            (has("http_request") || (manifest["abi"] == "0.1.1" && has("http_batch")))
+                && (dest.contains('*') || has_host(dest))
         } else {
             // Permission kinds without a statically-decidable use.
             true
