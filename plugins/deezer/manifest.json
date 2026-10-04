@@ -15,5 +15,5 @@
     "network:api.deezer.com",
     "network:*.dzcdn.net"
   ],
-  "version": "0.2.2"
+  "version": "0.2.3"
 }
