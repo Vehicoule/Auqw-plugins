@@ -1,0 +1,13 @@
+{
+  "plugin": "deezer",
+  "version": "0.2.3",
+  "abi_version": "0.1.1",
+  "wasm_sha256": "sha256:6dc8dde28a5e3040a1448e343d764cf40cd7e620720ce7ca8256f355dd8817de",
+  "manifest_sha256": "sha256:75d4d73653a1167e33483d013e496039e743b0c04d85774787b3a8d40a641767",
+  "signed_at": "2026-10-04T20:16:55.207Z",
+  "key_id": "42d8cac606f16c04",
+  "toolchain": {
+    "node": "v24.19.0",
+    "platform": "linux/x64"
+  }
+}
