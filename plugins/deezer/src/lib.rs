@@ -418,12 +418,12 @@ fn core_title(s: &str) -> &str {
     let mut out = s;
     loop {
         let t = out.trim_end();
-        let Some(open) = t.rfind(|c| c == '(' || c == '[') else { break };
+        let Some(open) = t.rfind(['(', '[']) else {
+            break;
+        };
         let close = if t.as_bytes()[open] == b'(' { ')' } else { ']' };
         let tail = &t[open..];
-        if !tail.ends_with(close)
-            || tail.matches(close).count() != 1
-            || t[..open].trim().is_empty()
+        if !tail.ends_with(close) || tail.matches(close).count() != 1 || t[..open].trim().is_empty()
         {
             break;
         }
