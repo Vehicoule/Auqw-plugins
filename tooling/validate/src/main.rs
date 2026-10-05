@@ -470,6 +470,35 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
             })
         })
     };
+    // A host_request kind name must be a complete literal, not the
+    // head of a longer identifier — every SDK >= 0.3.1 guest links
+    // decode strings like `http_batch_response.results…` whether it
+    // batches or not. Bound the needle on identifier-continuation
+    // bytes (alphanumeric, `_`) so only a guest that can emit the
+    // kind itself matches.
+    let ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let has_kind = |kind: &str| {
+        let needle = kind.as_bytes();
+        segments.iter().any(|seg| {
+            seg.windows(needle.len()).enumerate().any(|(i, w)| {
+                w == needle
+                    && (i == 0 || !ident_byte(seg[i - 1]))
+                    && (i + needle.len() == seg.len() || !ident_byte(seg[i + needle.len()]))
+            })
+        })
+    };
+
+    // `http_batch` exists only on the 0.1.1 line — a 0.1.0 host
+    // rejects the unknown kind with InvalidMessage, so an artifact
+    // whose guest can emit it cannot pin 0.1.0, regardless of which
+    // grant it fetches through. A guest that batches keeps the bare
+    // kind literal in rodata; one that never batches keeps only the
+    // shared decode strings has_kind excludes.
+    if manifest["abi"] == "0.1.0" && has_kind("http_batch") {
+        return Err(
+            "manifest.abi pins \"0.1.0\" but the guest can emit http_batch host requests".into(),
+        );
+    }
 
     let perms = manifest["permissions"]
         .as_array()
@@ -491,7 +520,7 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
             // (`http_batch` only counts on the 0.1.1 line — a 0.1.0
             // host rejects the kind, so a batch-only 0.1.0 guest
             // could never actually fetch.)
-            (has("http_request") || (manifest["abi"] == "0.1.1" && has("http_batch")))
+            (has("http_request") || (manifest["abi"] == "0.1.1" && has_kind("http_batch")))
                 && (dest.contains('*') || has_host(dest))
         } else {
             // Permission kinds without a statically-decidable use.
@@ -1034,5 +1063,63 @@ mod tests {
             &wasm
         )
         .is_err_and(|e| e.contains("network:x.test")));
+    }
+
+    #[test]
+    fn alignment_rejects_http_batch_on_abi_0_1_0() {
+        // A guest that can emit `http_batch` must pin the 0.1.1
+        // line: a 0.1.0 host rejects the unknown kind outright, so
+        // the `http_request` it also carries cannot save a 0.1.0 pin.
+        let wasm = wasm_with_literals(&["http_request", "http_batch", "api.deezer.com"]);
+        assert!(check_guest_alignment(
+            &manifest("0.1.0", "[]", "[\"network:api.deezer.com\"]"),
+            &wasm
+        )
+        .is_err_and(|e| e.contains("http_batch")));
+        // The rejection does not ride on a declared destination —
+        // the kind is unknown to 0.1.0 hosts either way.
+        let wasm = wasm_with_literals(&["http_batch"]);
+        assert!(check_guest_alignment(&manifest("0.1.0", "[]", "[]"), &wasm)
+            .is_err_and(|e| e.contains("http_batch")));
+        // The same artifact is valid on the 0.1.1 line it belongs
+        // to, and a batch-only guest fetches through `http_batch`
+        // alone.
+        for wasm in [
+            wasm_with_literals(&["http_request", "http_batch", "api.deezer.com"]),
+            wasm_with_literals(&["http_batch", "api.deezer.com"]),
+        ] {
+            assert_eq!(
+                check_guest_alignment(
+                    &manifest("0.1.1", "[]", "[\"network:api.deezer.com\"]"),
+                    &wasm
+                ),
+                Ok(())
+            );
+        }
+        // Without the literal a 0.1.0 pin stays valid.
+        let wasm = wasm_with_literals(&["http_request", "api.deezer.com"]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest("0.1.0", "[]", "[\"network:api.deezer.com\"]"),
+                &wasm
+            ),
+            Ok(())
+        );
+        // The SDK's shared batch decode strings (`http_batch_response…`)
+        // survive in every 0.3.1 guest's rodata whether it batches or
+        // not — they must not trip the 0.1.0 pin check.
+        let wasm = wasm_with_literals(&[
+            "http_request",
+            "http_batch_response.results must carry 1..=8 items",
+            "http_batch_response.results missing",
+            "api.deezer.com",
+        ]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest("0.1.0", "[]", "[\"network:api.deezer.com\"]"),
+                &wasm
+            ),
+            Ok(())
+        );
     }
 }
