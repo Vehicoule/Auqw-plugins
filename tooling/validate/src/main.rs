@@ -471,6 +471,18 @@ fn check_guest_alignment(manifest: &serde_json::Value, wasm: &[u8]) -> Result<()
         })
     };
 
+    // `http_batch` exists only on the 0.1.1 line — a 0.1.0 host
+    // rejects the unknown kind with InvalidMessage, so an artifact
+    // whose guest can emit it cannot pin 0.1.0, regardless of which
+    // grant it fetches through. Dead-code elimination strips the
+    // literal from guests that never batch, so its presence in
+    // rodata means the batch path is compiled in.
+    if manifest["abi"] == "0.1.0" && has("http_batch") {
+        return Err(
+            "manifest.abi pins \"0.1.0\" but the guest can emit http_batch host requests".into(),
+        );
+    }
+
     let perms = manifest["permissions"]
         .as_array()
         .ok_or_else(|| "manifest.permissions must be an array".to_string())?;
@@ -1034,5 +1046,47 @@ mod tests {
             &wasm
         )
         .is_err_and(|e| e.contains("network:x.test")));
+    }
+
+    #[test]
+    fn alignment_rejects_http_batch_on_abi_0_1_0() {
+        // A guest that can emit `http_batch` must pin the 0.1.1
+        // line: a 0.1.0 host rejects the unknown kind outright, so
+        // the `http_request` it also carries cannot save a 0.1.0 pin.
+        let wasm = wasm_with_literals(&["http_request", "http_batch", "api.deezer.com"]);
+        assert!(check_guest_alignment(
+            &manifest("0.1.0", "[]", "[\"network:api.deezer.com\"]"),
+            &wasm
+        )
+        .is_err_and(|e| e.contains("http_batch")));
+        // The rejection does not ride on a declared destination —
+        // the kind is unknown to 0.1.0 hosts either way.
+        let wasm = wasm_with_literals(&["http_batch"]);
+        assert!(check_guest_alignment(&manifest("0.1.0", "[]", "[]"), &wasm)
+            .is_err_and(|e| e.contains("http_batch")));
+        // The same artifact is valid on the 0.1.1 line it belongs
+        // to, and a batch-only guest fetches through `http_batch`
+        // alone.
+        for wasm in [
+            wasm_with_literals(&["http_request", "http_batch", "api.deezer.com"]),
+            wasm_with_literals(&["http_batch", "api.deezer.com"]),
+        ] {
+            assert_eq!(
+                check_guest_alignment(
+                    &manifest("0.1.1", "[]", "[\"network:api.deezer.com\"]"),
+                    &wasm
+                ),
+                Ok(())
+            );
+        }
+        // Without the literal a 0.1.0 pin stays valid.
+        let wasm = wasm_with_literals(&["http_request", "api.deezer.com"]);
+        assert_eq!(
+            check_guest_alignment(
+                &manifest("0.1.0", "[]", "[\"network:api.deezer.com\"]"),
+                &wasm
+            ),
+            Ok(())
+        );
     }
 }
