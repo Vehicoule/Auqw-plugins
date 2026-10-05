@@ -22,6 +22,7 @@ use auqw_guest_sdk::{
     export_plugin, http_requests, log, GuestError, GuestFuture, HttpRequest, Invocation, LogLevel,
 };
 use serde_json::{json, Map, Value};
+use unicode_normalization::UnicodeNormalization;
 
 const API: &str = "https://api.deezer.com";
 /// Deezer caps search pages at 25 rows — larger asks are clamped, not
@@ -392,42 +393,35 @@ async fn search(payload: &Value) -> Result<Value, GuestError> {
 }
 
 /// A title's matchable form: lowercase FIRST (so accents fold on
-/// capitals too), then Latin diacritics folded to base letters,
-/// combining marks riding their base letter, non-alphanumeric runs
+/// capitals too), canonical decomposition splitting every precomposed
+/// letter into base + combining marks — composed and decomposed
+/// spellings of the same text fold alike — non-alphanumeric runs
 /// collapsed to single spaces, a leading "the" dropped. "Beyoncé",
 /// "beyonce" and "BEYONCÉ" all compare alike.
 fn normalize_title(s: &str) -> String {
+    // Only letters with no canonical decomposition — bars, ligatures,
+    // digraphs — need a spelling; nfd() already split every other
+    // accent off its base letter.
     fn fold(c: char) -> &'static str {
         match c {
-            'à'..='å' | 'ā' | 'ă' | 'ą' => "a",
             'æ' => "ae",
-            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => "c",
-            'ď' | 'đ' | 'ð' => "d",
-            'è'..='ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => "e",
-            'ĝ' | 'ğ' | 'ġ' | 'ģ' => "g",
-            'ĥ' | 'ħ' => "h",
-            'ì'..='ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => "i",
-            'ĵ' => "j",
-            'ķ' | 'ĸ' => "k",
-            'ĺ' | 'ļ' | 'ľ' | 'ŀ' | 'ł' => "l",
-            'ñ' | 'ń' | 'ņ' | 'ň' | 'ŉ' => "n",
-            'ò'..='ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => "o",
+            'đ' | 'ð' => "d",
+            'ħ' => "h",
+            'ı' => "i",
+            'ĸ' => "k",
+            'ŀ' | 'ł' => "l",
+            'ŉ' => "n",
+            'ø' => "o",
             'œ' => "oe",
-            'ŕ' | 'ŗ' | 'ř' => "r",
-            'ś' | 'ŝ' | 'ş' | 'š' => "s",
             'ß' => "ss",
-            'ţ' | 'ť' | 'ŧ' => "t",
+            'ŧ' => "t",
             'þ' => "th",
-            'ù'..='ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => "u",
-            'ŵ' => "w",
-            'ý' | 'ÿ' => "y",
-            'ź' | 'ż' | 'ž' => "z",
             _ => "",
         }
     }
     let mut out = String::with_capacity(s.len());
     let mut pending_space = false;
-    for m in s.trim().chars().flat_map(char::to_lowercase) {
+    for m in s.trim().chars().flat_map(char::to_lowercase).nfd() {
         // A combining mark rides its base letter — a decomposed é
         // normalizes identically to the composed one, not as a
         // separator.
@@ -1228,6 +1222,14 @@ mod tests {
         assert_eq!(title_match("beyonce", "BEYONCÉ"), Some(3));
         // Decomposed accents normalize like composed ones.
         assert_eq!(title_match("beyonce", "Beyonce\u{301}"), Some(3));
+        // Letters past the Latin-1/A range fold by decomposition too
+        // — Vietnamese composites, horn vowels — and NFC and NFD
+        // spellings of the same text normalize identically.
+        assert_eq!(title_match("tien", "Tiến"), Some(3));
+        assert_eq!(title_match("son", "Sơn"), Some(3));
+        assert_eq!(title_match("son", "Sơn Tùng"), Some(1));
+        assert_eq!(title_match("tie\u{301}n", "Tiến"), Some(3));
+        assert_eq!(title_match("tiến", "Tie\u{301}n"), Some(3));
         assert_eq!(title_match("beatles", "The Beatles"), Some(3));
         assert_eq!(title_match("trip-hop", "Trip-Hop Classics"), Some(1));
         assert_eq!(title_match("phonk", "Brazilian Phonk Mano"), Some(0));
