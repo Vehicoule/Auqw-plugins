@@ -1,7 +1,7 @@
 {
   "abi": "0.1.1",
   "artifact": {
-    "digest": "sha256:6dc8dde28a5e3040a1448e343d764cf40cd7e620720ce7ca8256f355dd8817de",
+    "digest": "sha256:d3c413ad9183f879646dfd53996d34d52db3500d684b37dafeb66d7cc5a02117",
     "path": "dist/deezer.wasm"
   },
   "capabilities": [
